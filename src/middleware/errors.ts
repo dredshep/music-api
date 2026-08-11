@@ -25,6 +25,24 @@ function isAppError(err: unknown): err is AppError {
   );
 }
 
+const UPSTREAM_CODES = new Set([
+  "SLSKD_UNAVAILABLE",
+  "SLSKD_RATE_LIMITED",
+  "NAVIDROME_UNAVAILABLE",
+  "MUSICBRAINZ_ERROR",
+  "LASTFM_ERROR",
+  "LISTENBRAINZ_ERROR",
+]);
+
+const SANITIZED_MESSAGES: Record<string, string> = {
+  SLSKD_UNAVAILABLE: "Soulseek service is temporarily unavailable",
+  SLSKD_RATE_LIMITED: "Soulseek search rate limit reached",
+  NAVIDROME_UNAVAILABLE: "Library service is temporarily unavailable",
+  MUSICBRAINZ_ERROR: "Metadata service is temporarily unavailable",
+  LASTFM_ERROR: "Last.fm service is temporarily unavailable",
+  LISTENBRAINZ_ERROR: "ListenBrainz service is temporarily unavailable",
+};
+
 export function formatErrorResponse(err: unknown): {
   status: number;
   body: Record<string, unknown>;
@@ -34,14 +52,16 @@ export function formatErrorResponse(err: unknown): {
       code: err.code,
       message: err.message,
       status: err.status,
+      details: err.details,
     });
 
+    const isUpstream = UPSTREAM_CODES.has(err.code);
     const error: Record<string, unknown> = {
       code: err.code,
-      message: err.message,
+      message: isUpstream ? (SANITIZED_MESSAGES[err.code] ?? "Upstream service error") : err.message,
       retryable: err.retryable,
     };
-    if (err.details) error.details = err.details;
+    if (!isUpstream && err.details) error.details = err.details;
 
     return { status: err.status, body: { error } };
   }
@@ -58,7 +78,7 @@ export function formatErrorResponse(err: unknown): {
     status: 500,
     body: {
       error: {
-        code: "UPSTREAM_ERROR",
+        code: "INTERNAL_ERROR",
         message: "An internal error occurred",
         retryable: true,
       },

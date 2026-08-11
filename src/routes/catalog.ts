@@ -26,14 +26,19 @@ import {
   getCatalogStats,
   type CatalogReleaseGroupRecord,
 } from "../db/repositories/catalog";
+import { catalogRefreshSemaphore } from "../middleware/semaphore";
 
 export const catalogRoutes = new Hono();
 
+const releaseTypeEnum = z.enum(["Album", "EP", "Single", "Live", "Compilation", "Remix", "Soundtrack", "Other"]);
+const mbidFormat = z.string().uuid();
+
 const missingCatalogSchema = z.object({
-  artist: z.string().min(1),
-  musicbrainz_id: z.string().optional(),
+  artist: z.string().min(1).max(500),
+  musicbrainz_id: mbidFormat.optional(),
   release_types: z
-    .array(z.string())
+    .array(releaseTypeEnum)
+    .max(10)
     .optional()
     .default(["Album", "EP", "Single"]),
   include_compilations: z.boolean().optional().default(false),
@@ -42,7 +47,8 @@ const missingCatalogSchema = z.object({
 
 const libraryMissingSchema = z.object({
   release_types: z
-    .array(z.string())
+    .array(releaseTypeEnum)
+    .max(10)
     .optional()
     .default(["Album"]),
   include_compilations: z.boolean().optional().default(false),
@@ -53,6 +59,7 @@ const libraryMissingSchema = z.object({
 });
 
 catalogRoutes.post("/catalog/missing", async (c) => {
+  return catalogRefreshSemaphore.run(async () => {
   const body = await c.req.json();
   const parsed = missingCatalogSchema.safeParse(body);
 
@@ -264,6 +271,7 @@ catalogRoutes.post("/catalog/missing", async (c) => {
     },
     missing,
     uncertain,
+  });
   });
 });
 

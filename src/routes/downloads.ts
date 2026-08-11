@@ -39,7 +39,7 @@ import type { FileKind, FileStatus } from "../types/api";
 export const downloadRoutes = new Hono();
 
 const enqueueSchema = z.object({
-  candidate_id: z.string().min(1),
+  candidate_id: z.string().min(1).max(100),
 });
 
 downloadRoutes.post("/downloads", async (c) => {

@@ -20,22 +20,26 @@ import { scoreCandidate } from "../domain/scoring";
 import { matchLibraryAlbums } from "../domain/matching";
 import * as navidrome from "../services/navidrome";
 import { getCache, setCache } from "../db/repositories/cache";
+import { searchSemaphore } from "../middleware/semaphore";
 
 export const searchRoutes = new Hono();
 
+const formatEnum = z.enum(["FLAC", "MP3", "AAC", "OGG", "OPUS", "WAV", "ALAC", "WMA", "APE"]);
+
 const searchSchema = z.object({
-  artist: z.string().min(1),
-  title: z.string().min(1),
+  artist: z.string().min(1).max(500),
+  title: z.string().min(1).max(500),
   release_type: z
     .enum(["album", "ep", "single", "track", "any"])
     .optional()
     .default("album"),
-  preferred_formats: z.array(z.string()).optional().default(["FLAC", "MP3"]),
+  preferred_formats: z.array(formatEnum).max(10).optional().default(["FLAC", "MP3"]),
   prefer_lrc: z.boolean().optional().default(true),
   max_candidates: z.coerce.number().min(1).max(20).optional().default(10),
 });
 
 searchRoutes.post("/search", async (c) => {
+  return searchSemaphore.run(async () => {
   const body = await c.req.json();
   const parsed = searchSchema.safeParse(body);
 
@@ -181,6 +185,7 @@ searchRoutes.post("/search", async (c) => {
       flags: r.flags_json ? JSON.parse(r.flags_json) : [],
       reason: r.reason,
     })),
+  });
   });
 });
 

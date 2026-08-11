@@ -16,10 +16,12 @@ function md5(input: string): string {
 }
 
 function generateSalt(): string {
+  const bytes = new Uint8Array(12);
+  crypto.getRandomValues(bytes);
   const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
   let salt = "";
   for (let i = 0; i < 12; i++) {
-    salt += chars[Math.floor(Math.random() * chars.length)];
+    salt += chars[bytes[i]! % chars.length];
   }
   return salt;
 }

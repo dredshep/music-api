@@ -9,8 +9,8 @@ import { getConfig } from "../config";
 export const libraryRoutes = new Hono();
 
 const librarySearchSchema = z.object({
-  artist: z.string().min(1),
-  title: z.string().optional().default(""),
+  artist: z.string().min(1).max(500),
+  title: z.string().max(500).optional().default(""),
   release_type: z
     .enum(["album", "ep", "single", "track", "any"])
     .optional()

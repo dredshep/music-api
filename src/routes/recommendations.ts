@@ -15,12 +15,13 @@ import {
   type FeedbackValue,
 } from "../db/repositories/recommendations";
 import type { AppVariables } from "../middleware/logging";
+import { generateSemaphore } from "../middleware/semaphore";
 
 export const recommendationRoutes = new Hono<{ Variables: AppVariables }>();
 
 const generateSchema = z.object({
   limit: z.number().int().min(1).max(200).optional(),
-  sources: z.array(z.enum(["lastfm_similar", "listenbrainz_cf", "musicbrainz_new_release"])).optional(),
+  sources: z.array(z.enum(["lastfm_similar", "listenbrainz_cf", "musicbrainz_new_release"])).max(3).optional(),
   include_uncertain: z.boolean().optional(),
 }).optional();
 
@@ -30,28 +31,30 @@ const feedbackSchema = z.object({
 
 // POST /v1/recommendations/generate
 recommendationRoutes.post("/recommendations/generate", async (c) => {
-  const body = await c.req.json().catch(() => ({}));
-  const parsed = generateSchema.parse(body);
+  return generateSemaphore.run(async () => {
+    const body = await c.req.json().catch(() => ({}));
+    const parsed = generateSchema.parse(body);
 
-  const options: GenerateOptions = {
-    limit: parsed?.limit,
-    sources: parsed?.sources as RecommendationSource[] | undefined,
-    includeUncertain: parsed?.include_uncertain,
-  };
+    const options: GenerateOptions = {
+      limit: parsed?.limit,
+      sources: parsed?.sources as RecommendationSource[] | undefined,
+      includeUncertain: parsed?.include_uncertain,
+    };
 
-  const result = await runGeneration(options);
+    const result = await runGeneration(options);
 
-  return c.json({
-    generation_id: result.generationId,
-    status: result.status,
-    selected: result.selected,
-    stats: result.stats,
+    return c.json({
+      generation_id: result.generationId,
+      status: result.status,
+      selected: result.selected,
+      stats: result.stats,
+    });
   });
 });
 
 // GET /v1/recommendations
 recommendationRoutes.get("/recommendations", (c) => {
-  const limit = parseInt(c.req.query("limit") ?? "50", 10);
+  const limit = Math.min(Math.max(parseInt(c.req.query("limit") ?? "50", 10) || 50, 1), 200);
   const type = c.req.query("type") as RecommendationType | undefined;
   const reason = c.req.query("reason") as RecommendationReason | undefined;
   const minScore = c.req.query("min_score") ? parseFloat(c.req.query("min_score")!) : undefined;

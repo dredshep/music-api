@@ -3,7 +3,7 @@ import { z } from "zod";
 const configSchema = z.object({
   PORT: z.coerce.number().default(8787),
 
-  API_KEY: z.string().min(1, "API_KEY is required"),
+  API_KEY: z.string().min(32, "API_KEY must be at least 32 characters").max(256),
 
   SLSKD_URL: z.string().url().default("http://slskd:5030"),
   SLSKD_API_VERSION: z.string().default("v0"),
