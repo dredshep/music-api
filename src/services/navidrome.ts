@@ -9,6 +9,12 @@ import type {
   SubsonicSearchResult,
 } from "../types/upstream";
 
+/** Subsonic returns a single object when count is 1; normalize to an array. */
+function asArray<T>(value: T | T[] | null | undefined): T[] {
+  if (value == null) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
 function md5(input: string): string {
   const hasher = new Bun.CryptoHasher("md5");
   hasher.update(input);
@@ -156,9 +162,9 @@ export async function search3(
   const sr = result.searchResult3 ?? {};
 
   return {
-    artists: (sr.artist ?? []).map(mapArtist),
-    albums: (sr.album ?? []).map(mapAlbum),
-    songs: (sr.song ?? []).map(mapSong),
+    artists: asArray(sr.artist).map(mapArtist),
+    albums: asArray(sr.album).map(mapAlbum),
+    songs: asArray(sr.song).map(mapSong),
   };
 }
 
@@ -168,8 +174,8 @@ export async function getArtists(): Promise<LibraryArtist[]> {
   }>("getArtists");
 
   const artists: LibraryArtist[] = [];
-  for (const idx of result.artists?.index ?? []) {
-    for (const a of idx.artist ?? []) {
+  for (const idx of asArray(result.artists?.index)) {
+    for (const a of asArray(idx.artist)) {
       artists.push(mapArtist(a));
     }
   }
@@ -185,7 +191,7 @@ export async function getArtist(
 
   return {
     artist: mapArtist(result.artist),
-    albums: (result.artist.album ?? []).map(mapAlbum),
+    albums: asArray(result.artist.album).map(mapAlbum),
   };
 }
 
@@ -198,7 +204,7 @@ export async function getAlbum(
 
   return {
     album: mapAlbum(result.album),
-    songs: (result.album.song ?? []).map(mapSong),
+    songs: asArray(result.album.song).map(mapSong),
   };
 }
 
@@ -220,7 +226,7 @@ export async function getAlbumList2(params: {
     offset: String(params.offset ?? 0),
   });
 
-  return (result.albumList2?.album ?? []).map((a) => ({
+  return asArray(result.albumList2?.album).map((a) => ({
     ...mapAlbum(a),
     playCount: a.playCount,
     played: a.played,
