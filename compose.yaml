@@ -1,0 +1,28 @@
+services:
+  music-api:
+    build:
+      context: /home/dd/server/music-api
+    container_name: music-api
+    restart: unless-stopped
+    env_file:
+      - /home/dd/server/music-api/.env
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    volumes:
+      - /home/dd/server/music-api/data:/app/data
+    # Match SQLite data dir ownership (nobody/nogroup on this host).
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    networks:
+      - st_net
+
+networks:
+  st_net:
+    external: true
