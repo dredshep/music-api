@@ -11,6 +11,7 @@ import { libraryOwnershipRoutes } from "./routes/library-ownership";
 import { catalogRoutes } from "./routes/catalog";
 import { searchRoutes } from "./routes/search";
 import { downloadRoutes } from "./routes/downloads";
+import { downloadFileControlRoutes } from "./routes/download-file-controls";
 import { suggestionRoutes } from "./routes/suggestions";
 import { suggestionsUiRoute } from "./routes/suggestions-ui";
 import { recommendationRoutes } from "./routes/recommendations";
@@ -22,16 +23,13 @@ import { startCleanupTimer } from "./db/cleanup";
 import { warmLibraryDiskUsageCache } from "./services/library-storage";
 
 const config = loadConfig();
-
 initDatabase();
 
 const app = new Hono<{ Variables: AppVariables }>();
 
 app.onError((err, c) => {
   const { status, body, retryAfterSeconds } = formatErrorResponse(err);
-  if (retryAfterSeconds != null) {
-    c.header("Retry-After", String(retryAfterSeconds));
-  }
+  if (retryAfterSeconds != null) c.header("Retry-After", String(retryAfterSeconds));
   return c.json(body, status as 400);
 });
 
@@ -57,6 +55,7 @@ app.route("/v1", libraryOwnershipRoutes);
 app.route("/v1", catalogRoutes);
 app.route("/v1", searchRoutes);
 app.route("/v1", downloadRoutes);
+app.route("/v1", downloadFileControlRoutes);
 app.route("/v1", suggestionRoutes);
 app.route("/v1", recommendationRoutes);
 app.route("/v1", lyricsRoutes);
@@ -65,16 +64,11 @@ app.route("/v1", playerRoutes);
 startCleanupTimer();
 warmLibraryDiskUsageCache();
 
-console.log(
-  JSON.stringify({
-    level: "info",
-    event: "server_started",
-    port: config.PORT,
-    timestamp: new Date().toISOString(),
-  })
-);
-
-export default {
+console.log(JSON.stringify({
+  level: "info",
+  event: "server_started",
   port: config.PORT,
-  fetch: app.fetch,
-};
+  timestamp: new Date().toISOString(),
+}));
+
+export default { port: config.PORT, fetch: app.fetch };
