@@ -31,6 +31,9 @@ const configSchema = z.object({
   CATALOG_CACHE_HOURS: z.coerce.number().default(24),
   ARTIST_CACHE_DAYS: z.coerce.number().default(30),
   LIBRARY_CACHE_MINUTES: z.coerce.number().default(10),
+  /** Host path to the music library root, mounted read-only for disk usage stats. */
+  LIBRARY_MUSIC_PATH: z.string().default(""),
+  LIBRARY_DISK_CACHE_MINUTES: z.coerce.number().default(60),
 
   DEFAULT_MAX_CANDIDATES: z.coerce.number().default(10),
   MAX_SEARCH_CANDIDATES: z.coerce.number().default(20),
@@ -102,4 +105,9 @@ export function loadConfig(): Config {
 export function getConfig(): Config {
   if (!_config) return loadConfig();
   return _config;
+}
+
+/** Test-only: allow env overrides after first loadConfig(). */
+export function resetConfigForTests(): void {
+  _config = null;
 }

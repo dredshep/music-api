@@ -30,6 +30,7 @@ const spec = {
               code: { type: "string" },
               message: { type: "string" },
               retryable: { type: "boolean" },
+              retry_after_ms: { type: "integer", description: "Suggested retry delay in milliseconds; present when retryable is true and the server can estimate a useful delay" },
             },
             required: ["code", "message", "retryable"],
           },
@@ -38,27 +39,6 @@ const spec = {
     },
   },
   paths: {
-    "/health": {
-      get: {
-        operationId: "getHealth",
-        summary: "Health check",
-        description: "Returns ok if the service is running. No authentication required. Does not probe upstream services.",
-        security: [],
-        responses: {
-          "200": {
-            description: "Service is running",
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: { status: { type: "string", enum: ["ok"] } },
-                },
-              },
-            },
-          },
-        },
-      },
-    },
     "/v1/status": {
       get: {
         operationId: "getMusicSystemStatus",
@@ -89,6 +69,22 @@ const spec = {
                           properties: {
                             available: { type: "boolean" },
                             error: { type: "string" },
+                            scan: {
+                              type: "object",
+                              description: "Present when Navidrome is available",
+                              properties: {
+                                scanning: { type: "boolean" },
+                                files_scanned: { type: "integer" },
+                                folders_scanned: { type: "integer" },
+                                library_total_tracks: { type: "integer", nullable: true },
+                                progress_percent: { type: "integer", nullable: true },
+                                progress_note: { type: "string", nullable: true },
+                                last_scan: { type: "string", format: "date-time", nullable: true },
+                                scan_type: { type: "string", nullable: true },
+                                elapsed_ms: { type: "integer", nullable: true },
+                                error: { type: "string", nullable: true },
+                              },
+                            },
                           },
                         },
                         musicbrainz: {
@@ -113,7 +109,7 @@ const spec = {
         operationId: "searchLibrary",
         summary: "Check if music is already owned in the library",
         description:
-          "Searches Navidrome for an artist/title combination and returns ownership confidence. Use this to determine whether a release needs to be downloaded. Returns matched albums with confidence scores and match reasons.",
+          "Checks Navidrome ownership and returns recent Soulseek download jobs for the same artist/title. Includes handoff_hint for lyrics workflow. Set include_songs=true for per-track navidrome IDs when indexed.",
         requestBody: {
           required: true,
           content: {
@@ -128,6 +124,16 @@ const spec = {
                     enum: ["album", "ep", "single", "track", "any"],
                     default: "any",
                   },
+                  include_songs: {
+                    type: "boolean",
+                    default: false,
+                    description: "Include songs with navidrome_id on top match when indexed",
+                  },
+                  include_downloads: {
+                    type: "boolean",
+                    default: true,
+                    description: "Include recent download jobs (last 180 days) for handoff",
+                  },
                 },
                 required: ["artist"],
               },
@@ -136,14 +142,25 @@ const spec = {
         },
         responses: {
           "200": {
-            description: "Ownership result",
+            description: "Ownership, download history, and handoff hint",
             content: {
               "application/json": {
                 schema: {
                   type: "object",
                   properties: {
                     owned: { type: "boolean" },
+                    indexed: { type: "boolean" },
+                    scan: {
+                      type: "object",
+                      properties: {
+                        scanning: { type: "boolean" },
+                        files_scanned: { type: "integer" },
+                        progress_percent: { type: "integer", nullable: true },
+                        library_total_tracks: { type: "integer", nullable: true },
+                      },
+                    },
                     confidence: { type: "number" },
+                    handoff_hint: { type: "string" },
                     matches: {
                       type: "array",
                       items: {
@@ -156,6 +173,29 @@ const spec = {
                           navidrome_id: { type: "string" },
                           confidence: { type: "number" },
                           match_reasons: { type: "array", items: { type: "string" } },
+                          songs: {
+                            type: "array",
+                            items: {
+                              type: "object",
+                              properties: {
+                                navidrome_id: { type: "string" },
+                                track: { type: "integer" },
+                                title: { type: "string" },
+                                duration_s: { type: "number" },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                    recent_downloads: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          job_id: { type: "string" },
+                          status: { type: "string" },
+                          audio_files: { type: "array", items: { type: "object" } },
                         },
                       },
                     },
@@ -172,7 +212,7 @@ const spec = {
         operationId: "getLibraryOverview",
         summary: "Summarize the owned music library",
         description:
-          "Library totals plus top artists. by=album_count (default) ranks by collection size; by=play_count ranks by summed album listens. Prefer over searchLibrary for broad taste/overview queries.",
+          "Library totals plus top artists. Includes on-disk library size when LIBRARY_MUSIC_PATH is configured. by=album_count (default) ranks by collection size; by=play_count ranks by summed album listens. Prefer over searchLibrary for broad taste/overview queries.",
         parameters: [
           {
             name: "top",
@@ -205,6 +245,28 @@ const spec = {
                       properties: {
                         artist_count: { type: "integer" },
                         album_count: { type: "integer" },
+                        disk_bytes: {
+                          type: "integer",
+                          description: "Total on-disk library size in bytes",
+                        },
+                        disk_gb: {
+                          type: "number",
+                          description: "Library size in gibibytes (GiB)",
+                        },
+                        disk_tb: {
+                          type: "number",
+                          description: "Library size in tebibytes (TiB)",
+                        },
+                        disk_display: {
+                          type: "string",
+                          description: "Human-readable library size, e.g. 1.23 TB",
+                        },
+                        disk_status: {
+                          type: "string",
+                          enum: ["computing", "unavailable"],
+                          description:
+                            "Present when disk size is not cached yet or du failed; retry overview after a minute.",
+                        },
                       },
                     },
                     top_artists: {
@@ -294,7 +356,8 @@ const spec = {
       get: {
         operationId: "getLibraryScanStatus",
         summary: "Check library scan status",
-        description: "Returns whether Navidrome is currently scanning the music library.",
+        description:
+          "Navidrome scan progress: files/folders scanned, approximate progress_percent vs library_total_tracks, last_scan, scan_type, elapsed_ms. Includes cached library_disk when available.",
         responses: {
           "200": {
             description: "Scan status",
@@ -304,7 +367,23 @@ const spec = {
                   type: "object",
                   properties: {
                     scanning: { type: "boolean" },
-                    last_scan: { type: "string", format: "date-time" },
+                    files_scanned: { type: "integer" },
+                    folders_scanned: { type: "integer" },
+                    library_total_tracks: { type: "integer", nullable: true },
+                    progress_percent: { type: "integer", nullable: true },
+                    progress_note: { type: "string", nullable: true },
+                    last_scan: { type: "string", format: "date-time", nullable: true },
+                    scan_type: { type: "string", nullable: true },
+                    elapsed_ms: { type: "integer", nullable: true },
+                    error: { type: "string", nullable: true },
+                    library_disk: {
+                      type: "object",
+                      nullable: true,
+                      properties: {
+                        bytes: { type: "integer" },
+                        display: { type: "string" },
+                      },
+                    },
                   },
                 },
               },
@@ -352,7 +431,7 @@ const spec = {
         operationId: "getMissingCatalog",
         summary: "Find releases missing from the library for an artist",
         description:
-          "Local-first catalog comparison. Uses cached MusicBrainz release groups when fresh; refreshes from MB only when stale (>30d) or force_refresh=true.",
+          "Local-first catalog comparison. Uses cached MusicBrainz release groups when fresh; refreshes from MB only when stale (>30d) or force_refresh=true. When MusicBrainz is unavailable but a cached catalog exists, returns degraded results with catalog_degraded: true.",
         requestBody: {
           required: true,
           content: {
@@ -399,6 +478,19 @@ const spec = {
                     },
                     catalog_source: { type: "string", enum: ["local", "musicbrainz"] },
                     catalog_checked_at: { type: "string", format: "date-time" },
+                    catalog_degraded: { type: "boolean", description: "True when MusicBrainz refresh failed and stale cached data was used" },
+                    warnings: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          code: { type: "string" },
+                          message: { type: "string" },
+                        },
+                        required: ["code", "message"],
+                      },
+                      description: "Non-fatal warnings about data freshness or upstream issues",
+                    },
                     summary: {
                       type: "object",
                       properties: {
@@ -412,6 +504,20 @@ const spec = {
                     uncertain: { type: "array", items: { type: "object" } },
                   },
                 },
+              },
+            },
+          },
+          "503": {
+            description: "MusicBrainz unavailable and no cached catalog exists",
+            headers: {
+              "Retry-After": {
+                schema: { type: "integer" },
+                description: "Suggested retry delay in seconds",
+              },
+            },
+            content: {
+              "application/json": {
+                schema: { $ref: "#/components/schemas/Error" },
               },
             },
           },
@@ -701,7 +807,7 @@ const spec = {
         operationId: "searchMusic",
         summary: "Search Soulseek for a release and return ranked candidates",
         description:
-          "Searches Soulseek for the specified artist/title, groups results by peer+directory, enriches directories, scores candidates on format, completeness, LRC coverage, and peer availability, then returns the top candidates. Each candidate has an opaque ID used for downloading. Never invent candidate IDs.",
+          "Search Soulseek for artist/title, enrich directories, score candidates, and return ranked results with opaque candidate IDs. Response includes lifecycle and diagnostics; if state is collecting and candidates are empty, refresh via refreshMusicSearch after recommended_refresh_after_ms.",
         requestBody: {
           required: true,
           content: {
@@ -715,6 +821,7 @@ const spec = {
                     type: "string",
                     enum: ["album", "ep", "single", "track", "any"],
                     default: "album",
+                    description: "Affects completeness scoring: single/track accept 1+ tracks as complete; album uses track-count heuristics.",
                   },
                   preferred_formats: {
                     type: "array",
@@ -731,7 +838,7 @@ const spec = {
         },
         responses: {
           "200": {
-            description: "Search results with ranked candidates",
+            description: "Search results with ranked candidates, lifecycle, and diagnostics",
             content: {
               "application/json": {
                 schema: {
@@ -739,12 +846,45 @@ const spec = {
                   properties: {
                     search_id: { type: "string" },
                     query: { type: "object" },
+                    lifecycle: {
+                      type: "object",
+                      description: "Search lifecycle state — check before treating an empty result as final",
+                      properties: {
+                        state: { type: "string", enum: ["collecting", "settled", "expired"] },
+                        age_ms: { type: "integer" },
+                        collection_ms: { type: "integer" },
+                        settled: { type: "boolean" },
+                        last_new_result_at: { type: "string", format: "date-time", nullable: true },
+                        recommended_refresh_after_ms: { type: "integer", nullable: true, description: "If non-null, client should refresh after this many ms to get more results" },
+                      },
+                    },
+                    diagnostics: {
+                      type: "object",
+                      description: "Internal counters for debugging search quality issues",
+                      properties: {
+                        raw_file_count: { type: "integer" },
+                        locked_file_count: { type: "integer" },
+                        peer_response_count: { type: "integer" },
+                        unique_peers: { type: "integer" },
+                        unique_directories: { type: "integer" },
+                        audio_directories: { type: "integer" },
+                        lrc_directories: { type: "integer", description: "Directories containing .lrc files" },
+                        collection_ms: { type: "integer" },
+                        enrichment_successes: { type: "integer" },
+                        enrichment_failures: { type: "integer" },
+                      },
+                    },
+                    warnings: {
+                      type: "array",
+                      items: { type: "string", enum: ["raw_results_without_candidates", "search_still_collecting", "partial_upstream_failure"] },
+                      description: "Non-fatal warnings. raw_results_without_candidates means slskd returned files but none passed candidate filters.",
+                    },
                     candidates: {
                       type: "array",
                       items: {
                         type: "object",
                         properties: {
-                          id: { type: "string", description: "Opaque candidate ID for use with enqueueCandidate" },
+                          id: { type: "string", description: "Opaque candidate ID for use with enqueueCandidate. Stable across refreshes." },
                           release: { type: "string" },
                           peer: { type: "string" },
                           format: { type: "string" },
@@ -775,7 +915,7 @@ const spec = {
         operationId: "refreshMusicSearch",
         summary: "Refresh a previous Soulseek search for updated results",
         description:
-          "Re-polls the associated slskd searches for newly arrived peer responses, re-ranks candidates, and returns the updated list. Use when initial results were weak and you want to check if better peers have responded. Expired searches return HTTP 410.",
+          "Re-poll slskd for new peer responses, upsert candidates with stable IDs, and re-rank. Returns immediately when candidates exist; otherwise waits up to 15s while collecting. Check lifecycle.state before treating empty results as final. HTTP 410 if expired.",
         parameters: [
           {
             name: "search_id",
@@ -786,7 +926,7 @@ const spec = {
           },
         ],
         responses: {
-          "200": { description: "Updated search results" },
+          "200": { description: "Updated search results with lifecycle metadata" },
           "410": { description: "Search expired" },
         },
       },
@@ -842,7 +982,7 @@ const spec = {
         operationId: "enqueueCandidate",
         summary: "Download a previously discovered music candidate",
         description:
-          "Enqueues the complete release represented by a candidate ID returned by searchMusic, refreshMusicSearch, or previewAcquire. Never invent candidate IDs. Includes audio files, matching LRC lyrics, cover art, and useful sidecars. Idempotent: re-sending the same candidate returns the existing job.",
+          "Download a candidate from searchMusic, refreshMusicSearch, or previewAcquire. Includes audio, matching LRC, cover, and sidecars. Idempotent. Use matched_only with track_title for a single track plus its .lrc.",
         requestBody: {
           required: true,
           content: {
@@ -853,6 +993,15 @@ const spec = {
                   candidate_id: {
                     type: "string",
                     description: "Opaque candidate ID from a search result",
+                  },
+                  matched_only: {
+                    type: "boolean",
+                    default: false,
+                    description: "Download only the matched track file plus its .lrc sidecar and cover art",
+                  },
+                  track_title: {
+                    type: "string",
+                    description: "Required when matched_only=true. The track title to match against file names in the candidate directory.",
                   },
                 },
                 required: ["candidate_id"],
@@ -870,7 +1019,7 @@ const spec = {
         operationId: "getTransfers",
         summary: "List download jobs",
         description:
-          "Returns download jobs filtered by status. Default shows active (queued + downloading + retrying). Use to check what is currently downloading or stuck.",
+          "List download jobs. Default active only. With artist/release/q filters, defaults to all statuses and searches job history (not slskd's live window). Use include_files=true for audio filenames.",
         parameters: [
           {
             name: "status",
@@ -881,7 +1030,12 @@ const spec = {
               default: "active",
             },
           },
-          { name: "limit", in: "query", schema: { type: "integer", default: 50 } },
+          { name: "limit", in: "query", schema: { type: "integer", default: 50, maximum: 200 } },
+          { name: "artist", in: "query", schema: { type: "string" }, description: "Filter by artist substring" },
+          { name: "release", in: "query", schema: { type: "string" }, description: "Filter by release title substring" },
+          { name: "q", in: "query", schema: { type: "string" }, description: "Filter artist or release substring" },
+          { name: "since_days", in: "query", schema: { type: "integer" }, description: "Only jobs from the last N days" },
+          { name: "include_files", in: "query", schema: { type: "boolean", default: false } },
         ],
         responses: {
           "200": { description: "List of download jobs" },
@@ -1062,6 +1216,211 @@ const spec = {
         },
       },
     },
+    "/v1/lyrics/search": {
+      post: {
+        operationId: "searchLyrics",
+        summary: "Search LRCLIB for synced lyrics candidates",
+        description:
+          "Searches lrclib.net for lyrics matching artist, title, and optional album/duration. Returns ranked candidates with confidence scores. Use acquireLyrics (dry_run) to preview before writing.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["artist", "title"],
+                properties: {
+                  artist: { type: "string" },
+                  title: { type: "string" },
+                  album: { type: "string" },
+                  duration_s: { type: "number", description: "Track duration in seconds. Improves matching precision." },
+                  max_results: { type: "integer", default: 10, maximum: 50 },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Lyric candidates",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    candidates: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          lrclib_id: { type: "integer", description: "Use this ID with acquireLyrics" },
+                          artist: { type: "string" },
+                          title: { type: "string" },
+                          album: { type: "string" },
+                          duration_s: { type: "number" },
+                          duration_delta_s: { type: "number", nullable: true },
+                          instrumental: { type: "boolean" },
+                          has_synced: { type: "boolean" },
+                          has_plain: { type: "boolean" },
+                          match_type: { type: "string", enum: ["exact", "search"] },
+                          confidence: { type: "number" },
+                        },
+                      },
+                    },
+                    count: { type: "integer" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/v1/lyrics/acquire": {
+      post: {
+        operationId: "acquireLyrics",
+        summary: "Write a .lrc sidecar for a Navidrome song",
+        description:
+          "Downloads lyrics from LRCLIB and writes a .lrc file next to the audio file in the library. If the library mount is read-only, lyrics are staged to the data dir instead. Triggers a Navidrome scan on success. Does not overwrite existing .lrc files.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["lrclib_id", "navidrome_song_id"],
+                properties: {
+                  lrclib_id: { type: "integer", description: "LRCLIB track ID from searchLyrics" },
+                  navidrome_song_id: { type: "string", description: "Navidrome song ID" },
+                  synced_only: { type: "boolean", default: true, description: "Reject if only plain lyrics available" },
+                  dry_run: { type: "boolean", default: false },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "201": { description: "Lyrics deployed to library" },
+          "200": { description: "Lyrics staged (library read-only)" },
+          "409": { description: ".lrc file already exists" },
+          "422": { description: "No suitable lyrics available" },
+        },
+      },
+    },
+    "/v1/lyrics/audit": {
+      post: {
+        operationId: "auditReleaseLyrics",
+        summary: "Audit a release for per-track LRC coverage",
+        description:
+          "Checks each track in a Navidrome album for .lrc presence on disk and LRCLIB availability. Use this to decide which tracks to fill.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  navidrome_album_id: { type: "string", description: "Navidrome album ID. Preferred." },
+                  artist: { type: "string", description: "Alternative: search by artist + album" },
+                  album: { type: "string", description: "Alternative: search by artist + album" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Per-track LRC audit",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    album: { type: "object" },
+                    coverage: {
+                      type: "object",
+                      properties: {
+                        synced: { type: "integer" },
+                        missing: { type: "integer" },
+                        total: { type: "integer" },
+                        ratio: { type: "number" },
+                      },
+                    },
+                    tracks: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          track: { type: "integer" },
+                          title: { type: "string" },
+                          navidrome_id: { type: "string" },
+                          duration_s: { type: "number" },
+                          lrc_status: { type: "string", enum: ["present_synced", "present_plain", "missing", "unknown"] },
+                          lrclib_available: { type: "boolean" },
+                          lrclib_best_confidence: { type: "number" },
+                          lrclib_has_synced: { type: "boolean" },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    "/v1/lyrics/fill": {
+      post: {
+        operationId: "fillMissingLyrics",
+        summary: "Batch-fill missing .lrc files for a Navidrome album",
+        description:
+          "For each track missing a .lrc file, searches LRCLIB and writes the best match. Skips tracks that already have .lrc files. Use dry_run=true (default) to preview what would be filled before committing.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                required: ["navidrome_album_id"],
+                properties: {
+                  navidrome_album_id: { type: "string" },
+                  synced_only: { type: "boolean", default: true, description: "Only fill with synced (timestamped) lyrics" },
+                  min_confidence: { type: "number", default: 0.8, description: "Minimum match confidence 0-1" },
+                  dry_run: { type: "boolean", default: true, description: "Preview without writing files" },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Fill results",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    album: { type: "object" },
+                    dry_run: { type: "boolean" },
+                    summary: {
+                      type: "object",
+                      properties: {
+                        total: { type: "integer" },
+                        filled: { type: "integer" },
+                        skipped: { type: "integer" },
+                        failed: { type: "integer" },
+                      },
+                    },
+                    tracks: { type: "array", items: { type: "object" } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     "/v1/recommendations/generations": {
       get: {
         operationId: "getRecommendationGenerations",
@@ -1131,3 +1490,8 @@ const spec = {
 openapiRoute.get("/openapi.json", (c) => {
   return c.json(spec);
 });
+
+/** Full spec for tests and build-time validation. */
+export function getOpenApiSpec(): typeof spec {
+  return spec;
+}

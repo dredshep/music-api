@@ -119,6 +119,82 @@ export function createCandidate(params: CreateCandidateParams): CandidateRecord 
   return record;
 }
 
+/**
+ * Upsert a candidate by (search_id, peer, remote_directory).
+ * Keeps stable IDs across refreshes; updates stats/score/files.
+ */
+export function upsertCandidate(params: CreateCandidateParams): CandidateRecord {
+  const db = getDb();
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + params.ttlMinutes * 60 * 1000);
+
+  const existing = db
+    .query<CandidateRecord, [string, string, string]>(
+      "SELECT * FROM candidates WHERE search_id = ? AND peer = ? AND remote_directory = ?"
+    )
+    .get(params.searchId, params.peer, params.remoteDirectory);
+
+  if (existing) {
+    db.query(`
+      UPDATE candidates SET
+        display_release = ?, format = ?,
+        track_count = ?, audio_file_count = ?,
+        lrc_count = ?, image_count = ?, sidecar_count = ?,
+        lrc_coverage = ?, total_bytes = ?,
+        upload_speed = ?, free_upload_slots = ?, queue_length = ?,
+        score = ?, reason = ?,
+        flags_json = ?, files_json = ?, raw_json = ?,
+        expires_at = ?
+      WHERE id = ?
+    `).run(
+      params.displayRelease ?? existing.display_release,
+      params.format ?? existing.format,
+      params.trackCount ?? existing.track_count,
+      params.audioFileCount ?? existing.audio_file_count,
+      params.lrcCount ?? existing.lrc_count,
+      params.imageCount ?? existing.image_count,
+      params.sidecarCount ?? existing.sidecar_count,
+      params.lrcCoverage ?? existing.lrc_coverage,
+      params.totalBytes ?? existing.total_bytes,
+      params.uploadSpeed ?? existing.upload_speed,
+      params.freeUploadSlots !== undefined ? (params.freeUploadSlots ? 1 : 0) : existing.free_upload_slots,
+      params.queueLength ?? existing.queue_length,
+      params.score ?? existing.score,
+      params.reason ?? existing.reason,
+      params.flags ? JSON.stringify(params.flags) : existing.flags_json,
+      params.files ? JSON.stringify(params.files) : existing.files_json,
+      params.raw ? JSON.stringify(params.raw) : existing.raw_json,
+      expiresAt.toISOString(),
+      existing.id
+    );
+
+    return { ...existing, ...pickDefined(params, existing), expires_at: expiresAt.toISOString() };
+  }
+
+  return createCandidate(params);
+}
+
+function pickDefined(params: CreateCandidateParams, existing: CandidateRecord): Partial<CandidateRecord> {
+  return {
+    display_release: params.displayRelease ?? existing.display_release,
+    format: params.format ?? existing.format,
+    track_count: params.trackCount ?? existing.track_count,
+    audio_file_count: params.audioFileCount ?? existing.audio_file_count,
+    lrc_count: params.lrcCount ?? existing.lrc_count,
+    image_count: params.imageCount ?? existing.image_count,
+    sidecar_count: params.sidecarCount ?? existing.sidecar_count,
+    lrc_coverage: params.lrcCoverage ?? existing.lrc_coverage,
+    total_bytes: params.totalBytes ?? existing.total_bytes,
+    upload_speed: params.uploadSpeed ?? existing.upload_speed,
+    free_upload_slots: params.freeUploadSlots !== undefined ? (params.freeUploadSlots ? 1 : 0) : existing.free_upload_slots,
+    queue_length: params.queueLength ?? existing.queue_length,
+    score: params.score ?? existing.score,
+    reason: params.reason ?? existing.reason,
+    flags_json: params.flags ? JSON.stringify(params.flags) : existing.flags_json,
+    files_json: params.files ? JSON.stringify(params.files) : existing.files_json,
+  };
+}
+
 export function getCandidate(id: string): CandidateRecord | null {
   const db = getDb();
   return (

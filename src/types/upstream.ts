@@ -6,8 +6,27 @@ export interface SlskdSearchState {
   state: string;
   responseCount: number;
   fileCount: number;
+  isComplete?: boolean;
 }
 
+/**
+ * Raw slskd search response — the upstream payload uses `hasFreeUploadSlot`
+ * (boolean) while legacy/test code may still send `freeUploadSlots` (number).
+ * Normalise via {@link normalizeSearchResponse} before use.
+ */
+export interface SlskdSearchResponseRaw {
+  username: string;
+  fileCount: number;
+  hasFreeUploadSlot?: boolean;
+  freeUploadSlots?: number;
+  uploadSpeed: number;
+  queueLength: number;
+  files: SlskdFile[];
+  lockedFiles?: SlskdFile[];
+  lockedFileCount?: number;
+}
+
+/** Normalised form consumed by the candidate pipeline. */
 export interface SlskdSearchResponse {
   username: string;
   fileCount: number;
@@ -15,7 +34,8 @@ export interface SlskdSearchResponse {
   uploadSpeed: number;
   queueLength: number;
   files: SlskdFile[];
-  lockedFiles?: SlskdFile[];
+  lockedFiles: SlskdFile[];
+  lockedFileCount: number;
 }
 
 export interface SlskdFile {
@@ -50,10 +70,53 @@ export interface SlskdTransferFile {
   endedAt?: string;
 }
 
+/**
+ * slskd POST /users/{username}/directory returns an array of directory
+ * objects.  Each directory has a `name` and `files` where filenames may
+ * be basenames rather than full remote paths.
+ */
 export interface SlskdUserDirectory {
   name: string;
   files: SlskdFile[];
   directories?: SlskdUserDirectory[];
+}
+
+// --- Normalisation helpers ---
+
+export function normalizeSearchResponse(
+  raw: SlskdSearchResponseRaw
+): SlskdSearchResponse {
+  let freeSlots: number;
+  if (typeof raw.hasFreeUploadSlot === "boolean") {
+    freeSlots = raw.hasFreeUploadSlot ? 1 : 0;
+  } else if (typeof raw.freeUploadSlots === "number") {
+    freeSlots = raw.freeUploadSlots;
+  } else {
+    freeSlots = 0;
+  }
+
+  return {
+    username: raw.username,
+    fileCount: raw.fileCount,
+    freeUploadSlots: freeSlots,
+    uploadSpeed: raw.uploadSpeed ?? 0,
+    queueLength: raw.queueLength ?? 0,
+    files: Array.isArray(raw.files) ? raw.files : [],
+    lockedFiles: Array.isArray(raw.lockedFiles) ? raw.lockedFiles : [],
+    lockedFileCount:
+      raw.lockedFileCount ?? (Array.isArray(raw.lockedFiles) ? raw.lockedFiles.length : 0),
+  };
+}
+
+export function isSearchComplete(state: SlskdSearchState): boolean {
+  if (state.isComplete === true) return true;
+  const s = state.state?.toLowerCase().replace(/\s/g, "") ?? "";
+  return (
+    s === "completed" ||
+    s.startsWith("completed,") ||
+    s === "completed,succeeded" ||
+    s === "completed,timedout"
+  );
 }
 
 // Navidrome/Subsonic types

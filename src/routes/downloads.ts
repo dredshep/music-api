@@ -26,9 +26,11 @@ import {
 } from "../db/repositories/job-files";
 import {
   selectDownloadFiles,
+  selectMatchedTrackFiles,
   getFilename,
   type CandidateFile,
 } from "../domain/candidates";
+import { planAlternatePeerRetry } from "../domain/retry-alternate";
 import { deriveJobStatus, computeProgress } from "../domain/transfers";
 import {
   syncJobFromSlskd,
@@ -40,6 +42,8 @@ export const downloadRoutes = new Hono();
 
 const enqueueSchema = z.object({
   candidate_id: z.string().min(1).max(100),
+  matched_only: z.boolean().optional().default(false),
+  track_title: z.string().min(1).max(500).optional(),
 });
 
 downloadRoutes.post("/downloads", async (c) => {
@@ -54,7 +58,15 @@ downloadRoutes.post("/downloads", async (c) => {
     );
   }
 
-  const { candidate_id } = parsed.data;
+  const { candidate_id, matched_only, track_title } = parsed.data;
+
+  if (matched_only && !track_title) {
+    throw new AppError(
+      "VALIDATION_ERROR",
+      "track_title is required when matched_only is true",
+      400
+    );
+  }
 
   // Check for existing active job (idempotency)
   const existingJob = getJobByCandidateId(candidate_id);
@@ -93,7 +105,9 @@ downloadRoutes.post("/downloads", async (c) => {
   }
 
   // Select files for download
-  const filesToDownload = selectDownloadFiles(storedFiles);
+  const filesToDownload = matched_only && track_title
+    ? selectMatchedTrackFiles(storedFiles, track_title)
+    : selectDownloadFiles(storedFiles);
 
   // Create job
   const job = createJob({
@@ -172,8 +186,17 @@ downloadRoutes.post("/downloads", async (c) => {
 });
 
 downloadRoutes.get("/downloads", async (c) => {
-  const status = c.req.query("status") ?? "active";
-  const limit = parseInt(c.req.query("limit") ?? "50", 10);
+  const artist = c.req.query("artist")?.trim();
+  const release = c.req.query("release")?.trim();
+  const q = c.req.query("q")?.trim();
+  const hasIdentityFilter = !!(artist || release || q);
+
+  // When looking up a specific release, default to full job history not just active
+  const status = c.req.query("status") ?? (hasIdentityFilter ? "all" : "active");
+  const limit = parseInt(c.req.query("limit") ?? (hasIdentityFilter ? "100" : "50"), 10);
+  const sinceDaysRaw = c.req.query("since_days");
+  const sinceDays = sinceDaysRaw ? parseInt(sinceDaysRaw, 10) : undefined;
+  const includeFiles = c.req.query("include_files") === "true";
 
   // Refresh logical jobs from live slskd transfer state before reading
   if (status === "active" || status === "all") {
@@ -186,21 +209,31 @@ downloadRoutes.get("/downloads", async (c) => {
     }
   }
 
-  const jobs = listJobs({ status, limit });
+  const jobs = listJobs({
+    status,
+    limit,
+    artist,
+    release,
+    q,
+    sinceDays: sinceDays && sinceDays > 0 ? sinceDays : undefined,
+  });
 
   const jobsWithStats = jobs.map((job) => {
+    const jobFiles = getJobFiles(job.id);
     const stats = getJobFileStats(job.id);
-    const fileStatuses = getJobFiles(job.id).map((f) => f.status as FileStatus);
+    const fileStatuses = jobFiles.map((f) => f.status as FileStatus);
     const progress = computeProgress(
       fileStatuses.map((s) => ({ status: s }))
     );
 
-    return {
+    const entry: Record<string, unknown> = {
       job_id: job.id,
       artist: job.artist,
       release: job.release_title,
       status: job.status,
       error: job.last_error ?? undefined,
+      peer: job.peer ?? undefined,
+      remote_directory: job.remote_directory ?? undefined,
       files: {
         total: stats.total,
         completed: stats.completed,
@@ -210,10 +243,37 @@ downloadRoutes.get("/downloads", async (c) => {
       },
       progress: Math.round(progress * 100) / 100,
       created_at: job.created_at,
+      updated_at: job.updated_at,
     };
+
+    if (includeFiles) {
+      entry.file_list = jobFiles.map((f) => ({
+        filename: f.logical_filename,
+        kind: f.kind,
+        status: f.status,
+        size: f.size,
+      }));
+      entry.audio_files = jobFiles
+        .filter((f) => f.kind === "audio")
+        .map((f) => f.logical_filename);
+      entry.lyrics_files = jobFiles
+        .filter((f) => f.kind === "lyrics")
+        .map((f) => f.logical_filename);
+    }
+
+    return entry;
   });
 
-  return c.json({ jobs: jobsWithStats });
+  return c.json({
+    jobs: jobsWithStats,
+    filters: {
+      status,
+      artist: artist ?? undefined,
+      release: release ?? undefined,
+      q: q ?? undefined,
+      since_days: sinceDays && sinceDays > 0 ? sinceDays : undefined,
+    },
+  });
 });
 
 downloadRoutes.get("/downloads/:job_id", async (c) => {
@@ -420,63 +480,38 @@ async function handleRetryAlternate(
 
   // Search for alternate source
   const query = `${artist} ${title}`;
-  const search = await slskd.startSearch(query);
-  const responses = await slskd.waitForSearchCompletion(search.id, 7000);
+  let responses: Awaited<ReturnType<typeof slskd.collectSearchResults>>["responses"];
+  try {
+    const search = await slskd.startSearch(query);
+    ({ responses } = await slskd.collectSearchResults([search.id], { minMs: 7000 }));
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Alternate peer search failed";
+    throw new AppError("SEARCH_FAILED", message, 502, true);
+  }
 
-  // Find a different peer with compatible files
-  const originalPeer = job.peer;
-  const altResponses = responses.filter((r) => r.username !== originalPeer);
+  const plan = planAlternatePeerRetry({
+    originalPeer: job.peer,
+    retryableFiles,
+    responses,
+  });
 
-  if (altResponses.length === 0) {
+  if (!plan.ok) {
     return c.json({
       job_id: job.id,
       status: job.status,
-      message: "No alternate peers found",
+      message: plan.message,
+      retry: { strategy: "alternate_peer", reason: plan.reason },
     });
   }
 
-  // Try to match failed logical files in alternate responses
-  const { groupByDirectory, computeStats } = await import("../domain/candidates");
-  const altCandidates = groupByDirectory(altResponses);
-  const bestAlt = altCandidates
-    .filter((c) => c.files.filter((f) => f.kind === "audio").length > 0)
-    .sort(
-      (a, b) =>
-        b.files.filter((f) => f.kind === "audio").length -
-        a.files.filter((f) => f.kind === "audio").length
-    )[0];
-
-  if (!bestAlt) {
-    return c.json({
-      job_id: job.id,
-      status: job.status,
-      message: "No suitable alternate candidate found",
-    });
+  try {
+    await slskd.enqueueFiles(plan.alternatePeer, plan.filesToEnqueue);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Failed to enqueue alternate peer files";
+    throw new AppError("ENQUEUE_FAILED", message, 502, true);
   }
-
-  // Enqueue matching files from alternate peer
-  const filesToEnqueue = retryableFiles
-    .map((failed) => {
-      const match = bestAlt.files.find(
-        (f) =>
-          f.kind === failed.kind &&
-          getFilename(f.filename).toLowerCase().includes(
-            failed.logical_filename.replace(/\.[^.]+$/, "").toLowerCase()
-          )
-      );
-      return match ? { filename: match.filename, size: match.size } : null;
-    })
-    .filter((f): f is { filename: string; size: number } => f !== null);
-
-  if (filesToEnqueue.length === 0) {
-    return c.json({
-      job_id: job.id,
-      status: job.status,
-      message: "Could not match failed files to alternate peer",
-    });
-  }
-
-  await slskd.enqueueFiles(bestAlt.peer, filesToEnqueue);
 
   for (const file of retryableFiles) {
     updateJobFileStatus(file.id, "queued");
@@ -487,9 +522,9 @@ async function handleRetryAlternate(
 
   log("info", "download_retry_alternate", {
     job_id: job.id,
-    original_peer: originalPeer,
-    alternate_peer: bestAlt.peer,
-    files_retried: filesToEnqueue.length,
+    original_peer: job.peer,
+    alternate_peer: plan.alternatePeer,
+    files_retried: plan.filesToEnqueue.length,
   });
 
   return c.json({
@@ -497,7 +532,8 @@ async function handleRetryAlternate(
     status: "retrying",
     retry: {
       strategy: "alternate_peer",
-      failed_files: filesToEnqueue.length,
+      failed_files: plan.filesToEnqueue.length,
+      alternate_peer: plan.alternatePeer,
     },
   });
 }

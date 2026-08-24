@@ -16,6 +16,7 @@ import { artistMatch } from "../domain/normalization";
 import { addAliases, clearAliasesForArtist } from "../db/repositories/aliases";
 import {
   getCatalogArtist,
+  findUniqueCatalogArtistByName,
   listCatalogArtists,
   upsertCatalogArtist,
   markCatalogChecked,
@@ -75,71 +76,83 @@ catalogRoutes.post("/catalog/missing", async (c) => {
     parsed.data;
   const config = getConfig();
 
+  type Warning = { code: string; message: string };
+  const warnings: Warning[] = [];
+  let catalogDegraded = false;
+
   // Step 1: Resolve artist MBID
   let artistMbid = musicbrainz_id;
   let artistName = artist;
 
   if (!artistMbid) {
-    const searchResults = await musicbrainz.searchArtist(artist, 5);
+    // Try exact case-insensitive cached lookup first
+    const cached = findUniqueCatalogArtistByName(artist);
+    if (cached) {
+      artistMbid = cached.mbid;
+      artistName = cached.name;
+      log("info", "catalog_artist_from_cache", { artist, mbid: cached.mbid });
+    } else {
+      const searchResults = await musicbrainz.searchArtist(artist, 5);
 
-    if (searchResults.length === 0) {
-      throw new AppError(
-        "MUSICBRAINZ_UNAVAILABLE",
-        `No MusicBrainz results for "${artist}"`,
-        404
+      if (searchResults.length === 0) {
+        throw new AppError(
+          "ARTIST_NOT_FOUND",
+          `No MusicBrainz results for "${artist}"`,
+          404
+        );
+      }
+
+      const highConfidence = searchResults.filter(
+        (r) => r.name.toLowerCase() === artist.toLowerCase()
       );
-    }
 
-    const highConfidence = searchResults.filter(
-      (r) => r.name.toLowerCase() === artist.toLowerCase()
-    );
+      if (highConfidence.length > 1) {
+        throw new AppError(
+          "AMBIGUOUS_ARTIST",
+          "Multiple MusicBrainz artists match this name.",
+          409,
+          false,
+          {
+            artists: highConfidence.slice(0, 5).map((a) => ({
+              name: a.name,
+              musicbrainz_id: a.id,
+              disambiguation: a.disambiguation,
+              type: a.type,
+              country: a.country,
+            })),
+          }
+        );
+      }
 
-    if (highConfidence.length > 1) {
-      throw new AppError(
-        "AMBIGUOUS_ARTIST",
-        "Multiple MusicBrainz artists match this name.",
-        409,
-        false,
-        {
-          artists: highConfidence.slice(0, 5).map((a) => ({
+      const bestMatch = highConfidence[0] ?? searchResults[0];
+      if (!bestMatch) {
+        throw new AppError(
+          "ARTIST_NOT_FOUND",
+          `Could not resolve artist "${artist}"`,
+          404
+        );
+      }
+
+      artistMbid = bestMatch.id;
+      artistName = bestMatch.name;
+
+      upsertCatalogArtist({
+        mbid: artistMbid,
+        name: artistName,
+        disambiguation: bestMatch.disambiguation,
+      });
+
+      if (bestMatch.aliases.length > 0) {
+        clearAliasesForArtist(bestMatch.name);
+        addAliases(
+          bestMatch.name,
+          bestMatch.aliases.map((a) => ({
             name: a.name,
-            musicbrainz_id: a.id,
-            disambiguation: a.disambiguation,
-            type: a.type,
-            country: a.country,
-          })),
-        }
-      );
-    }
-
-    const bestMatch = highConfidence[0] ?? searchResults[0];
-    if (!bestMatch) {
-      throw new AppError(
-        "MUSICBRAINZ_UNAVAILABLE",
-        `Could not resolve artist "${artist}"`,
-        404
-      );
-    }
-
-    artistMbid = bestMatch.id;
-    artistName = bestMatch.name;
-
-    upsertCatalogArtist({
-      mbid: artistMbid,
-      name: artistName,
-      disambiguation: bestMatch.disambiguation,
-    });
-
-    if (bestMatch.aliases.length > 0) {
-      clearAliasesForArtist(bestMatch.name);
-      addAliases(
-        bestMatch.name,
-        bestMatch.aliases.map((a) => ({
-          name: a.name,
-          source: "musicbrainz",
-          confidence: 0.95,
-        }))
-      );
+            source: "musicbrainz",
+            confidence: 0.95,
+          }))
+        );
+      }
     }
   } else {
     const existing = getCatalogArtist(artistMbid);
@@ -151,7 +164,7 @@ catalogRoutes.post("/catalog/missing", async (c) => {
   }
 
   // Step 2: Check local catalog cache
-  const cachedArtist = getCatalogArtist(artistMbid);
+  let cachedArtist = getCatalogArtist(artistMbid);
   const staleThresholdDays = config.ARTIST_CACHE_DAYS;
   const needsRefresh =
     force_refresh ||
@@ -184,17 +197,26 @@ catalogRoutes.post("/catalog/missing", async (c) => {
       );
       markCatalogChecked(artistMbid);
 
+      // Re-read to get the persisted timestamp
+      cachedArtist = getCatalogArtist(artistMbid);
+
       catalogEntries = filterReleaseGroups(allGroups, release_types, include_compilations);
       catalogSource = "musicbrainz";
     } catch (err) {
-      const localGroups = getReleaseGroupsForArtist(artistMbid);
-      if (localGroups.length > 0) {
+      // Fall back to local data if the artist was previously checked
+      if (cachedArtist?.catalog_checked_at) {
+        const localGroups = getReleaseGroupsForArtist(artistMbid);
         log("warn", "catalog_mb_failed_using_local", {
           artist: artistName,
           local_count: localGroups.length,
         });
         catalogEntries = filterLocalGroups(localGroups, release_types, include_compilations);
         catalogSource = "local";
+        catalogDegraded = true;
+        warnings.push({
+          code: "MUSICBRAINZ_REFRESH_FAILED_USING_CACHE",
+          message: "MusicBrainz is temporarily unavailable; cached catalog data was used.",
+        });
       } else {
         throw err;
       }
@@ -254,6 +276,7 @@ catalogRoutes.post("/catalog/missing", async (c) => {
     owned: summary.owned,
     missing: summary.missing,
     uncertain: summary.uncertain,
+    degraded: catalogDegraded,
   });
 
   return c.json({
@@ -263,6 +286,8 @@ catalogRoutes.post("/catalog/missing", async (c) => {
     },
     catalog_source: catalogSource,
     catalog_checked_at: cachedArtist?.catalog_checked_at ?? new Date().toISOString(),
+    catalog_degraded: catalogDegraded,
+    warnings,
     summary: {
       catalog_releases: summary.catalogReleases,
       owned: summary.owned,

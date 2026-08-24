@@ -29,6 +29,20 @@ export function getCatalogArtist(mbid: string): CatalogArtistRecord | null {
   );
 }
 
+/**
+ * Exact case-insensitive name lookup using the COLLATE NOCASE index.
+ * Returns null if zero or multiple rows match (ambiguity).
+ */
+export function findUniqueCatalogArtistByName(name: string): CatalogArtistRecord | null {
+  const db = getDb();
+  const rows = db
+    .query<CatalogArtistRecord, [string]>(
+      "SELECT * FROM catalog_artists WHERE name = ? COLLATE NOCASE"
+    )
+    .all(name);
+  return rows.length === 1 ? rows[0] : null;
+}
+
 export function listCatalogArtists(options?: {
   onlyChecked?: boolean;
 }): CatalogArtistRecord[] {

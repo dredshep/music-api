@@ -2,9 +2,17 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { AppError } from "../middleware/errors";
 import * as navidrome from "../services/navidrome";
+import {
+  getCachedLibraryDiskUsage,
+  isLibraryDiskUsageRefreshPending,
+  scheduleLibraryDiskUsageRefresh,
+} from "../services/library-storage";
 import { matchLibraryAlbums } from "../domain/matching";
 import { getCache, setCache } from "../db/repositories/cache";
 import { getConfig } from "../config";
+import { listJobs } from "../db/repositories/jobs";
+import { getJobFiles } from "../db/repositories/job-files";
+import { getLibraryScanStatus } from "../services/scan-status";
 
 export const libraryRoutes = new Hono();
 
@@ -15,6 +23,8 @@ const librarySearchSchema = z.object({
     .enum(["album", "ep", "single", "track", "any"])
     .optional()
     .default("any"),
+  include_songs: z.boolean().optional().default(false),
+  include_downloads: z.boolean().optional().default(true),
 });
 
 libraryRoutes.post("/library/search", async (c) => {
@@ -29,13 +39,13 @@ libraryRoutes.post("/library/search", async (c) => {
     );
   }
 
-  const { artist, title, release_type } = parsed.data;
+  const { artist, title, release_type, include_songs, include_downloads } = parsed.data;
   const config = getConfig();
 
-  // Check cache
-  const cacheKey = `lib:search:${artist.toLowerCase()}:${title.toLowerCase()}:${release_type}`;
+  // Check cache (exclude volatile download/scan fields from cache key)
+  const cacheKey = `lib:search:${artist.toLowerCase()}:${title.toLowerCase()}:${release_type}:${include_songs}`;
   const cached = getCache<unknown>(cacheKey);
-  if (cached) return c.json(cached);
+  if (cached && !include_downloads) return c.json(cached);
 
   // Search Navidrome
   const query = title ? `${artist} ${title}` : artist;
@@ -48,26 +58,129 @@ libraryRoutes.post("/library/search", async (c) => {
   // Match
   const ownershipResult = matchLibraryAlbums(artist, title || artist, results.albums);
 
+  const matches = await Promise.all(
+    ownershipResult.matches.map(async (m) => {
+      const entry: Record<string, unknown> = {
+        artist: m.artist,
+        title: m.title,
+        year: m.year,
+        track_count: m.trackCount,
+        navidrome_id: m.navidromeId,
+        confidence: Math.round(m.confidence * 100) / 100,
+        match_reasons: m.matchReasons,
+      };
+
+      if (
+        include_songs &&
+        m.confidence >= 0.85 &&
+        ownershipResult.matches[0]?.navidromeId === m.navidromeId
+      ) {
+        try {
+          const albumData = await navidrome.getAlbum(m.navidromeId);
+          entry.songs = albumData.songs.map((s) => ({
+            navidrome_id: s.id,
+            track: s.track,
+            title: s.title,
+            duration_s: s.duration,
+          }));
+        } catch {
+          entry.songs = [];
+        }
+      }
+
+      return entry;
+    })
+  );
+
+  let recentDownloads: Array<Record<string, unknown>> | undefined;
+  if (include_downloads) {
+    const jobs = listJobs({
+      status: "all",
+      artist,
+      release: title || undefined,
+      limit: 20,
+      sinceDays: 180,
+    });
+
+    recentDownloads = jobs.map((job) => {
+      const files = getJobFiles(job.id);
+      return {
+        job_id: job.id,
+        artist: job.artist,
+        release: job.release_title,
+        status: job.status,
+        created_at: job.created_at,
+        updated_at: job.updated_at,
+        audio_files: files
+          .filter((f) => f.kind === "audio")
+          .map((f) => ({ filename: f.logical_filename, status: f.status })),
+        lyrics_files: files
+          .filter((f) => f.kind === "lyrics")
+          .map((f) => ({ filename: f.logical_filename, status: f.status })),
+      };
+    });
+  }
+
+  let scanStatus: Awaited<ReturnType<typeof getLibraryScanStatus>> | undefined;
+  try {
+    scanStatus = await getLibraryScanStatus();
+  } catch {
+    scanStatus = undefined;
+  }
+
   const response = {
     query: { artist, title: title || undefined, release_type },
     owned: ownershipResult.owned,
     confidence: Math.round(ownershipResult.confidence * 100) / 100,
-    matches: ownershipResult.matches.map((m) => ({
-      artist: m.artist,
-      title: m.title,
-      year: m.year,
-      track_count: m.trackCount,
-      navidrome_id: m.navidromeId,
-      confidence: Math.round(m.confidence * 100) / 100,
-      match_reasons: m.matchReasons,
-    })),
+    indexed: ownershipResult.owned,
+    scan: scanStatus,
+    matches,
+    recent_downloads: recentDownloads,
+    handoff_hint: buildHandoffHint({
+      owned: ownershipResult.owned,
+      scanning: scanStatus?.scanning,
+      recentDownloads,
+      topMatch: matches[0],
+    }),
   };
 
-  // Cache for configured duration
-  setCache(cacheKey, response, config.LIBRARY_CACHE_MINUTES * 60 * 1000);
+  // Cache ownership match only (downloads/scan stay fresh on each request when include_downloads)
+  if (!include_downloads) {
+    setCache(cacheKey, response, config.LIBRARY_CACHE_MINUTES * 60 * 1000);
+  }
 
   return c.json(response);
 });
+
+function buildHandoffHint(params: {
+  owned: boolean;
+  scanning?: boolean;
+  recentDownloads?: Array<Record<string, unknown>>;
+  topMatch?: Record<string, unknown>;
+}): string {
+  const { owned, scanning, recentDownloads, topMatch } = params;
+  const hasCompletedJob = recentDownloads?.some((j) => j.status === "completed");
+
+  if (owned && topMatch?.navidrome_id) {
+    if (topMatch.songs) {
+      return "Release indexed. Use navidrome_id from matches[0] with auditReleaseLyrics or fillMissingLyrics.";
+    }
+    return "Release indexed. Use matches[0].navidrome_id with auditReleaseLyrics or fillMissingLyrics.";
+  }
+
+  if (hasCompletedJob && !owned) {
+    if (scanning) {
+      return "Download completed but not indexed yet. Navidrome scan in progress — retry searchLibrary, then run lyrics audit/fill.";
+    }
+    return "Download completed but not indexed in Navidrome. Run startLibraryScan, wait, then retry searchLibrary before lyrics audit/fill.";
+  }
+
+  if (recentDownloads?.some((j) => j.status === "downloading" || j.status === "queued")) {
+    return "Download in progress. Poll getTransfers or retry after completion.";
+  }
+
+  return "No indexed match and no recent completed download found for this query.";
+}
 
 libraryRoutes.get("/library/overview", async (c) => {
   const config = getConfig();
@@ -78,12 +191,18 @@ libraryRoutes.get("/library/overview", async (c) => {
   const by =
     c.req.query("by") === "play_count" ? "play_count" : "album_count";
 
-  const cacheKey = `lib:overview:${by}:${topLimit}`;
-  const cached = getCache<unknown>(cacheKey);
-  if (cached) return c.json(cached);
+  const cacheKey = `lib:overview:v3:${by}:${topLimit}`;
+  const cached = getCache<Record<string, unknown>>(cacheKey);
+  if (cached) {
+    return c.json(attachDiskUsageToOverview(cached));
+  }
 
   const artists = await navidrome.getArtists();
   const totalAlbums = artists.reduce((sum, a) => sum + (a.albumCount ?? 0), 0);
+
+  if (!getCachedLibraryDiskUsage() && getConfig().LIBRARY_MUSIC_PATH?.trim()) {
+    scheduleLibraryDiskUsageRefresh();
+  }
 
   let topArtists: Array<{
     name: string;
@@ -121,7 +240,7 @@ libraryRoutes.get("/library/overview", async (c) => {
       }));
   }
 
-  const response = {
+  const base = {
     summary: {
       artist_count: artists.length,
       album_count: totalAlbums,
@@ -134,9 +253,46 @@ libraryRoutes.get("/library/overview", async (c) => {
     top_artists: topArtists,
   };
 
-  setCache(cacheKey, response, config.LIBRARY_CACHE_MINUTES * 60 * 1000);
-  return c.json(response);
+  setCache(cacheKey, base, config.LIBRARY_CACHE_MINUTES * 60 * 1000);
+  return c.json(attachDiskUsageToOverview(base));
 });
+
+function attachDiskUsageToOverview(
+  overview: Record<string, unknown>
+): Record<string, unknown> {
+  const summary = { ...(overview.summary as Record<string, unknown>) };
+  delete summary.disk_bytes;
+  delete summary.disk_gb;
+  delete summary.disk_tb;
+  delete summary.disk_display;
+  delete summary.disk_status;
+
+  const diskUsage = getCachedLibraryDiskUsage();
+  if (!diskUsage && getConfig().LIBRARY_MUSIC_PATH?.trim()) {
+    scheduleLibraryDiskUsageRefresh();
+  }
+
+  return {
+    ...overview,
+    summary: {
+      ...summary,
+      ...(diskUsage
+        ? {
+            disk_bytes: diskUsage.bytes,
+            disk_gb: diskUsage.gb,
+            disk_tb: diskUsage.tb,
+            disk_display: diskUsage.display,
+          }
+        : getConfig().LIBRARY_MUSIC_PATH?.trim()
+          ? {
+              disk_status: isLibraryDiskUsageRefreshPending()
+                ? "computing"
+                : "unavailable",
+            }
+          : {}),
+    },
+  };
+}
 
 libraryRoutes.get("/library/artists", async (c) => {
   const config = getConfig();
@@ -221,12 +377,8 @@ libraryRoutes.get("/library/artists", async (c) => {
 });
 
 libraryRoutes.get("/library/scan", async (c) => {
-  const status = await navidrome.getScanStatus();
-
-  return c.json({
-    scanning: status.scanning,
-    last_scan: status.count ? undefined : undefined,
-  });
+  const status = await getLibraryScanStatus();
+  return c.json(status);
 });
 
 libraryRoutes.post("/library/scan", async (c) => {

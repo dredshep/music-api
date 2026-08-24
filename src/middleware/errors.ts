@@ -7,7 +7,8 @@ export class AppError extends Error {
     message: string,
     public status: number = 500,
     public retryable: boolean = false,
-    public details?: unknown
+    public details?: unknown,
+    public retryAfterMs?: number
   ) {
     super(message);
     this.name = "AppError";
@@ -30,8 +31,11 @@ const UPSTREAM_CODES = new Set([
   "SLSKD_RATE_LIMITED",
   "NAVIDROME_UNAVAILABLE",
   "MUSICBRAINZ_ERROR",
+  "MUSICBRAINZ_UNAVAILABLE",
+  "MUSICBRAINZ_RATE_LIMITED",
   "LASTFM_ERROR",
   "LISTENBRAINZ_ERROR",
+  "LRCLIB_ERROR",
 ]);
 
 const SANITIZED_MESSAGES: Record<string, string> = {
@@ -39,13 +43,17 @@ const SANITIZED_MESSAGES: Record<string, string> = {
   SLSKD_RATE_LIMITED: "Soulseek search rate limit reached",
   NAVIDROME_UNAVAILABLE: "Library service is temporarily unavailable",
   MUSICBRAINZ_ERROR: "Metadata service is temporarily unavailable",
+  MUSICBRAINZ_UNAVAILABLE: "Metadata service is temporarily unavailable",
+  MUSICBRAINZ_RATE_LIMITED: "Metadata service is temporarily unavailable",
   LASTFM_ERROR: "Last.fm service is temporarily unavailable",
   LISTENBRAINZ_ERROR: "ListenBrainz service is temporarily unavailable",
+  LRCLIB_ERROR: "Lyrics service is temporarily unavailable",
 };
 
 export function formatErrorResponse(err: unknown): {
   status: number;
   body: Record<string, unknown>;
+  retryAfterSeconds?: number;
 } {
   if (isAppError(err)) {
     log("warn", "app_error", {
@@ -62,8 +70,12 @@ export function formatErrorResponse(err: unknown): {
       retryable: err.retryable,
     };
     if (!isUpstream && err.details) error.details = err.details;
+    if (err.retryAfterMs != null) error.retry_after_ms = err.retryAfterMs;
 
-    return { status: err.status, body: { error } };
+    const retryAfterSeconds =
+      err.retryAfterMs != null ? Math.ceil(err.retryAfterMs / 1000) : undefined;
+
+    return { status: err.status, body: { error }, retryAfterSeconds };
   }
 
   const message =
@@ -91,7 +103,10 @@ export function errorHandler(): MiddlewareHandler {
     try {
       await next();
     } catch (err) {
-      const { status, body } = formatErrorResponse(err);
+      const { status, body, retryAfterSeconds } = formatErrorResponse(err);
+      if (retryAfterSeconds != null) {
+        c.header("Retry-After", String(retryAfterSeconds));
+      }
       return c.json(body, status as 400);
     }
   };

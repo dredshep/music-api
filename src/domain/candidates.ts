@@ -238,6 +238,74 @@ export function selectDownloadFiles(files: CandidateFile[]): CandidateFile[] {
   return selected;
 }
 
+/**
+ * Select only the audio file best matching `trackTitle`, its .lrc sidecar,
+ * and one cover image. For track/single acquisition that avoids downloading
+ * the entire directory.
+ */
+export function selectMatchedTrackFiles(
+  files: CandidateFile[],
+  trackTitle: string
+): CandidateFile[] {
+  const audioFiles = files.filter((f) => f.kind === "audio");
+  if (audioFiles.length === 0) return [];
+
+  const normalizedTitle = normalizeFileStem(trackTitle);
+
+  // Score each audio file by how well its stem matches the track title
+  let bestFile = audioFiles[0]!;
+  let bestScore = -1;
+
+  for (const f of audioFiles) {
+    const stem = normalizeFileStem(getFilename(f.filename));
+    let score = 0;
+
+    if (stem === normalizedTitle) {
+      score = 100;
+    } else if (stem.includes(normalizedTitle) || normalizedTitle.includes(stem)) {
+      score = 60;
+    } else {
+      // Strip leading track numbers like "01 - " or "01. "
+      const stripped = stem.replace(/^\d+[\s.\-_]+/, "");
+      const strippedTitle = normalizedTitle.replace(/^\d+[\s.\-_]+/, "");
+      if (stripped === strippedTitle) {
+        score = 90;
+      } else if (stripped.includes(strippedTitle) || strippedTitle.includes(stripped)) {
+        score = 50;
+      }
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestFile = f;
+    }
+  }
+
+  const selected: CandidateFile[] = [bestFile];
+  const audioStem = normalizeFileStem(getFilename(bestFile.filename));
+
+  // Add matching .lrc
+  for (const f of files) {
+    if (f.kind === "lyrics" && f.extension === ".lrc") {
+      const lrcStem = normalizeFileStem(getFilename(f.filename));
+      if (lrcStem === audioStem) {
+        selected.push(f);
+      }
+    }
+  }
+
+  // Add one cover image
+  const cover = files.find((f) => {
+    if (f.kind !== "image") return false;
+    const name = getFilename(f.filename).toLowerCase();
+    return name.includes("cover") || name.includes("folder") || name.includes("front");
+  }) ?? files.find((f) => f.kind === "image");
+
+  if (cover) selected.push(cover);
+
+  return selected;
+}
+
 function dedupeByFilename(files: CandidateFile[]): CandidateFile[] {
   const seen = new Set<string>();
   const out: CandidateFile[] = [];

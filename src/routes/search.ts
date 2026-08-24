@@ -4,22 +4,33 @@ import { AppError } from "../middleware/errors";
 import { getConfig } from "../config";
 import { log } from "../middleware/logging";
 import * as slskd from "../services/slskd";
-import { createSearch, getSearch, isSearchExpired } from "../db/repositories/searches";
+import type { SearchCollectionDiagnostics } from "../services/slskd";
 import {
-  createCandidate,
+  createSearch,
+  getSearch,
+  isSearchExpired,
+  updateSearchLifecycle,
+  buildSearchLifecycle,
+  type SearchRecord,
+} from "../db/repositories/searches";
+import {
+  upsertCandidate,
   getCandidatesBySearch,
+  type CandidateRecord,
 } from "../db/repositories/candidates";
 import {
   groupByDirectory,
   computeStats,
   buildDisplayRelease,
+  classifyFile,
+  getFilename,
   type RawCandidate,
+  type CandidateFile,
 } from "../domain/candidates";
 import { detectFlags } from "../domain/flags";
 import { scoreCandidate } from "../domain/scoring";
 import { matchLibraryAlbums } from "../domain/matching";
 import * as navidrome from "../services/navidrome";
-import { getCache, setCache } from "../db/repositories/cache";
 import { searchSemaphore } from "../middleware/semaphore";
 
 export const searchRoutes = new Hono();
@@ -38,160 +49,115 @@ const searchSchema = z.object({
   max_candidates: z.coerce.number().min(1).max(20).optional().default(10),
 });
 
+// --- POST /search: start a new search ---
+
 searchRoutes.post("/search", async (c) => {
   return searchSemaphore.run(async () => {
-  const body = await c.req.json();
-  const parsed = searchSchema.safeParse(body);
+    const body = await c.req.json();
+    const parsed = searchSchema.safeParse(body);
 
-  if (!parsed.success) {
-    throw new AppError(
-      "VALIDATION_ERROR",
-      parsed.error.issues.map((i) => i.message).join("; "),
-      400
-    );
-  }
+    if (!parsed.success) {
+      throw new AppError(
+        "VALIDATION_ERROR",
+        parsed.error.issues.map((i) => i.message).join("; "),
+        400
+      );
+    }
 
-  const { artist, title, release_type, preferred_formats, prefer_lrc, max_candidates } =
-    parsed.data;
-  const config = getConfig();
+    const { artist, title, release_type, preferred_formats, prefer_lrc, max_candidates } =
+      parsed.data;
+    const config = getConfig();
 
-  // Generate search queries (2-4 variants)
-  const queries = generateSearchQueries(artist, title, preferred_formats);
+    const queries = generateSearchQueries(artist, title, preferred_formats);
 
-  log("info", "soulseek_search_initiated", {
-    artist,
-    title,
-    queries: queries.length,
-  });
-
-  // Start slskd searches serially (slskd allows only one concurrent start)
-  const searches = await slskd.startSearches(queries);
-  const slskdSearchIds = searches.map((s) => s.id);
-
-  // Wait for responses
-  const allResponses = await Promise.all(
-    slskdSearchIds.map((id) =>
-      slskd.waitForSearchCompletion(id, config.SEARCH_COLLECTION_MS)
-    )
-  );
-
-  const flatResponses = allResponses.flat();
-
-  // Group by peer + directory
-  const rawCandidates = groupByDirectory(flatResponses);
-
-  // Pre-rank and take top N for enrichment
-  const preRanked = preRankCandidates(rawCandidates, artist, title);
-  const topCandidates = preRanked.slice(0, 30);
-
-  // Directory enrichment: fetch full directory contents for top candidates
-  const enriched = await enrichCandidates(topCandidates);
-
-  // Build, score, and persist candidates
-  const searchRecord = createSearch({
-    artist,
-    title,
-    releaseType: release_type,
-    rawQuery: queries.join(" | "),
-    slskdSearchIds,
-    ttlMinutes: config.SEARCH_RESULT_TTL_MINUTES,
-  });
-
-  const candidateRecords = [];
-  for (const raw of enriched.slice(0, max_candidates * 2)) {
-    const stats = computeStats(raw.files);
-    if (stats.audioFileCount === 0) continue;
-
-    const flags = detectFlags({
-      directoryName: raw.directory,
-      filenames: raw.files.map((f) => f.filename),
-      audioFormats: stats.audioFormats,
-      audioFileCount: stats.audioFileCount,
-      lrcCount: stats.matchingLrcCount,
-      freeUploadSlots: raw.freeUploadSlots,
-      uploadSpeed: raw.uploadSpeed,
-      queueLength: raw.queueLength,
+    log("info", "soulseek_search_initiated", {
+      artist,
+      title,
+      queries: queries.length,
     });
 
-    const scoring = scoreCandidate({
-      stats,
-      flags,
-      freeUploadSlots: raw.freeUploadSlots,
-      uploadSpeed: raw.uploadSpeed,
-      queueLength: raw.queueLength,
+    // Start slskd searches serially
+    const searches = await slskd.startSearches(queries);
+    const slskdSearchIds = searches.map((s) => s.id);
+
+    // Create the search record immediately with original options
+    const searchRecord = createSearch({
+      artist,
+      title,
+      releaseType: release_type,
+      rawQuery: queries.join(" | "),
+      slskdSearchIds,
+      ttlMinutes: config.SEARCH_RESULT_TTL_MINUTES,
       preferredFormats: preferred_formats,
+      preferLrc: prefer_lrc,
+      maxCandidates: max_candidates,
+    });
+
+    // Adaptive collection. When prefer_lrc, poll longer for LRC-bearing peers.
+    const { responses, diagnostics } = await slskd.collectSearchResults(slskdSearchIds, {
+      minMs: config.SEARCH_COLLECTION_MS,
+      maxMs: prefer_lrc ? 45000 : 30000,
       preferLrc: prefer_lrc,
     });
 
-    const displayRelease = buildDisplayRelease(raw.directory, artist, title);
-
-    const record = createCandidate({
-      searchId: searchRecord.id,
-      peer: raw.peer,
-      remoteDirectory: raw.directory,
-      displayRelease,
-      format: stats.dominantFormat,
-      trackCount: stats.trackCount,
-      audioFileCount: stats.audioFileCount,
-      lrcCount: stats.matchingLrcCount,
-      imageCount: stats.imageCount,
-      sidecarCount: stats.sidecarCount,
-      lrcCoverage: stats.lrcCoverage,
-      totalBytes: stats.totalBytes,
-      uploadSpeed: raw.uploadSpeed,
-      freeUploadSlots: raw.freeUploadSlots,
-      queueLength: raw.queueLength,
-      score: scoring.score,
-      reason: scoring.reason,
-      flags,
-      files: raw.files,
-      ttlMinutes: config.SEARCH_RESULT_TTL_MINUTES,
+    // Build, enrich, score, and persist candidates
+    const result = await processResponses({
+      responses,
+      searchRecord,
+      artist,
+      title,
+      releaseType: release_type,
+      preferredFormats: preferred_formats,
+      preferLrc: prefer_lrc,
+      maxCandidates: max_candidates,
     });
 
-    candidateRecords.push(record);
-  }
+    // Update lifecycle
+    const lifecycle = buildSearchLifecycle(searchRecord, diagnostics);
+    updateSearchLifecycle(searchRecord.id, {
+      state: diagnostics.settled ? "settled" : "collecting",
+      diagnostics,
+      candidateCount: result.candidates.length,
+      lifecycle,
+    });
 
-  // Sort by score and limit
-  candidateRecords.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  const finalCandidates = candidateRecords.slice(0, max_candidates);
+    const warnings = buildWarnings(diagnostics, result.candidates.length);
 
-  log("info", "soulseek_search_completed", {
-    search_id: searchRecord.id,
-    raw_results: flatResponses.reduce((sum, r) => sum + r.files.length, 0),
-    candidate_directories: rawCandidates.length,
-    directories_enriched: enriched.length,
-    returned_candidates: finalCandidates.length,
-  });
+    log("info", "soulseek_search_completed", {
+      search_id: searchRecord.id,
+      raw_results: diagnostics.rawFileCount,
+      candidate_directories: diagnostics.uniqueDirectories,
+      directories_enriched: result.enrichedCount,
+      returned_candidates: result.candidates.length,
+      settled: diagnostics.settled,
+    });
 
-  return c.json({
-    search_id: searchRecord.id,
-    query: { artist, title, release_type },
-    candidates: finalCandidates.map((r) => ({
-      id: r.id,
-      release: r.display_release,
-      peer: r.peer,
-      format: r.format,
-      track_count: r.track_count,
-      lrc_count: r.lrc_count,
-      lrc_coverage: r.lrc_coverage,
-      has_cover: (r.image_count ?? 0) > 0,
-      size_mb: r.total_bytes ? Math.round((r.total_bytes / 1024 / 1024) * 10) / 10 : null,
-      upload_speed_mbps: r.upload_speed
-        ? Math.round((r.upload_speed / 1000000) * 10) / 10
-        : null,
-      free_upload_slots: Boolean(r.free_upload_slots),
-      queue_length: r.queue_length,
-      score: r.score,
-      flags: r.flags_json ? JSON.parse(r.flags_json) : [],
-      reason: r.reason,
-    })),
-  });
+    return c.json({
+      search_id: searchRecord.id,
+      query: { artist, title, release_type },
+      lifecycle,
+      diagnostics: {
+        raw_file_count: diagnostics.rawFileCount,
+        locked_file_count: diagnostics.lockedFileCount,
+        peer_response_count: diagnostics.peerResponseCount,
+        unique_peers: diagnostics.uniquePeers,
+        unique_directories: diagnostics.uniqueDirectories,
+        audio_directories: diagnostics.audioDirectories,
+        lrc_directories: diagnostics.lrcDirectories,
+        collection_ms: diagnostics.collectionMs,
+        enrichment_successes: result.enrichedCount,
+        enrichment_failures: result.enrichmentFailures,
+      },
+      warnings,
+      candidates: result.candidates.map(serializeCandidate),
+    });
   });
 });
 
+// --- GET /searches/:search_id: refresh an existing search ---
+
 searchRoutes.get("/searches/:search_id", async (c) => {
   const searchId = c.req.param("search_id");
-  const config = getConfig();
 
   const search = getSearch(searchId);
   if (!search) {
@@ -206,93 +172,56 @@ searchRoutes.get("/searches/:search_id", async (c) => {
     );
   }
 
-  // Re-poll slskd searches for updated results
+  const config = getConfig();
+
+  // Recover original search options
+  const opts = parseSearchOptions(search);
+
   const slskdIds: string[] = search.slskd_search_ids_json
     ? JSON.parse(search.slskd_search_ids_json)
     : [];
 
+  let diagnostics: SearchCollectionDiagnostics | null = null;
+
   if (slskdIds.length > 0) {
-    const freshResponses = await Promise.all(
-      slskdIds.map((id) => slskd.getSearchResponses(id))
-    );
-    const flatResponses = freshResponses.flat();
-    const rawCandidates = groupByDirectory(flatResponses);
-    const preRanked = preRankCandidates(rawCandidates, search.artist, search.title);
-    const enriched = await enrichCandidates(preRanked.slice(0, 30));
+    const collection = await slskd.refreshSearchResults(slskdIds, {
+      waitMs: 15000,
+    });
+    diagnostics = collection.diagnostics;
 
-    // Re-score and update candidates
-    for (const raw of enriched) {
-      const stats = computeStats(raw.files);
-      if (stats.audioFileCount === 0) continue;
+    // Re-process and upsert candidates
+    await processResponses({
+      responses: collection.responses,
+      searchRecord: search,
+      artist: search.artist,
+      title: search.title,
+      releaseType: search.release_type ?? opts.releaseType,
+      preferredFormats: opts.preferredFormats,
+      preferLrc: opts.preferLrc,
+      maxCandidates: opts.maxCandidates,
+    });
 
-      const flags = detectFlags({
-        directoryName: raw.directory,
-        filenames: raw.files.map((f) => f.filename),
-        audioFormats: stats.audioFormats,
-        audioFileCount: stats.audioFileCount,
-        lrcCount: stats.matchingLrcCount,
-        freeUploadSlots: raw.freeUploadSlots,
-        uploadSpeed: raw.uploadSpeed,
-        queueLength: raw.queueLength,
-      });
-
-      const scoring = scoreCandidate({
-        stats,
-        flags,
-        freeUploadSlots: raw.freeUploadSlots,
-        uploadSpeed: raw.uploadSpeed,
-        queueLength: raw.queueLength,
-        preferLrc: true,
-      });
-
-      const displayRelease = buildDisplayRelease(
-        raw.directory,
-        search.artist,
-        search.title
-      );
-
-      createCandidate({
-        searchId: search.id,
-        peer: raw.peer,
-        remoteDirectory: raw.directory,
-        displayRelease,
-        format: stats.dominantFormat,
-        trackCount: stats.trackCount,
-        audioFileCount: stats.audioFileCount,
-        lrcCount: stats.matchingLrcCount,
-        imageCount: stats.imageCount,
-        sidecarCount: stats.sidecarCount,
-        lrcCoverage: stats.lrcCoverage,
-        totalBytes: stats.totalBytes,
-        uploadSpeed: raw.uploadSpeed,
-        freeUploadSlots: raw.freeUploadSlots,
-        queueLength: raw.queueLength,
-        score: scoring.score,
-        reason: scoring.reason,
-        flags,
-        files: raw.files,
-        ttlMinutes: config.SEARCH_RESULT_TTL_MINUTES,
-      });
-    }
+    const lifecycle = buildSearchLifecycle(search, diagnostics);
+    updateSearchLifecycle(search.id, {
+      state: diagnostics.settled ? "settled" : "collecting",
+      diagnostics,
+      candidateCount: getCandidatesBySearch(search.id).length,
+      lifecycle,
+    });
   }
 
-  // Return current candidates
+  // Return current candidates (deduped by upsert, sorted by score)
   const candidates = getCandidatesBySearch(searchId);
-  const maxCandidates = config.DEFAULT_MAX_CANDIDATES;
+  const maxCandidates = opts.maxCandidates;
+  const finalCandidates = candidates.slice(0, maxCandidates);
 
-  // Deduplicate by peer+directory, keep highest-scored
-  const seen = new Map<string, typeof candidates[0]>();
-  for (const cand of candidates) {
-    const key = `${cand.peer}::${cand.remote_directory}`;
-    const existing = seen.get(key);
-    if (!existing || (cand.score ?? 0) > (existing.score ?? 0)) {
-      seen.set(key, cand);
-    }
-  }
+  const lifecycle = diagnostics
+    ? buildSearchLifecycle(search, diagnostics)
+    : buildFallbackLifecycle(search);
 
-  const deduped = Array.from(seen.values())
-    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
-    .slice(0, maxCandidates);
+  const warnings = diagnostics
+    ? buildWarnings(diagnostics, finalCandidates.length)
+    : [];
 
   return c.json({
     search_id: search.id,
@@ -301,29 +230,26 @@ searchRoutes.get("/searches/:search_id", async (c) => {
       title: search.title,
       release_type: search.release_type,
     },
-    candidates: deduped.map((r) => ({
-      id: r.id,
-      release: r.display_release,
-      peer: r.peer,
-      format: r.format,
-      track_count: r.track_count,
-      lrc_count: r.lrc_count,
-      lrc_coverage: r.lrc_coverage,
-      has_cover: (r.image_count ?? 0) > 0,
-      size_mb: r.total_bytes ? Math.round((r.total_bytes / 1024 / 1024) * 10) / 10 : null,
-      upload_speed_mbps: r.upload_speed
-        ? Math.round((r.upload_speed / 1000000) * 10) / 10
-        : null,
-      free_upload_slots: Boolean(r.free_upload_slots),
-      queue_length: r.queue_length,
-      score: r.score,
-      flags: r.flags_json ? JSON.parse(r.flags_json) : [],
-      reason: r.reason,
-    })),
+    lifecycle,
+    diagnostics: diagnostics
+      ? {
+          raw_file_count: diagnostics.rawFileCount,
+          locked_file_count: diagnostics.lockedFileCount,
+          peer_response_count: diagnostics.peerResponseCount,
+          unique_peers: diagnostics.uniquePeers,
+          unique_directories: diagnostics.uniqueDirectories,
+          audio_directories: diagnostics.audioDirectories,
+          lrc_directories: diagnostics.lrcDirectories,
+          collection_ms: diagnostics.collectionMs,
+        }
+      : undefined,
+    warnings,
+    candidates: finalCandidates.map(serializeCandidate),
   });
 });
 
-// Convenience endpoint: check library first, then search if not owned
+// --- POST /acquire/preview: check library, then search ---
+
 const acquirePreviewSchema = z.object({
   artist: z.string().min(1),
   title: z.string().min(1),
@@ -346,6 +272,7 @@ searchRoutes.post("/acquire/preview", async (c) => {
   }
 
   const { artist, title, release_type } = parsed.data;
+  const config = getConfig();
 
   // Check library first
   const query = `${artist} ${title}`;
@@ -367,22 +294,11 @@ searchRoutes.post("/acquire/preview", async (c) => {
     });
   }
 
-  // Not owned — trigger Soulseek search via internal logic
-  const config = getConfig();
-  const queries = generateSearchQueries(artist, title, ["FLAC", "MP3"]);
+  // Not owned — search via unified path
+  const preferredFormats: Array<"FLAC" | "MP3"> = ["FLAC", "MP3"];
+  const queries = generateSearchQueries(artist, title, preferredFormats);
   const searches = await slskd.startSearches(queries);
   const slskdSearchIds = searches.map((s) => s.id);
-
-  const allResponses = await Promise.all(
-    slskdSearchIds.map((id) =>
-      slskd.waitForSearchCompletion(id, config.SEARCH_COLLECTION_MS)
-    )
-  );
-
-  const flatResponses = allResponses.flat();
-  const rawCandidates = groupByDirectory(flatResponses);
-  const preRanked = preRankCandidates(rawCandidates, artist, title);
-  const enriched = await enrichCandidates(preRanked.slice(0, 30));
 
   const searchRecord = createSearch({
     artist,
@@ -391,10 +307,82 @@ searchRoutes.post("/acquire/preview", async (c) => {
     rawQuery: queries.join(" | "),
     slskdSearchIds,
     ttlMinutes: config.SEARCH_RESULT_TTL_MINUTES,
+    preferredFormats,
+    preferLrc: true,
+    maxCandidates: config.DEFAULT_MAX_CANDIDATES,
   });
 
-  const candidateRecords = [];
-  for (const raw of enriched.slice(0, 20)) {
+  const { responses, diagnostics } = await slskd.collectSearchResults(slskdSearchIds, {
+    minMs: config.SEARCH_COLLECTION_MS,
+    maxMs: 45000,
+    preferLrc: true,
+  });
+
+  const result = await processResponses({
+    responses,
+    searchRecord,
+    artist,
+    title,
+    releaseType: release_type,
+    preferredFormats,
+    preferLrc: true,
+    maxCandidates: config.DEFAULT_MAX_CANDIDATES,
+  });
+
+  const lifecycle = buildSearchLifecycle(searchRecord, diagnostics);
+  updateSearchLifecycle(searchRecord.id, {
+    state: diagnostics.settled ? "settled" : "collecting",
+    diagnostics,
+    candidateCount: result.candidates.length,
+    lifecycle,
+  });
+
+  const finalCandidates = result.candidates.slice(0, config.DEFAULT_MAX_CANDIDATES);
+
+  return c.json({
+    status: "not_owned",
+    library_match: null,
+    search_id: searchRecord.id,
+    lifecycle,
+    candidates: finalCandidates.map(serializeCandidate),
+  });
+});
+
+// --- Shared pipeline ---
+
+interface ProcessResult {
+  candidates: CandidateRecord[];
+  enrichedCount: number;
+  enrichmentFailures: number;
+}
+
+async function processResponses(params: {
+  responses: slskd.SearchCollectionResult["responses"];
+  searchRecord: SearchRecord;
+  artist: string;
+  title: string;
+  releaseType: string;
+  preferredFormats: string[];
+  preferLrc: boolean;
+  maxCandidates: number;
+}): Promise<ProcessResult> {
+  const { responses, searchRecord, artist, title, releaseType, preferredFormats, preferLrc, maxCandidates } = params;
+  const config = getConfig();
+
+  const rawCandidates = groupByDirectory(responses);
+  const preRanked = preRankCandidates(rawCandidates, artist, title);
+
+  // Enrichment pool: 30 normally, 60 for prefer_lrc
+  const enrichmentLimit = preferLrc ? 60 : 30;
+  const topCandidates = preRanked.slice(0, enrichmentLimit);
+
+  const { enriched, failures } = await enrichCandidatesWithTimeout(topCandidates, {
+    timeoutMs: 10000,
+    concurrency: 5,
+  });
+
+  const candidateRecords: CandidateRecord[] = [];
+  for (const raw of enriched.slice(0, maxCandidates * 2)) {
     const stats = computeStats(raw.files);
     if (stats.audioFileCount === 0) continue;
 
@@ -415,12 +403,15 @@ searchRoutes.post("/acquire/preview", async (c) => {
       freeUploadSlots: raw.freeUploadSlots,
       uploadSpeed: raw.uploadSpeed,
       queueLength: raw.queueLength,
-      preferLrc: true,
+      expectedTrackCount: undefined,
+      preferredFormats,
+      preferLrc,
+      releaseType,
     });
 
     const displayRelease = buildDisplayRelease(raw.directory, artist, title);
 
-    const record = createCandidate({
+    const record = upsertCandidate({
       searchId: searchRecord.id,
       peer: raw.peer,
       remoteDirectory: raw.directory,
@@ -447,33 +438,82 @@ searchRoutes.post("/acquire/preview", async (c) => {
   }
 
   candidateRecords.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
-  const finalCandidates = candidateRecords.slice(0, config.DEFAULT_MAX_CANDIDATES);
+  return {
+    candidates: candidateRecords.slice(0, maxCandidates),
+    enrichedCount: enriched.length,
+    enrichmentFailures: failures,
+  };
+}
 
-  return c.json({
-    status: "not_owned",
-    library_match: null,
-    search_id: searchRecord.id,
-    candidates: finalCandidates.map((r) => ({
-      id: r.id,
-      release: r.display_release,
-      peer: r.peer,
-      format: r.format,
-      track_count: r.track_count,
-      lrc_count: r.lrc_count,
-      lrc_coverage: r.lrc_coverage,
-      has_cover: (r.image_count ?? 0) > 0,
-      size_mb: r.total_bytes ? Math.round((r.total_bytes / 1024 / 1024) * 10) / 10 : null,
-      upload_speed_mbps: r.upload_speed
-        ? Math.round((r.upload_speed / 1000000) * 10) / 10
-        : null,
-      free_upload_slots: Boolean(r.free_upload_slots),
-      queue_length: r.queue_length,
-      score: r.score,
-      flags: r.flags_json ? JSON.parse(r.flags_json) : [],
-      reason: r.reason,
-    })),
-  });
-});
+// --- Enrichment with concurrency and timeout ---
+
+async function enrichCandidatesWithTimeout(
+  candidates: RawCandidate[],
+  opts: { timeoutMs: number; concurrency: number }
+): Promise<{ enriched: RawCandidate[]; failures: number }> {
+  const { timeoutMs, concurrency } = opts;
+  const deadline = Date.now() + timeoutMs;
+  const enriched: RawCandidate[] = [];
+  let failures = 0;
+
+  // Process in batches of `concurrency`
+  for (let i = 0; i < candidates.length; i += concurrency) {
+    if (Date.now() >= deadline) {
+      // Budget exhausted — use original files for remaining
+      for (let j = i; j < candidates.length; j++) {
+        enriched.push(candidates[j]);
+      }
+      break;
+    }
+
+    const batch = candidates.slice(i, i + concurrency);
+    const remaining = deadline - Date.now();
+
+    const results = await Promise.all(
+      batch.map((raw) => enrichSingleCandidate(raw, remaining))
+    );
+
+    for (const r of results) {
+      enriched.push(r.candidate);
+      if (!r.success) failures++;
+    }
+  }
+
+  return { enriched, failures };
+}
+
+async function enrichSingleCandidate(
+  raw: RawCandidate,
+  timeoutMs: number
+): Promise<{ candidate: RawCandidate; success: boolean }> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const dirInfo = await slskd.getUserDirectory(raw.peer, raw.directory);
+
+      if (dirInfo?.files && dirInfo.files.length > 0) {
+        const enrichedFiles: CandidateFile[] = dirInfo.files.map((f) => {
+          const fname = getFilename(f.filename);
+          const { kind, extension } = classifyFile(fname);
+          return { filename: f.filename, size: f.size, kind, extension };
+        });
+
+        return {
+          candidate: { ...raw, files: enrichedFiles },
+          success: true,
+        };
+      }
+    } finally {
+      clearTimeout(timeout);
+    }
+
+    return { candidate: raw, success: true };
+  } catch {
+    return { candidate: raw, success: false };
+  }
+}
 
 // --- Helpers ---
 
@@ -487,7 +527,6 @@ function generateSearchQueries(
   queries.push(`${artist} ${title}`);
   queries.push(`${artist} - ${title}`);
 
-  // Add format-specific query for top preferred format
   const topFormat = preferredFormats[0];
   if (topFormat) {
     queries.push(`${artist} ${title} ${topFormat}`);
@@ -501,7 +540,6 @@ function preRankCandidates(
   artist: string,
   title: string
 ): RawCandidate[] {
-  // Quick pre-rank: prefer directories with more audio files and free slots
   return candidates
     .map((c) => {
       const audioCount = c.files.filter((f) => f.kind === "audio").length;
@@ -520,37 +558,97 @@ function preRankCandidates(
     .map((x) => x.candidate);
 }
 
-async function enrichCandidates(
-  candidates: RawCandidate[]
-): Promise<RawCandidate[]> {
-  const enriched: RawCandidate[] = [];
-
-  for (const raw of candidates) {
+function parseSearchOptions(search: SearchRecord): {
+  preferredFormats: string[];
+  preferLrc: boolean;
+  maxCandidates: number;
+  releaseType: string;
+} {
+  if (search.search_options_json) {
     try {
-      const dirInfo = await slskd.getUserDirectory(raw.peer, raw.directory);
-
-      if (dirInfo && dirInfo.files && dirInfo.files.length > 0) {
-        // Replace with enriched file list
-        const { classifyFile, getFilename } = await import("../domain/candidates");
-        const enrichedFiles = dirInfo.files.map((f) => {
-          const fname = getFilename(f.filename);
-          const { kind, extension } = classifyFile(fname);
-          return { filename: f.filename, size: f.size, kind, extension };
-        });
-
-        enriched.push({
-          ...raw,
-          files: enrichedFiles,
-        });
-      } else {
-        // Use original search-hit files
-        enriched.push(raw);
-      }
+      const opts = JSON.parse(search.search_options_json);
+      return {
+        preferredFormats: opts.preferred_formats ?? ["FLAC", "MP3"],
+        preferLrc: opts.prefer_lrc ?? true,
+        maxCandidates: opts.max_candidates ?? 10,
+        releaseType: opts.release_type ?? search.release_type ?? "album",
+      };
     } catch {
-      // Enrichment failed; use original files
-      enriched.push(raw);
+      // fall through
     }
   }
 
-  return enriched;
+  return {
+    preferredFormats: search.preferred_formats_json
+      ? JSON.parse(search.preferred_formats_json)
+      : ["FLAC", "MP3"],
+    preferLrc: search.prefer_lrc === 1,
+    maxCandidates: search.max_candidates ?? 10,
+    releaseType: search.release_type ?? "album",
+  };
+}
+
+function serializeCandidate(r: CandidateRecord) {
+  return {
+    id: r.id,
+    release: r.display_release,
+    peer: r.peer,
+    format: r.format,
+    track_count: r.track_count,
+    lrc_count: r.lrc_count,
+    lrc_coverage: r.lrc_coverage,
+    has_cover: (r.image_count ?? 0) > 0,
+    size_mb: r.total_bytes ? Math.round((r.total_bytes / 1024 / 1024) * 10) / 10 : null,
+    upload_speed_mbps: r.upload_speed
+      ? Math.round((r.upload_speed / 1000000) * 10) / 10
+      : null,
+    free_upload_slots: Boolean(r.free_upload_slots),
+    queue_length: r.queue_length,
+    score: r.score,
+    flags: r.flags_json ? JSON.parse(r.flags_json) : [],
+    reason: r.reason,
+  };
+}
+
+function buildWarnings(
+  diagnostics: SearchCollectionDiagnostics,
+  candidateCount: number
+): string[] {
+  const warnings: string[] = [];
+
+  if (diagnostics.rawFileCount > 0 && candidateCount === 0) {
+    warnings.push("raw_results_without_candidates");
+  }
+
+  if (!diagnostics.settled && candidateCount === 0) {
+    warnings.push("search_still_collecting");
+  }
+
+  const failedSearches = diagnostics.searchStates.filter((s) =>
+    s.state.toLowerCase().includes("errored") || s.state.toLowerCase().includes("timedout")
+  );
+  if (failedSearches.length > 0 && failedSearches.length < diagnostics.searchStates.length) {
+    warnings.push("partial_upstream_failure");
+  }
+
+  return warnings;
+}
+
+function buildFallbackLifecycle(search: SearchRecord) {
+  const ageMs = Date.now() - new Date(search.created_at).getTime();
+  if (search.lifecycle_json) {
+    try {
+      return JSON.parse(search.lifecycle_json);
+    } catch {
+      // fall through
+    }
+  }
+  return {
+    state: search.state ?? "collecting",
+    age_ms: ageMs,
+    collection_ms: 0,
+    settled: search.state === "settled",
+    last_new_result_at: search.last_refreshed_at,
+    recommended_refresh_after_ms: null,
+  };
 }

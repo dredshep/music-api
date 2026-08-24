@@ -5,7 +5,10 @@
   "scripts": {
     "dev": "bun run --watch src/index.ts",
     "start": "bun run src/index.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "check:openapi": "bun run scripts/check-openapi.ts",
+    "check:service-refs": "bun run scripts/check-service-refs.ts",
+    "check": "bun run check:openapi && bun run check:service-refs"
   },
   "dependencies": {
     "hono": "^4.7.0",

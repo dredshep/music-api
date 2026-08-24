@@ -13,9 +13,11 @@ import { downloadRoutes } from "./routes/downloads";
 import { suggestionRoutes } from "./routes/suggestions";
 import { suggestionsUiRoute } from "./routes/suggestions-ui";
 import { recommendationRoutes } from "./routes/recommendations";
+import { lyricsRoutes } from "./routes/lyrics";
 import { openapiRoute } from "./routes/openapi";
 import { initDatabase } from "./db/database";
 import { startCleanupTimer } from "./db/cleanup";
+import { warmLibraryDiskUsageCache } from "./services/library-storage";
 
 const config = loadConfig();
 
@@ -24,7 +26,10 @@ initDatabase();
 const app = new Hono<{ Variables: AppVariables }>();
 
 app.onError((err, c) => {
-  const { status, body } = formatErrorResponse(err);
+  const { status, body, retryAfterSeconds } = formatErrorResponse(err);
+  if (retryAfterSeconds != null) {
+    c.header("Retry-After", String(retryAfterSeconds));
+  }
   return c.json(body, status as 400);
 });
 
@@ -61,8 +66,10 @@ app.route("/v1", searchRoutes);
 app.route("/v1", downloadRoutes);
 app.route("/v1", suggestionRoutes);
 app.route("/v1", recommendationRoutes);
+app.route("/v1", lyricsRoutes);
 
 startCleanupTimer();
+warmLibraryDiskUsageCache();
 
 console.log(
   JSON.stringify({

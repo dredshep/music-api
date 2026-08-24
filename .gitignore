@@ -1,3 +1,8 @@
 .env
 node_modules/
 data/
+.tg-cursor/
+.cursor/hooks.json
+*.sqlite
+*.sqlite-*
+*.sqlite.*

@@ -4,6 +4,7 @@ import * as navidrome from "../services/navidrome";
 import * as musicbrainz from "../services/musicbrainz";
 import * as lastfm from "../services/lastfm";
 import * as listenbrainz from "../services/listenbrainz";
+import { getLibraryScanStatus } from "../services/scan-status";
 
 export const statusRoutes = new Hono();
 
@@ -25,6 +26,15 @@ statusRoutes.get("/status", async (c) => {
   else if (noneAvailable) overallStatus = "unavailable";
   else overallStatus = "degraded";
 
+  let scanStatus: Awaited<ReturnType<typeof getLibraryScanStatus>> | null = null;
+  if (navidromeAvailable) {
+    try {
+      scanStatus = await getLibraryScanStatus();
+    } catch {
+      scanStatus = null;
+    }
+  }
+
   return c.json({
     status: overallStatus,
     services: {
@@ -35,6 +45,7 @@ statusRoutes.get("/status", async (c) => {
       navidrome: {
         available: navidromeAvailable,
         ...(navidromeAvailable ? {} : { error: "connection_failed" }),
+        ...(scanStatus ? { scan: scanStatus } : {}),
       },
       musicbrainz: {
         available: mbAvailable,

@@ -4,6 +4,7 @@ export interface ApiError {
     message: string;
     retryable: boolean;
     details?: unknown;
+    retry_after_ms?: number;
   };
 }
 

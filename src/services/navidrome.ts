@@ -136,6 +136,8 @@ export interface LibrarySong {
   track?: number;
   year?: number;
   duration: number;
+  path?: string;
+  suffix?: string;
 }
 
 export interface LibraryArtistPlayStats {
@@ -305,12 +307,35 @@ export async function getTopArtistsByPlayCount(
 
 export async function getScanStatus(): Promise<{
   scanning: boolean;
-  count?: number;
+  count: number;
+  folderCount?: number;
+  lastScan?: string;
+  error?: string;
+  scanType?: string;
+  elapsedTime?: number;
 }> {
   const result = await subsonicFetch<{
-    scanStatus: { scanning: boolean; count?: number };
+    scanStatus: {
+      scanning: boolean;
+      count?: number;
+      folderCount?: number;
+      lastScan?: string;
+      error?: string;
+      scanType?: string;
+      elapsedTime?: number;
+    };
   }>("getScanStatus");
-  return result.scanStatus;
+
+  const s = result.scanStatus;
+  return {
+    scanning: s.scanning,
+    count: s.count ?? 0,
+    folderCount: s.folderCount,
+    lastScan: s.lastScan,
+    error: s.error,
+    scanType: s.scanType,
+    elapsedTime: s.elapsedTime,
+  };
 }
 
 export async function startScan(fullScan?: boolean): Promise<void> {
@@ -352,5 +377,7 @@ function mapSong(s: SubsonicSong): LibrarySong {
     track: s.track,
     year: s.year,
     duration: s.duration,
+    path: s.path,
+    suffix: s.suffix,
   };
 }

@@ -277,4 +277,58 @@ export const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS idx_rec_fb_rec ON recommendation_feedback(recommendation_id);
     `,
   },
+  {
+    version: 6,
+    sql: `
+      ALTER TABLE searches ADD COLUMN state TEXT NOT NULL DEFAULT 'collecting';
+      ALTER TABLE searches ADD COLUMN search_options_json TEXT;
+      ALTER TABLE searches ADD COLUMN preferred_formats_json TEXT;
+      ALTER TABLE searches ADD COLUMN prefer_lrc INTEGER NOT NULL DEFAULT 1;
+      ALTER TABLE searches ADD COLUMN max_candidates INTEGER NOT NULL DEFAULT 10;
+      ALTER TABLE searches ADD COLUMN lifecycle_json TEXT;
+      ALTER TABLE searches ADD COLUMN diagnostics_json TEXT;
+      ALTER TABLE searches ADD COLUMN candidate_count INTEGER NOT NULL DEFAULT 0;
+      ALTER TABLE searches ADD COLUMN last_refreshed_at DATETIME;
+      ALTER TABLE searches ADD COLUMN settled_at DATETIME;
+
+      -- Deduplicate legacy candidates before adding uniqueness constraint
+      DELETE FROM candidates
+        WHERE rowid NOT IN (
+          SELECT MIN(rowid) FROM candidates
+          GROUP BY search_id, peer, remote_directory
+        );
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_search_peer_dir
+        ON candidates(search_id, peer, remote_directory);
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      CREATE TABLE IF NOT EXISTS lyric_acquisitions (
+        id TEXT PRIMARY KEY,
+        navidrome_song_id TEXT,
+        artist TEXT NOT NULL,
+        title TEXT NOT NULL,
+        album TEXT,
+        lrclib_id INTEGER,
+        match_type TEXT NOT NULL,
+        match_confidence REAL NOT NULL DEFAULT 0,
+        duration_delta_s REAL,
+        has_synced INTEGER NOT NULL DEFAULT 0,
+        has_plain INTEGER NOT NULL DEFAULT 0,
+        synced_lyrics TEXT,
+        plain_lyrics TEXT,
+        status TEXT NOT NULL DEFAULT 'staged',
+        target_path TEXT,
+        staged_path TEXT,
+        deployed_at DATETIME,
+        created_at DATETIME NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_lyric_acq_song ON lyric_acquisitions(navidrome_song_id);
+      CREATE INDEX IF NOT EXISTS idx_lyric_acq_status ON lyric_acquisitions(status);
+      CREATE INDEX IF NOT EXISTS idx_lyric_acq_lrclib ON lyric_acquisitions(lrclib_id);
+    `,
+  },
 ];

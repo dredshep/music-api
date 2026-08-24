@@ -3,10 +3,13 @@ import { log } from "../middleware/logging";
 import { AppError } from "../middleware/errors";
 import type {
   SlskdSearchState,
+  SlskdSearchResponseRaw,
   SlskdSearchResponse,
   SlskdDownloadState,
   SlskdUserDirectory,
+  SlskdFile,
 } from "../types/upstream";
+import { normalizeSearchResponse, isSearchComplete } from "../types/upstream";
 
 function getBaseUrl(): string {
   const config = getConfig();
@@ -141,19 +144,97 @@ export async function getSearch(searchId: string): Promise<SlskdSearchState> {
 export async function getSearchResponses(
   searchId: string
 ): Promise<SlskdSearchResponse[]> {
-  return slskdFetch<SlskdSearchResponse[]>(`/searches/${searchId}/responses`);
+  const raw = await slskdFetch<SlskdSearchResponseRaw[]>(
+    `/searches/${searchId}/responses`
+  );
+  if (!Array.isArray(raw)) {
+    log("warn", "slskd_adapter_warning", {
+      warning: "search_responses_not_array",
+      search_id: searchId,
+      received_type: typeof raw,
+    });
+    return [];
+  }
+  return raw.map(normalizeSearchResponse);
 }
 
+/**
+ * Retrieve a user's shared directory.
+ *
+ * slskd requires POST with the directory path as the JSON body
+ * and returns an array of directory objects.  File entries may
+ * contain basenames — we reconstruct full remote paths.
+ */
 export async function getUserDirectory(
   username: string,
   directory?: string
 ): Promise<SlskdUserDirectory> {
-  const params = new URLSearchParams();
-  if (directory) params.set("directory", directory);
-  const qs = params.toString() ? `?${params.toString()}` : "";
-  return slskdFetch<SlskdUserDirectory>(
-    `/users/${encodeURIComponent(username)}/directory${qs}`
+  if (!directory) {
+    return { name: "", files: [], directories: [] };
+  }
+
+  const rawResult = await slskdFetch<SlskdUserDirectory[] | SlskdUserDirectory>(
+    `/users/${encodeURIComponent(username)}/directory`,
+    {
+      method: "POST",
+      body: JSON.stringify(directory),
+    }
   );
+
+  if (!rawResult) {
+    log("warn", "slskd_adapter_warning", {
+      warning: "directory_empty_response",
+      username,
+      directory,
+    });
+    return { name: directory, files: [], directories: [] };
+  }
+
+  // slskd returns an array of directory objects; merge them
+  const dirs: SlskdUserDirectory[] = Array.isArray(rawResult)
+    ? rawResult
+    : [rawResult];
+
+  const allFiles: SlskdFile[] = [];
+  const subDirectories: SlskdUserDirectory[] = [];
+
+  for (const dir of dirs) {
+    if (!dir.files || !Array.isArray(dir.files)) continue;
+
+    for (const file of dir.files) {
+      // slskd may return basenames — reconstruct full remote path
+      const filename = looksLikeBasename(file.filename, directory)
+        ? joinRemotePath(dir.name || directory, file.filename)
+        : file.filename;
+      allFiles.push({ ...file, filename });
+    }
+
+    if (dir.directories) {
+      subDirectories.push(...dir.directories);
+    }
+  }
+
+  return {
+    name: directory,
+    files: allFiles,
+    directories: subDirectories.length > 0 ? subDirectories : undefined,
+  };
+}
+
+function looksLikeBasename(filename: string, directory: string): boolean {
+  const normalized = filename.replace(/\\/g, "/");
+  // If it contains a path separator, it's already a full path
+  if (normalized.includes("/")) return false;
+  // If it starts with the directory prefix, it's already full
+  if (normalized.startsWith(directory.replace(/\\/g, "/"))) return false;
+  return true;
+}
+
+function joinRemotePath(directory: string, basename: string): string {
+  // Preserve the original path separator style
+  const sep = directory.includes("\\") ? "\\" : "/";
+  const dir = directory.replace(/[/\\]$/, "");
+  return `${dir}${sep}${basename}`;
 }
 
 export interface RemoteFile {
@@ -212,26 +293,214 @@ export async function retryTransfer(
   );
 }
 
-export async function waitForSearchCompletion(
-  searchId: string,
-  timeoutMs: number
-): Promise<SlskdSearchResponse[]> {
-  const config = getConfig();
-  const deadline = Date.now() + (timeoutMs || config.SEARCH_COLLECTION_MS);
-  const pollInterval = 1000;
+// --- Adaptive search collection ---
 
-  while (Date.now() < deadline) {
-    const state = await getSearch(searchId);
-    if (
-      state.state === "Completed" ||
-      state.state === "completed" ||
-      state.responseCount > 0
-    ) {
-      await new Promise((r) => setTimeout(r, Math.min(2000, deadline - Date.now())));
-      break;
+export interface SearchCollectionDiagnostics {
+  rawFileCount: number;
+  lockedFileCount: number;
+  peerResponseCount: number;
+  uniquePeers: number;
+  uniqueDirectories: number;
+  audioDirectories: number;
+  lrcDirectories: number;
+  searchStates: Array<{ id: string; state: string; isComplete: boolean; fileCount: number }>;
+  collectionMs: number;
+  settled: boolean;
+}
+
+export interface SearchCollectionResult {
+  responses: SlskdSearchResponse[];
+  diagnostics: SearchCollectionDiagnostics;
+}
+
+/**
+ * Adaptive search collection that replaces the old `waitForSearchCompletion`.
+ *
+ * Policy:
+ *  - Poll every 1s.
+ *  - Keep existing SEARCH_COLLECTION_MS (default 7s) as the minimum wait.
+ *  - After the minimum, return early if ≥1 audio-bearing directory exists.
+ *  - Otherwise wait until all slskd searches report complete or `maxMs` elapses.
+ */
+export async function collectSearchResults(
+  searchIds: string[],
+  opts: {
+    minMs?: number;
+    maxMs?: number;
+    preferLrc?: boolean;
+  } = {}
+): Promise<SearchCollectionResult> {
+  const config = getConfig();
+  const preferLrc = opts.preferLrc ?? false;
+  const minMs = opts.minMs ?? config.SEARCH_COLLECTION_MS;
+  // When prefer_lrc is set, allow more collection time for lyric-bearing peers
+  const maxMs = opts.maxMs ?? (preferLrc ? 45000 : 30000);
+  const pollMs = 1000;
+  const startedAt = Date.now();
+
+  let lastResponses: SlskdSearchResponse[] = [];
+  let lastStates: SlskdSearchState[] = [];
+
+  while (true) {
+    const elapsed = Date.now() - startedAt;
+
+    const states = await Promise.all(
+      searchIds.map((id) => getSearch(id).catch(() => null))
+    );
+    lastStates = states.filter((s): s is SlskdSearchState => s !== null);
+    const allSettled = lastStates.length > 0 && lastStates.every(isSearchComplete);
+
+    const responseSets = await Promise.all(
+      searchIds.map((id) => getSearchResponses(id).catch(() => []))
+    );
+    lastResponses = responseSets.flat();
+
+    const pastMinimum = elapsed >= minMs;
+    const pastMaximum = elapsed >= maxMs;
+
+    if (pastMinimum) {
+      const audioDirs = countAudioDirectories(lastResponses);
+
+      if (preferLrc && audioDirs > 0 && !allSettled && !pastMaximum) {
+        // When prefer_lrc, keep waiting past minimum if we have audio dirs
+        // but no LRC-bearing ones yet, unless settled or timed out
+        const lrcDirs = countLrcDirectories(lastResponses);
+        if (lrcDirs > 0 || allSettled || pastMaximum) {
+          break;
+        }
+        // Keep polling for LRC-bearing directories
+      } else if (audioDirs > 0 || allSettled || pastMaximum) {
+        break;
+      }
     }
-    await new Promise((r) => setTimeout(r, pollInterval));
+
+    if (pastMaximum) break;
+
+    await sleep(pollMs);
   }
 
-  return getSearchResponses(searchId);
+  const diag = buildDiagnostics(lastResponses, lastStates, Date.now() - startedAt);
+  return { responses: lastResponses, diagnostics: diag };
+}
+
+/**
+ * Refresh collection: for an existing search, return immediately if
+ * candidates already exist in the responses.  If empty and still
+ * collecting, wait up to `waitMs` for a viable directory or settlement.
+ */
+export async function refreshSearchResults(
+  searchIds: string[],
+  opts: { waitMs?: number } = {}
+): Promise<SearchCollectionResult> {
+  const waitMs = opts.waitMs ?? 15000;
+  const pollMs = 1000;
+  const startedAt = Date.now();
+
+  while (true) {
+    const states = await Promise.all(
+      searchIds.map((id) => getSearch(id).catch(() => null))
+    );
+    const validStates = states.filter((s): s is SlskdSearchState => s !== null);
+    const allSettled = validStates.length > 0 && validStates.every(isSearchComplete);
+
+    const responseSets = await Promise.all(
+      searchIds.map((id) => getSearchResponses(id).catch(() => []))
+    );
+    const responses = responseSets.flat();
+    const audioDirs = countAudioDirectories(responses);
+
+    if (audioDirs > 0 || allSettled || Date.now() - startedAt >= waitMs) {
+      const diag = buildDiagnostics(responses, validStates, Date.now() - startedAt);
+      return { responses, diagnostics: diag };
+    }
+
+    await sleep(pollMs);
+  }
+}
+
+const AUDIO_EXTS = new Set([
+  ".flac", ".mp3", ".m4a", ".aac", ".alac", ".ogg", ".opus", ".wav", ".ape",
+]);
+
+const LRC_EXT = ".lrc";
+
+function countLrcDirectories(responses: SlskdSearchResponse[]): number {
+  const dirs = new Set<string>();
+  for (const r of responses) {
+    for (const f of r.files) {
+      const lastDot = f.filename.lastIndexOf(".");
+      if (lastDot !== -1) {
+        const ext = f.filename.slice(lastDot).toLowerCase();
+        if (ext === LRC_EXT) {
+          const normalized = f.filename.replace(/\\/g, "/");
+          const lastSlash = normalized.lastIndexOf("/");
+          const dir = lastSlash >= 0 ? normalized.slice(0, lastSlash) : "";
+          dirs.add(`${r.username}::${dir}`);
+        }
+      }
+    }
+  }
+  return dirs.size;
+}
+
+function countAudioDirectories(responses: SlskdSearchResponse[]): number {
+  const dirs = new Set<string>();
+  for (const r of responses) {
+    for (const f of r.files) {
+      const lastDot = f.filename.lastIndexOf(".");
+      if (lastDot !== -1) {
+        const ext = f.filename.slice(lastDot).toLowerCase();
+        if (AUDIO_EXTS.has(ext)) {
+          const normalized = f.filename.replace(/\\/g, "/");
+          const lastSlash = normalized.lastIndexOf("/");
+          const dir = lastSlash >= 0 ? normalized.slice(0, lastSlash) : "";
+          dirs.add(`${dir}`);
+        }
+      }
+    }
+  }
+  return dirs.size;
+}
+
+function buildDiagnostics(
+  responses: SlskdSearchResponse[],
+  states: SlskdSearchState[],
+  collectionMs: number
+): SearchCollectionDiagnostics {
+  const peers = new Set<string>();
+  const directories = new Set<string>();
+  let rawFileCount = 0;
+  let lockedFileCount = 0;
+
+  for (const r of responses) {
+    peers.add(r.username);
+    rawFileCount += r.files.length;
+    lockedFileCount += r.lockedFileCount;
+    for (const f of r.files) {
+      const normalized = f.filename.replace(/\\/g, "/");
+      const lastSlash = normalized.lastIndexOf("/");
+      if (lastSlash >= 0) directories.add(`${r.username}::${normalized.slice(0, lastSlash)}`);
+    }
+  }
+
+  const audioDirs = countAudioDirectories(responses);
+  const lrcDirs = countLrcDirectories(responses);
+
+  return {
+    rawFileCount,
+    lockedFileCount,
+    peerResponseCount: responses.length,
+    uniquePeers: peers.size,
+    uniqueDirectories: directories.size,
+    audioDirectories: audioDirs,
+    lrcDirectories: lrcDirs,
+    searchStates: states.map((s) => ({
+      id: s.id,
+      state: s.state,
+      isComplete: isSearchComplete(s),
+      fileCount: s.fileCount,
+    })),
+    collectionMs,
+    settled: states.length > 0 && states.every(isSearchComplete),
+  };
 }

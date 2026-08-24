@@ -10,6 +10,7 @@ export interface ScoringInput {
   expectedTrackCount?: number;
   preferredFormats?: string[];
   preferLrc?: boolean;
+  releaseType?: string;
 }
 
 export interface ScoringResult {
@@ -32,7 +33,8 @@ export function scoreCandidate(input: ScoringInput): ScoringResult {
   // Completeness scoring (+25 max)
   const completenessScore = scoreCompleteness(
     input.stats.audioFileCount,
-    input.expectedTrackCount
+    input.expectedTrackCount,
+    input.releaseType
   );
   score += completenessScore.points;
   if (completenessScore.points > 15) {
@@ -90,10 +92,21 @@ function scoreFormat(dominant: string, flags: CandidateFlagName[]): number {
 
 function scoreCompleteness(
   foundTracks: number,
-  expectedTracks?: number
+  expectedTracks?: number,
+  releaseType?: string
 ): { points: number; status: string } {
+  // Singles and tracks: 1+ audio files is valid — never penalise for low count
+  if (releaseType === "single" || releaseType === "track") {
+    if (expectedTracks && expectedTracks > 0) {
+      const ratio = foundTracks / expectedTracks;
+      if (ratio >= 1.0) return { points: 25, status: "complete" };
+      if (ratio >= 0.5) return { points: 15, status: "likely_complete" };
+    }
+    if (foundTracks >= 1) return { points: 20, status: "likely_complete" };
+    return { points: 0, status: "uncertain" };
+  }
+
   if (!expectedTracks || expectedTracks === 0) {
-    // No reference: give moderate credit if reasonable track count
     if (foundTracks >= 8) return { points: 20, status: "likely_complete" };
     if (foundTracks >= 4) return { points: 10, status: "uncertain" };
     return { points: -10, status: "likely_incomplete" };
@@ -174,13 +187,24 @@ function buildReason(
 
 export function getCompletenessStatus(
   foundTracks: number,
-  expectedTracks?: number
+  expectedTracks?: number,
+  releaseType?: string
 ): {
   status: string;
   confidence: number;
   expectedTracks?: number;
   foundTracks: number;
 } {
+  if (releaseType === "single" || releaseType === "track") {
+    if (expectedTracks && expectedTracks > 0) {
+      const ratio = foundTracks / expectedTracks;
+      if (ratio >= 1.0) return { status: "complete", confidence: 0.95, expectedTracks, foundTracks };
+      if (ratio >= 0.5) return { status: "likely_complete", confidence: 0.8, expectedTracks, foundTracks };
+    }
+    if (foundTracks >= 1) return { status: "likely_complete", confidence: 0.85, foundTracks };
+    return { status: "uncertain", confidence: 0.5, foundTracks };
+  }
+
   if (!expectedTracks) {
     return {
       status: foundTracks >= 6 ? "likely_complete" : "uncertain",

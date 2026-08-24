@@ -114,30 +114,54 @@ export function getJobByCandidateId(candidateId: string): JobRecord | null {
 export function listJobs(params: {
   status?: string;
   limit?: number;
+  artist?: string;
+  release?: string;
+  q?: string;
+  sinceDays?: number;
 }): JobRecord[] {
   const db = getDb();
-  const limit = params.limit ?? 50;
+  const limit = Math.min(Math.max(params.limit ?? 50, 1), 200);
+
+  const conditions: string[] = [];
+  const bindings: (string | number)[] = [];
 
   if (params.status && params.status !== "all") {
     if (params.status === "active") {
-      return db
-        .query<JobRecord, [number]>(
-          "SELECT * FROM download_jobs WHERE status IN ('queued', 'downloading', 'retrying') ORDER BY created_at DESC LIMIT ?"
-        )
-        .all(limit);
+      conditions.push("status IN ('queued', 'downloading', 'retrying')");
+    } else {
+      conditions.push("status = ?");
+      bindings.push(params.status);
     }
-    return db
-      .query<JobRecord, [string, number]>(
-        "SELECT * FROM download_jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?"
-      )
-      .all(params.status, limit);
   }
 
-  return db
-    .query<JobRecord, [number]>(
-      "SELECT * FROM download_jobs ORDER BY created_at DESC LIMIT ?"
-    )
-    .all(limit);
+  if (params.artist?.trim()) {
+    conditions.push("instr(lower(COALESCE(artist, '')), lower(?)) > 0");
+    bindings.push(params.artist.trim());
+  }
+
+  if (params.release?.trim()) {
+    conditions.push("instr(lower(COALESCE(release_title, '')), lower(?)) > 0");
+    bindings.push(params.release.trim());
+  }
+
+  if (params.q?.trim()) {
+    conditions.push(
+      "(instr(lower(COALESCE(artist, '')), lower(?)) > 0 OR instr(lower(COALESCE(release_title, '')), lower(?)) > 0)"
+    );
+    const term = params.q.trim();
+    bindings.push(term, term);
+  }
+
+  if (params.sinceDays != null && params.sinceDays > 0) {
+    conditions.push("created_at >= datetime('now', ?)");
+    bindings.push(`-${Math.floor(params.sinceDays)} days`);
+  }
+
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+  const sql = `SELECT * FROM download_jobs ${where} ORDER BY created_at DESC LIMIT ?`;
+  bindings.push(limit);
+
+  return db.query<JobRecord, (string | number)[]>(sql).all(...bindings);
 }
 
 export function updateJobStatus(

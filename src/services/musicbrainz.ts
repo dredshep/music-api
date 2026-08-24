@@ -13,110 +13,166 @@ import type {
 let lastRequestTime = 0;
 const MIN_REQUEST_INTERVAL_MS = 1100;
 
+const RETRY_DELAY_MS = 3000;
+const ABORT_TIMEOUT_MS = 15000;
+const TRANSIENT_HTTP = new Set([500, 502, 503, 504]);
+
 // In-flight request deduplication
 const inflightRequests = new Map<string, Promise<unknown>>();
+
+/** Exported for tests to assert cleanup. */
+export function getInflightCount(): number {
+  return inflightRequests.size;
+}
+
+function isTransientError(err: unknown): boolean {
+  if (err instanceof AppError) return false;
+  if (err instanceof DOMException && err.name === "AbortError") return true;
+  if (err instanceof TypeError) return true; // fetch network errors
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase();
+    if (msg.includes("certificate") || msg.includes("tls") || msg.includes("ssl")) return true;
+    if (msg.includes("econnrefused") || msg.includes("enotfound") || msg.includes("etimedout")) return true;
+    if (msg.includes("fetch failed") || msg.includes("unable to connect")) return true;
+  }
+  return false;
+}
+
+function parseRetryAfterMs(header: string | null): number {
+  if (!header) return RETRY_DELAY_MS;
+  const seconds = Number(header);
+  if (!Number.isFinite(seconds) || seconds < 1) return RETRY_DELAY_MS;
+  return Math.min(Math.max(seconds, 1), 60) * 1000;
+}
+
+async function singleAttempt(url: string, userAgent: string): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ABORT_TIMEOUT_MS);
+  try {
+    return await fetch(url, {
+      headers: { "User-Agent": userAgent, Accept: "application/json" },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function rateLimitedFetch<T>(
   url: string,
   cacheKey?: string,
   cacheTtlMs?: number
 ): Promise<T> {
-  // Check cache first
   if (cacheKey) {
     const cached = getCache<T>(cacheKey);
     if (cached !== null) return cached;
   }
 
-  // Deduplicate identical in-flight requests
   const dedupeKey = url;
   const inflight = inflightRequests.get(dedupeKey);
   if (inflight) return inflight as Promise<T>;
 
   const doRequest = async (): Promise<T> => {
-    // Rate limit
-    const now = Date.now();
-    const elapsed = now - lastRequestTime;
-    if (elapsed < MIN_REQUEST_INTERVAL_MS) {
-      await new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS - elapsed));
-    }
-    lastRequestTime = Date.now();
-
     const config = getConfig();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    let lastError: unknown;
 
-    try {
-      const res = await fetch(url, {
-        headers: {
-          "User-Agent": config.MUSICBRAINZ_USER_AGENT,
-          Accept: "application/json",
-        },
-        signal: controller.signal,
-      });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const now = Date.now();
+      const elapsed = now - lastRequestTime;
+      if (elapsed < MIN_REQUEST_INTERVAL_MS) {
+        await new Promise((r) => setTimeout(r, MIN_REQUEST_INTERVAL_MS - elapsed));
+      }
+      lastRequestTime = Date.now();
 
-      if (res.status === 503) {
-        // Retry once with backoff
-        log("warn", "musicbrainz_503_retry", { url });
-        await new Promise((r) => setTimeout(r, 3000));
-        lastRequestTime = Date.now();
-
-        const retryRes = await fetch(url, {
-          headers: {
-            "User-Agent": config.MUSICBRAINZ_USER_AGENT,
-            Accept: "application/json",
-          },
-          signal: AbortSignal.timeout(15000),
-        });
-
-        if (!retryRes.ok) {
-          throw new AppError(
-            "MUSICBRAINZ_UNAVAILABLE",
-            `MusicBrainz returned ${retryRes.status} after retry`,
-            502,
-            true
-          );
+      let res: Response;
+      try {
+        res = await singleAttempt(url, config.MUSICBRAINZ_USER_AGENT);
+      } catch (err) {
+        lastError = err;
+        if (attempt === 0 && isTransientError(err)) {
+          log("warn", "musicbrainz_network_retry", {
+            url,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+          continue;
         }
-
-        const data = (await retryRes.json()) as T;
-        if (cacheKey && cacheTtlMs) setCache(cacheKey, data, cacheTtlMs);
-        return data;
+        break;
       }
 
       if (res.status === 429) {
+        const retryMs = parseRetryAfterMs(res.headers.get("Retry-After"));
         throw new AppError(
           "MUSICBRAINZ_RATE_LIMITED",
           "MusicBrainz rate limit exceeded",
-          429,
-          true
+          503,
+          true,
+          undefined,
+          retryMs
         );
+      }
+
+      if (TRANSIENT_HTTP.has(res.status)) {
+        lastError = new Error(`MusicBrainz returned HTTP ${res.status}`);
+        if (attempt === 0) {
+          log("warn", "musicbrainz_http_retry", { url, status: res.status });
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+          continue;
+        }
+        break;
       }
 
       if (!res.ok) {
         throw new AppError(
           "MUSICBRAINZ_UNAVAILABLE",
           `MusicBrainz returned ${res.status}`,
-          502,
-          true
+          503,
+          true,
+          undefined,
+          RETRY_DELAY_MS
         );
       }
 
-      const data = (await res.json()) as T;
+      let data: T;
+      try {
+        data = (await res.json()) as T;
+      } catch (jsonErr) {
+        lastError = jsonErr;
+        if (attempt === 0) {
+          log("warn", "musicbrainz_json_retry", {
+            url,
+            error: jsonErr instanceof Error ? jsonErr.message : String(jsonErr),
+          });
+          await new Promise((r) => setTimeout(r, RETRY_DELAY_MS));
+          continue;
+        }
+        break;
+      }
+
       if (cacheKey && cacheTtlMs) setCache(cacheKey, data, cacheTtlMs);
       return data;
-    } catch (err) {
-      if (err instanceof AppError) throw err;
-      const message =
-        err instanceof Error ? err.message : "MusicBrainz connection failed";
-      throw new AppError("MUSICBRAINZ_UNAVAILABLE", message, 502, true);
-    } finally {
-      clearTimeout(timeout);
-      inflightRequests.delete(dedupeKey);
     }
+
+    const rawMessage =
+      lastError instanceof Error ? lastError.message : "MusicBrainz connection failed";
+    log("error", "musicbrainz_exhausted", { url, error: rawMessage });
+    throw new AppError(
+      "MUSICBRAINZ_UNAVAILABLE",
+      rawMessage,
+      503,
+      true,
+      undefined,
+      RETRY_DELAY_MS
+    );
   };
 
   const promise = doRequest();
   inflightRequests.set(dedupeKey, promise);
-  return promise;
+  try {
+    return await promise;
+  } finally {
+    inflightRequests.delete(dedupeKey);
+  }
 }
 
 export async function ping(): Promise<boolean> {
