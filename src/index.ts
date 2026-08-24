@@ -7,6 +7,7 @@ import { loggingMiddleware, type AppVariables } from "./middleware/logging";
 import { failBanMiddleware, publicRateLimit, authenticatedRateLimit } from "./middleware/rate-limit";
 import { statusRoutes } from "./routes/status";
 import { libraryRoutes } from "./routes/library";
+import { libraryOwnershipRoutes } from "./routes/library-ownership";
 import { catalogRoutes } from "./routes/catalog";
 import { searchRoutes } from "./routes/search";
 import { downloadRoutes } from "./routes/downloads";
@@ -61,6 +62,7 @@ app.use("/v1/*", loggingMiddleware());
 
 app.route("/v1", statusRoutes);
 app.route("/v1", libraryRoutes);
+app.route("/v1", libraryOwnershipRoutes);
 app.route("/v1", catalogRoutes);
 app.route("/v1", searchRoutes);
 app.route("/v1", downloadRoutes);
