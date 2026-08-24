@@ -47,20 +47,20 @@ function buildAuthParams(): URLSearchParams {
   });
 }
 
+function buildSubsonicUrl(endpoint: string, extraParams?: Record<string, string>): string {
+  const config = getConfig();
+  const params = buildAuthParams();
+  if (extraParams) {
+    for (const [key, value] of Object.entries(extraParams)) params.set(key, value);
+  }
+  return `${config.NAVIDROME_URL}/rest/${endpoint}?${params.toString()}`;
+}
+
 async function subsonicFetch<T>(
   endpoint: string,
   extraParams?: Record<string, string>
 ): Promise<T> {
-  const config = getConfig();
-  const params = buildAuthParams();
-
-  if (extraParams) {
-    for (const [key, value] of Object.entries(extraParams)) {
-      params.set(key, value);
-    }
-  }
-
-  const url = `${config.NAVIDROME_URL}/rest/${endpoint}?${params.toString()}`;
+  const url = buildSubsonicUrl(endpoint, extraParams);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 10000);
 
@@ -213,6 +213,53 @@ export async function getAlbum(
 export async function getSong(id: string): Promise<LibrarySong> {
   const result = await subsonicFetch<{ song: SubsonicSong }>("getSong", { id });
   return mapSong(result.song);
+}
+
+/**
+ * Return the upstream Navidrome/Subsonic stream response without buffering it.
+ * Range is forwarded so browser audio seeking continues to work.
+ */
+export async function streamSong(id: string, range?: string): Promise<Response> {
+  const url = buildSubsonicUrl("stream", { id });
+  const headers: Record<string, string> = {};
+  if (range) headers.Range = range;
+
+  try {
+    const response = await fetch(url, { headers, redirect: "follow" });
+    if (!response.ok && response.status !== 206) {
+      throw new AppError(
+        "NAVIDROME_UNAVAILABLE",
+        `Navidrome stream returned ${response.status}`,
+        502,
+        true
+      );
+    }
+    return response;
+  } catch (err) {
+    if (err instanceof AppError) throw err;
+    throw new AppError(
+      "NAVIDROME_UNAVAILABLE",
+      err instanceof Error ? err.message : "Navidrome stream failed",
+      502,
+      true
+    );
+  }
+}
+
+/**
+ * Subsonic scrobble semantics: submission=false means now-playing, while
+ * submission=true records a completed play. timeMs is Unix epoch ms.
+ */
+export async function scrobbleSong(
+  id: string,
+  submission: boolean,
+  timeMs?: number
+): Promise<void> {
+  await subsonicFetch("scrobble", {
+    id,
+    submission: submission ? "true" : "false",
+    ...(timeMs ? { time: String(Math.floor(timeMs)) } : {}),
+  });
 }
 
 export async function getAlbumList2(params: {
