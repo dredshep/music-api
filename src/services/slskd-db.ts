@@ -55,8 +55,6 @@ export function isMessagingDbAvailable(): boolean {
   return getMessagingDb() !== null;
 }
 
-// --- Transfer types ---
-
 export interface SoulseekTransfer {
   id: string;
   username: string;
@@ -97,8 +95,6 @@ export interface SoulMessage {
   direction: "inbound" | "outbound";
   message: string;
 }
-
-// --- Transfer history queries ---
 
 export function transferHistory(opts: {
   direction?: "Download" | "Upload";
@@ -237,11 +233,7 @@ const AUDIO_FILTER = [
   .map((ext) => `LOWER(Filename) LIKE '%.${ext}'`)
   .join(" OR ");
 
-function categorizeUser(
-  days: number,
-  tracks: number,
-  bytes: number
-): string {
+function categorizeUser(days: number, tracks: number, bytes: number): string {
   if (days >= 10) return "Extreme / persistent regular";
   if (days >= 5) return "Genuine regular";
   if (days >= 3) return "Occasional → regular";
@@ -326,6 +318,38 @@ export function peerAnalytics(username: string) {
     )
     .all(username);
 
+  const topAlbums = db
+    .query<{ artist: string; album: string; files: number; bytes: number }, [string]>(
+      `SELECT artist, album, COUNT(*) as files, SUM(Size) as bytes FROM (
+         SELECT Size,
+           SUBSTR(norm,LENGTH('music\\\\')+1,
+             INSTR(SUBSTR(norm,LENGTH('music\\\\')+1),'\\\\')-1) as artist,
+           SUBSTR(
+             SUBSTR(norm,LENGTH('music\\\\')+1),
+             INSTR(SUBSTR(norm,LENGTH('music\\\\')+1),'\\\\')+1,
+             INSTR(SUBSTR(SUBSTR(norm,LENGTH('music\\\\')+1),
+               INSTR(SUBSTR(norm,LENGTH('music\\\\')+1),'\\\\')+1),'\\\\')-1
+           ) as album
+         FROM (
+           SELECT Size, REPLACE(Filename,'/','\\\\') as norm
+           FROM Transfers WHERE Username=? AND ${SUCCESS_UPLOAD}
+         ) WHERE norm LIKE 'music\\\\%'
+       )
+       WHERE artist IS NOT NULL AND artist!='' AND album IS NOT NULL AND album!=''
+       GROUP BY artist,album ORDER BY bytes DESC LIMIT 15`
+    )
+    .all(username);
+
+  const repeated = db
+    .query<{ filename: string; times: number; size: number; cumulativeBytes: number }, [string]>(
+      `SELECT Filename as filename, COUNT(*) as times, MAX(Size) as size,
+       SUM(Size) as cumulativeBytes FROM Transfers
+       WHERE Username=? AND ${SUCCESS_UPLOAD}
+       GROUP BY Filename HAVING COUNT(*)>1
+       ORDER BY times DESC,cumulativeBytes DESC LIMIT 12`
+    )
+    .all(username);
+
   const states = db
     .query<{ state: string; count: number }, [string]>(
       `SELECT StateDescription as state, COUNT(*) as count
@@ -333,6 +357,44 @@ export function peerAnalytics(username: string) {
        GROUP BY StateDescription ORDER BY count DESC`
     )
     .all(username);
+
+  const rawDaily = db
+    .query<{ day: string; filename: string; size: number }, [string]>(
+      `SELECT date(COALESCE(EndedAt,RequestedAt)) as day,
+       Filename as filename, Size as size FROM Transfers
+       WHERE Username=? AND ${SUCCESS_UPLOAD} ORDER BY day`
+    )
+    .all(username);
+
+  const firstSeenByFile = new Map<string, string>();
+  for (const row of rawDaily) {
+    if (!firstSeenByFile.has(row.filename)) firstSeenByFile.set(row.filename, row.day);
+  }
+
+  const dailyMap = new Map<string, {
+    transfers: number;
+    newFiles: number;
+    repeatFiles: number;
+    bytes: number;
+  }>();
+  for (const row of rawDaily) {
+    const value = dailyMap.get(row.day) ?? {
+      transfers: 0,
+      newFiles: 0,
+      repeatFiles: 0,
+      bytes: 0,
+    };
+    value.transfers++;
+    value.bytes += row.size;
+    if (firstSeenByFile.get(row.filename) === row.day) value.newFiles++;
+    else value.repeatFiles++;
+    dailyMap.set(row.day, value);
+  }
+
+  const daily = [...dailyMap]
+    .map(([day, value]) => ({ day, ...value }))
+    .sort((a, b) => b.day.localeCompare(a.day))
+    .slice(0, 90);
 
   const repeatBytes = Math.max(0, summary.bytes - unique.bytes);
   const msgs = messagesForUser(username);
@@ -348,16 +410,16 @@ export function peerAnalytics(username: string) {
     },
     downloads,
     topArtists,
+    topAlbums,
+    repeated,
     states,
-    daily: [],
+    daily,
     messages: msgs,
     hasThanks: msgs.some((m) =>
       /thanks?|thank you|thx|\bty\b|merci|gracias/i.test(m.message)
     ),
   };
 }
-
-// --- Messaging queries ---
 
 export function messagesForUser(username: string): SoulMessage[] {
   const db = getMessagingDb();
