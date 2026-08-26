@@ -1,6 +1,13 @@
 import { Hono } from "hono";
 import { z } from "zod";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  realpathSync,
+  rmSync,
+  rmdirSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { getConfig } from "../config";
 import { AppError } from "../middleware/errors";
@@ -98,9 +105,6 @@ playerRoutes.post("/player/scrobble", async (c) => {
   }
   const listen = parsed.data;
 
-  // Exactly one external path is chosen. If we have a Navidrome identity, submit there and
-  // let Navidrome fan out to any configured Last.fm/ListenBrainz targets. Otherwise use
-  // ListenBrainz directly when a token is available. The caller still records its local event.
   if (listen.navidrome_id) {
     await navidromePlayer.scrobble(
       listen.navidrome_id,
@@ -188,21 +192,111 @@ playerRoutes.get("/library/genres", async (c) => {
   return c.json({ genres, total: genres.length });
 });
 
+function configuredLibraryRoot(): string {
+  const raw = getConfig().LIBRARY_MUSIC_PATH?.trim();
+  if (!raw) throw new AppError("LIBRARY_NOT_WRITABLE", "LIBRARY_MUSIC_PATH is not configured", 422);
+  if (!existsSync(raw)) throw new AppError("LIBRARY_NOT_WRITABLE", "LIBRARY_MUSIC_PATH does not exist", 422);
+  return realpathSync(raw);
+}
+
+function safeLibraryFilePath(libraryRoot: string, songPath: string): string {
+  const root = realpathSync(libraryRoot);
+  const candidate = isAbsolute(songPath) ? resolve(songPath) : resolve(root, songPath);
+  const parent = dirname(candidate);
+  if (!existsSync(parent)) throw new AppError("NO_SONG_PATH", "Song parent directory no longer exists", 404);
+  const realParent = realpathSync(parent);
+  const relParent = relative(root, realParent);
+  if (relParent === ".." || relParent.startsWith(`..${sep}`) || isAbsolute(relParent)) {
+    throw new AppError("INVALID_LIBRARY_PATH", "Navidrome song path resolves outside LIBRARY_MUSIC_PATH", 422);
+  }
+  const safe = join(realParent, candidate.slice(parent.length + (parent.endsWith(sep) ? 0 : 1)));
+  const rel = relative(root, safe);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new AppError("INVALID_LIBRARY_PATH", "Navidrome song path is outside LIBRARY_MUSIC_PATH", 422);
+  }
+  return safe;
+}
+
+function targetSidecarPath(libraryRoot: string, songPath: string): string {
+  return safeLibraryFilePath(libraryRoot, songPath).replace(/\.[^.]+$/, ".lrc");
+}
+
+const deleteLibrarySchema = z.object({
+  entity: z.enum(["track", "album", "artist"]),
+  id: z.string().min(1).max(300),
+  confirm: z.literal(true),
+});
+
+type DeleteCandidate = { id: string; artist: string; album: string; title: string; path?: string };
+
+async function songsForDeletion(entity: "track" | "album" | "artist", id: string): Promise<DeleteCandidate[]> {
+  if (entity === "track") return [await navidromePlayer.getSong(id)];
+  if (entity === "album") return (await navidromePlayer.getAlbum(id)).songs;
+  const { albums } = await navidromePlayer.getArtist(id);
+  const songs: DeleteCandidate[] = [];
+  for (const album of albums) songs.push(...(await navidromePlayer.getAlbum(album.id)).songs);
+  return songs;
+}
+
+function pruneEmptyParents(start: string, root: string) {
+  let cursor = dirname(start);
+  while (cursor !== root) {
+    const rel = relative(root, cursor);
+    if (!rel || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return;
+    try {
+      rmdirSync(cursor);
+    } catch {
+      return;
+    }
+    cursor = dirname(cursor);
+  }
+}
+
+playerRoutes.post("/library/delete", async (c) => {
+  const parsed = deleteLibrarySchema.safeParse(await c.req.json());
+  if (!parsed.success) {
+    throw new AppError("VALIDATION_ERROR", parsed.error.issues.map((i) => i.message).join("; "), 400);
+  }
+
+  const root = configuredLibraryRoot();
+  const candidates = await songsForDeletion(parsed.data.entity, parsed.data.id);
+  if (!candidates.length) throw new AppError("NOT_FOUND", "No local tracks resolved for this entity", 404);
+
+  const resolved = candidates.map((song) => {
+    if (!song.path) throw new AppError("NO_SONG_PATH", `Navidrome did not return a file path for ${song.artist} — ${song.title}`, 422);
+    const audioPath = safeLibraryFilePath(root, song.path);
+    return {
+      song,
+      audioPath,
+      sidecarPath: audioPath.replace(/\.[^.]+$/, ".lrc"),
+    };
+  });
+
+  const unique = new Map(resolved.map((item) => [item.audioPath, item]));
+  const deleted: Array<{ id: string; path: string; sidecar_deleted: boolean }> = [];
+  for (const item of unique.values()) {
+    if (existsSync(item.audioPath)) rmSync(item.audioPath, { force: false });
+    const sidecarDeleted = existsSync(item.sidecarPath);
+    if (sidecarDeleted) rmSync(item.sidecarPath, { force: true });
+    deleted.push({ id: item.song.id, path: item.audioPath, sidecar_deleted: sidecarDeleted });
+    pruneEmptyParents(item.audioPath, root);
+  }
+
+  return c.json({
+    deleted: true,
+    entity: parsed.data.entity,
+    id: parsed.data.id,
+    tracks_deleted: deleted.length,
+    files: deleted,
+    note: "Navidrome will reflect filesystem deletion after its next scan.",
+  });
+});
+
 const sidecarSchema = z.object({
   navidrome_song_id: z.string().min(1).max(300),
   content: z.string().min(1).max(2_000_000),
   overwrite: z.boolean().optional().default(false),
 });
-
-function targetSidecarPath(libraryRoot: string, songPath: string): string {
-  const root = resolve(libraryRoot);
-  const audioPath = isAbsolute(songPath) ? resolve(songPath) : resolve(root, songPath);
-  const rel = relative(root, audioPath);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    throw new AppError("INVALID_LIBRARY_PATH", "Navidrome song path is outside LIBRARY_MUSIC_PATH", 422);
-  }
-  return audioPath.replace(/\.[^.]+$/, ".lrc");
-}
 
 playerRoutes.post("/player/lyrics/sidecar", async (c) => {
   const parsed = sidecarSchema.safeParse(await c.req.json());
