@@ -495,7 +495,7 @@ async function handleRetryAlternate(
   const query = `${artist} ${title}`;
   let responses: Awaited<ReturnType<typeof slskd.collectSearchResults>>["responses"];
   try {
-    const search = await slskd.startSearch(query);
+    const { search } = await slskd.findOrStartSearch(query);
     ({ responses } = await slskd.collectSearchResults([search.id], { minMs: 7000 }));
   } catch (err) {
     const message =

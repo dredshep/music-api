@@ -154,6 +154,52 @@ export async function startSearches(queries: string[]): Promise<SlskdSearchState
   return results;
 }
 
+/**
+ * Find an existing slskd search with a matching fingerprint, or start a new one.
+ * Checks both the local variant DB and slskd's search list before creating.
+ */
+export async function findOrStartSearch(
+  query: string,
+  checkVariantDb?: (fp: string) => { slskdSearchId: string } | null
+): Promise<{ search: SlskdSearchState; reused: boolean }> {
+  const fp = searchFingerprint(query);
+
+  if (checkVariantDb) {
+    const knownVariant = checkVariantDb(fp);
+    if (knownVariant) {
+      try {
+        const existing = await getSearch(knownVariant.slskdSearchId);
+        log("info", "slskd_search_reused_from_db", {
+          query,
+          slskd_search_id: existing.id,
+        });
+        return { search: existing, reused: true };
+      } catch {
+        // Variant's slskd search no longer valid — fall through
+      }
+    }
+  }
+
+  try {
+    const allSearches = await listSearches();
+    for (const existing of allSearches) {
+      const existingFp = searchFingerprint(existing.searchText ?? "");
+      if (existingFp === fp) {
+        log("info", "slskd_search_reused_from_list", {
+          query,
+          slskd_search_id: existing.id,
+        });
+        return { search: existing, reused: true };
+      }
+    }
+  } catch {
+    log("warn", "slskd_list_searches_failed_during_dedup", { query });
+  }
+
+  const search = await startSearch(query);
+  return { search, reused: false };
+}
+
 export async function listSearches(): Promise<SlskdSearchState[]> {
   return slskdFetch<SlskdSearchState[]>("/searches");
 }

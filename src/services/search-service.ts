@@ -28,9 +28,9 @@ import {
   upsertSearchVariant,
   getVariantsForSearch,
   markVariantMissing,
+  findVariantByQueryFingerprint,
 } from "../db/repositories/search-variants";
 import * as slskd from "./slskd";
-import type { SlskdSearchState } from "../types/upstream";
 
 export interface SemanticSearchParams {
   artist: string;
@@ -132,13 +132,7 @@ async function getOrCreateSemanticSearchUnlocked(
   let adoptedCount = 0;
   let createdCount = 0;
   const slskdSearchIds: string[] = [];
-
-  // A normal search may adopt a matching historical slskd search. An explicit
-  // re-search must not: it is the user's opt-in way to create genuinely fresh
-  // upstream searches.
-  const adoptable = params.forceNew
-    ? []
-    : await findAdoptableSlskdSearches(queries);
+  const coveredFingerprints = new Set<string>();
 
   const searchRecord = createSearch({
     artist: params.artist,
@@ -152,36 +146,41 @@ async function getOrCreateSemanticSearchUnlocked(
     maxCandidates: params.maxCandidates,
   });
 
-  for (const adopted of adoptable) {
-    const qfp = queryFingerprint(adopted.matchedQuery);
-    upsertSearchVariant({
-      semanticSearchId: searchRecord.id,
-      query: adopted.matchedQuery,
-      queryFingerprint: qfp,
-      slskdSearchId: adopted.slskdSearch.id,
-      discovered: true,
-    });
-    slskdSearchIds.push(adopted.slskdSearch.id);
-    adoptedCount++;
-  }
-
-  const adoptedFingerprints = new Set(
-    adoptable.map((a) => queryFingerprint(a.matchedQuery))
-  );
-
   for (const query of queries) {
     const qfp = queryFingerprint(query);
-    if (adoptedFingerprints.has(qfp)) continue;
+    if (coveredFingerprints.has(qfp)) continue;
+    coveredFingerprints.add(qfp);
 
-    const slskdSearch = await slskd.startSearch(query);
+    if (params.forceNew) {
+      const slskdSearch = await slskd.startSearch(query);
+      upsertSearchVariant({
+        semanticSearchId: searchRecord.id,
+        query,
+        queryFingerprint: qfp,
+        slskdSearchId: slskdSearch.id,
+      });
+      slskdSearchIds.push(slskdSearch.id);
+      createdCount++;
+      continue;
+    }
+
+    const { search: slskdSearch, reused } = await slskd.findOrStartSearch(
+      query,
+      (fp) => {
+        const variant = findVariantByQueryFingerprint(fp);
+        return variant ? { slskdSearchId: variant.slskd_search_id } : null;
+      }
+    );
     upsertSearchVariant({
       semanticSearchId: searchRecord.id,
       query,
       queryFingerprint: qfp,
       slskdSearchId: slskdSearch.id,
+      discovered: reused,
     });
     slskdSearchIds.push(slskdSearch.id);
-    createdCount++;
+    if (reused) adoptedCount++;
+    else createdCount++;
   }
 
   const uniqueIds = [...new Set(slskdSearchIds)];
@@ -275,38 +274,28 @@ async function reconcileSearchVariants(
   );
 
   if (missingQueries.length > 0) {
-    const adoptable = await findAdoptableSlskdSearches(missingQueries);
-    const adoptedFps = new Set<string>();
-
-    for (const adopted of adoptable) {
-      const qfp = queryFingerprint(adopted.matchedQuery);
-      upsertSearchVariant({
-        semanticSearchId: search.id,
-        query: adopted.matchedQuery,
-        queryFingerprint: qfp,
-        slskdSearchId: adopted.slskdSearch.id,
-        discovered: true,
-      });
-      activeIds.push(adopted.slskdSearch.id);
-      activeFingerprints.add(qfp);
-      adoptedFps.add(qfp);
-      adoptedCount++;
-    }
-
     for (const query of missingQueries) {
       const qfp = queryFingerprint(query);
-      if (activeFingerprints.has(qfp) || adoptedFps.has(qfp)) continue;
+      if (activeFingerprints.has(qfp)) continue;
 
-      const slskdSearch = await slskd.startSearch(query);
+      const { search: slskdSearch, reused } = await slskd.findOrStartSearch(
+        query,
+        (fp) => {
+          const variant = findVariantByQueryFingerprint(fp);
+          return variant ? { slskdSearchId: variant.slskd_search_id } : null;
+        }
+      );
       upsertSearchVariant({
         semanticSearchId: search.id,
         query,
         queryFingerprint: qfp,
         slskdSearchId: slskdSearch.id,
+        discovered: reused,
       });
       activeIds.push(slskdSearch.id);
       activeFingerprints.add(qfp);
-      createdCount++;
+      if (reused) adoptedCount++;
+      else createdCount++;
     }
   }
 
@@ -314,42 +303,6 @@ async function reconcileSearchVariants(
   updateSlskdIds(search.id, uniqueIds);
 
   return { activeSlskdIds: uniqueIds, adoptedCount, createdCount };
-}
-
-interface AdoptableSearch {
-  slskdSearch: SlskdSearchState;
-  matchedQuery: string;
-}
-
-async function findAdoptableSlskdSearches(
-  queries: string[]
-): Promise<AdoptableSearch[]> {
-  try {
-    const existingSearches = await slskd.listSearches();
-    const adoptable: AdoptableSearch[] = [];
-    const adopted = new Set<string>();
-
-    for (const query of queries) {
-      const qfp = queryFingerprint(query);
-
-      for (const existing of existingSearches) {
-        if (adopted.has(existing.id)) continue;
-        const existingFp = queryFingerprint(existing.searchText ?? "");
-        if (existingFp === qfp) {
-          adoptable.push({ slskdSearch: existing, matchedQuery: query });
-          adopted.add(existing.id);
-          break;
-        }
-      }
-    }
-
-    return adoptable;
-  } catch (err) {
-    log("warn", "slskd_list_searches_failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    return [];
-  }
 }
 
 function queryFingerprint(query: string): string {
