@@ -13,6 +13,8 @@ services:
       - /home/dd/server/music-api/data:/app/data
       # RW required for player sidecar writes and library deletion (PR #3).
       - /mnt/storage_6tb/Music/complete:/music
+      # Read-only slskd history/message databases consumed by the Manager API.
+      - ${SLSKD_DATA_PATH:-./slskd-data}:/slskd-data:ro
     # Match SQLite data dir ownership (nobody/nogroup on this host).
     user: "65534:65534"
     group_add:

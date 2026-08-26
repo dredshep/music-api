@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { loadConfig } from "./config";
-import { authMiddleware } from "./middleware/auth";
+import { authMiddleware, managerAuthMiddleware } from "./middleware/auth";
 import { errorHandler, formatErrorResponse } from "./middleware/errors";
 import { loggingMiddleware, type AppVariables } from "./middleware/logging";
 import { failBanMiddleware, publicRateLimit, authenticatedRateLimit } from "./middleware/rate-limit";
@@ -18,9 +18,12 @@ import { recommendationRoutes } from "./routes/recommendations";
 import { lyricsRoutes } from "./routes/lyrics";
 import { playerRoutes } from "./routes/player";
 import { openapiRoute } from "./routes/openapi";
+import { openapiManagerRoute } from "./routes/openapi-manager";
+import { managerRoutes } from "./routes/manager";
 import { initDatabase } from "./db/database";
 import { startCleanupTimer } from "./db/cleanup";
 import { warmLibraryDiskUsageCache } from "./services/library-storage";
+import { startReconciler } from "./services/download-reconciler";
 
 const config = loadConfig();
 
@@ -54,6 +57,7 @@ app.use("*", errorHandler());
 app.use("/health", publicRateLimit());
 app.get("/health", (c) => c.json({ status: "ok" }));
 app.route("/", openapiRoute);
+app.route("/", openapiManagerRoute);
 app.route("/", suggestionsUiRoute);
 
 // --- Authenticated routes ---
@@ -74,7 +78,14 @@ app.route("/v1", recommendationRoutes);
 app.route("/v1", lyricsRoutes);
 app.route("/v1", playerRoutes);
 
+// --- Manager API (separate auth, broader surface) ---
+app.use("/manager/v1/*", managerAuthMiddleware());
+app.use("/manager/v1/*", authenticatedRateLimit());
+app.use("/manager/v1/*", loggingMiddleware());
+app.route("/manager/v1", managerRoutes);
+
 startCleanupTimer();
+startReconciler();
 warmLibraryDiskUsageCache();
 
 console.log(

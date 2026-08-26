@@ -46,3 +46,37 @@ export function authMiddleware(): MiddlewareHandler {
     await next();
   };
 }
+
+/**
+ * Manager auth is deliberately separate from the agent/ChatGPT API surface.
+ * When MANAGER_API_KEY is configured it is the ONLY key accepted here.
+ * Falling back to API_KEY keeps existing single-key deployments bootable,
+ * while production can opt into strict credential separation immediately.
+ */
+export function managerAuthMiddleware(): MiddlewareHandler {
+  return async (c, next) => {
+    const authHeader = c.req.header("Authorization");
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      recordAuthFailure(getClientIp(c));
+      return c.json(
+        { error: { code: "UNAUTHORIZED", message: "Missing or invalid authorization", retryable: false } },
+        401
+      );
+    }
+
+    const token = authHeader.slice(7);
+    const config = getConfig();
+    const expected = config.MANAGER_API_KEY || config.API_KEY;
+
+    if (!timingSafeEqual(token, expected)) {
+      recordAuthFailure(getClientIp(c));
+      return c.json(
+        { error: { code: "UNAUTHORIZED", message: "Invalid manager API key", retryable: false } },
+        401
+      );
+    }
+
+    await next();
+  };
+}

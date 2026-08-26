@@ -148,6 +148,39 @@ export function extractEditionInfo(title: string): {
   return { baseTitle: title };
 }
 
+/**
+ * Compute a canonical fingerprint for a semantic search identity.
+ * Two requests with different formatting but the same musical intent
+ * must produce the same fingerprint.
+ */
+export function computeSemanticFingerprint(
+  artist: string,
+  title: string,
+  releaseType?: string,
+): string {
+  const normArtist = normalizeForFingerprint(artist);
+  const normTitle = normalizeForFingerprint(title);
+  const normType = (releaseType ?? "album").toLowerCase().trim();
+  return `${normArtist}\0${normTitle}\0${normType}`;
+}
+
+/**
+ * Aggressive normalization for fingerprinting — strips punctuation,
+ * accents, and anything not alphanumeric/space, then collapses whitespace.
+ */
+function normalizeForFingerprint(input: string): string {
+  let s = input.normalize("NFKC").toLowerCase();
+  // Strip accents
+  s = s.normalize("NFKD").replace(/[\u0300-\u036f]/g, "");
+  // Replace all dash/hyphen variants and punctuation with space
+  s = s.replace(/[\u2010-\u2015\uFE58\uFE63\uFF0D\-]/g, " ");
+  // Strip everything except letters, numbers, spaces
+  s = s.replace(/[^\p{L}\p{N}\s]/gu, "");
+  // Collapse whitespace
+  s = s.replace(/\s+/g, " ").trim();
+  return s;
+}
+
 export function normalizeFileStem(filename: string): string {
   // Remove extension, normalize for LRC matching
   const stem = filename.replace(/\.[^.]+$/, "");

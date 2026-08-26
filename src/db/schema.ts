@@ -331,4 +331,39 @@ export const MIGRATIONS = [
       CREATE INDEX IF NOT EXISTS idx_lyric_acq_lrclib ON lyric_acquisitions(lrclib_id);
     `,
   },
+  {
+    version: 8,
+    sql: `
+      -- Make searches durable: add fingerprint for identity dedup,
+      -- normalized fields, and last_used_at for access tracking.
+      ALTER TABLE searches ADD COLUMN fingerprint TEXT;
+      ALTER TABLE searches ADD COLUMN normalized_artist TEXT;
+      ALTER TABLE searches ADD COLUMN normalized_title TEXT;
+      ALTER TABLE searches ADD COLUMN last_used_at DATETIME;
+
+      CREATE INDEX IF NOT EXISTS idx_searches_fingerprint ON searches(fingerprint);
+
+      -- Search variants: map semantic searches to individual slskd search IDs.
+      -- Each variant is one query string sent to slskd.
+      CREATE TABLE IF NOT EXISTS search_variants (
+        id TEXT PRIMARY KEY,
+        semantic_search_id TEXT NOT NULL,
+        query TEXT NOT NULL,
+        query_fingerprint TEXT NOT NULL,
+        slskd_search_id TEXT NOT NULL,
+        discovered INTEGER NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL,
+        last_seen_at DATETIME NOT NULL,
+        missing_at DATETIME,
+        FOREIGN KEY (semantic_search_id) REFERENCES searches(id)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_search_variants_semantic
+        ON search_variants(semantic_search_id);
+      CREATE INDEX IF NOT EXISTS idx_search_variants_slskd
+        ON search_variants(slskd_search_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_search_variants_query_fp
+        ON search_variants(semantic_search_id, query_fingerprint);
+    `,
+  },
 ];

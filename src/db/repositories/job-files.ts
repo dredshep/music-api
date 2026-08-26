@@ -208,11 +208,12 @@ export function getJobFileStats(jobId: string): {
       stats[key] = row.cnt;
     }
   }
-  // waiting_remote counts as downloading for summary
+
+  // waiting_remote is already included in total; only fold it into the
+  // downloading summary bucket so progress totals remain accurate.
   const waitingRemote = rows.find((r) => r.status === "waiting_remote");
   if (waitingRemote) {
     stats.downloading += waitingRemote.cnt;
-    stats.total += waitingRemote.cnt;
   }
 
   return stats;
