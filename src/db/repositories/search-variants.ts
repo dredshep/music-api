@@ -104,3 +104,15 @@ export function getVariantBySlskdId(slskdSearchId: string): SearchVariantRecord 
       .get(slskdSearchId) ?? null
   );
 }
+
+/** Find any non-missing variant across ALL semantic searches with matching query fingerprint. */
+export function findVariantByQueryFingerprint(fp: string): SearchVariantRecord | null {
+  const db = getDb();
+  return (
+    db
+      .query<SearchVariantRecord, [string]>(
+        "SELECT * FROM search_variants WHERE query_fingerprint = ? AND missing_at IS NULL ORDER BY last_seen_at DESC LIMIT 1"
+      )
+      .get(fp) ?? null
+  );
+}
