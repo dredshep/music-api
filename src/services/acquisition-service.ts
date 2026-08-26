@@ -33,7 +33,11 @@ import {
   updateAcquisitionStatus,
   type AcquisitionRecord,
 } from "../db/repositories/acquisitions";
-import { selectDownloadFiles, type CandidateFile } from "../domain/candidates";
+import {
+  selectDownloadFiles,
+  selectMatchedTrackFiles,
+  type CandidateFile,
+} from "../domain/candidates";
 import {
   hasSameSourceRetryBudget,
   isSystemicSourceFailure,
@@ -210,9 +214,15 @@ async function enqueueCandidateForAcquisition(
   const storedFiles: CandidateFile[] = candidate.files_json
     ? JSON.parse(candidate.files_json)
     : [];
-  const filesToDownload = selectDownloadFiles(storedFiles);
+  const filesToDownload = acquisition.release_type === "track"
+    ? selectMatchedTrackFiles(storedFiles, acquisition.title)
+    : selectDownloadFiles(storedFiles);
   if (filesToDownload.length === 0) {
-    throw new Error(`Candidate has no downloadable audio files: ${candidate.id}`);
+    throw new Error(
+      acquisition.release_type === "track"
+        ? `Candidate does not contain a usable match for track: ${acquisition.title}`
+        : `Candidate has no downloadable audio files: ${candidate.id}`
+    );
   }
 
   const job = createJob({
@@ -228,6 +238,8 @@ async function enqueueCandidateForAcquisition(
       search_id: acquisition.search_id,
       peer: candidate.peer,
       directory: candidate.remote_directory,
+      matched_only: acquisition.release_type === "track",
+      track_title: acquisition.release_type === "track" ? acquisition.title : undefined,
     },
   });
 
@@ -281,7 +293,7 @@ async function verifyCompletedAcquisition(
   acquisition: AcquisitionRecord,
   job: JobRecord
 ): Promise<void> {
-  // Track acquisitions already use matched-only transfer semantics. For them,
+  // Track acquisitions use matched-only transfer semantics. For them,
   // successful transfer completion is sufficient; album ownership matching is
   // intentionally release-oriented.
   if (acquisition.release_type === "track") {
