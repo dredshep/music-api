@@ -128,10 +128,27 @@ export async function startSearch(query: string): Promise<SlskdSearchState> {
   });
 }
 
-/** Start multiple queries serially (slskd allows only one concurrent start). */
+function searchFingerprint(query: string): string {
+  return query
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/[\u2010-\u2015-]+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Start unique query variants serially (slskd allows only one concurrent start). */
 export async function startSearches(queries: string[]): Promise<SlskdSearchState[]> {
   const results: SlskdSearchState[] = [];
+  const seen = new Set<string>();
   for (const query of queries) {
+    const fingerprint = searchFingerprint(query);
+    if (!fingerprint || seen.has(fingerprint)) {
+      log("info", "slskd_search_variant_deduped", { query, fingerprint });
+      continue;
+    }
+    seen.add(fingerprint);
     results.push(await startSearch(query));
   }
   return results;
@@ -162,7 +179,7 @@ export async function getSearchResponses(
  * Retrieve a user's shared directory.
  *
  * slskd requires POST with the directory path as the JSON body
- * and returns an array of directory objects.  File entries may
+ * and returns an array of directory objects. File entries may
  * contain basenames — we reconstruct full remote paths.
  */
 export async function getUserDirectory(
@@ -190,7 +207,6 @@ export async function getUserDirectory(
     return { name: directory, files: [], directories: [] };
   }
 
-  // slskd returns an array of directory objects; merge them
   const dirs: SlskdUserDirectory[] = Array.isArray(rawResult)
     ? rawResult
     : [rawResult];
@@ -202,7 +218,6 @@ export async function getUserDirectory(
     if (!dir.files || !Array.isArray(dir.files)) continue;
 
     for (const file of dir.files) {
-      // slskd may return basenames — reconstruct full remote path
       const filename = looksLikeBasename(file.filename, directory)
         ? joinRemotePath(dir.name || directory, file.filename)
         : file.filename;
@@ -223,15 +238,12 @@ export async function getUserDirectory(
 
 function looksLikeBasename(filename: string, directory: string): boolean {
   const normalized = filename.replace(/\\/g, "/");
-  // If it contains a path separator, it's already a full path
   if (normalized.includes("/")) return false;
-  // If it starts with the directory prefix, it's already full
   if (normalized.startsWith(directory.replace(/\\/g, "/"))) return false;
   return true;
 }
 
 function joinRemotePath(directory: string, basename: string): string {
-  // Preserve the original path separator style
   const sep = directory.includes("\\") ? "\\" : "/";
   const dir = directory.replace(/[/\\]$/, "");
   return `${dir}${sep}${basename}`;
@@ -246,7 +258,6 @@ export async function enqueueFiles(
   username: string,
   files: RemoteFile[]
 ): Promise<void> {
-  // slskd rejects requests with duplicate filenames
   const seen = new Set<string>();
   const unique: RemoteFile[] = [];
   for (const f of files) {
@@ -271,6 +282,49 @@ export async function enqueueFiles(
 
 export async function getDownloads(): Promise<SlskdDownloadState[]> {
   return slskdFetch<SlskdDownloadState[]>("/transfers/downloads");
+}
+
+function normalizeRemotePath(value: string): string {
+  return value.replace(/\\/g, "/").replace(/\/+/g, "/").toLocaleLowerCase();
+}
+
+function remoteBasename(value: string): string {
+  const normalized = normalizeRemotePath(value);
+  return normalized.slice(normalized.lastIndexOf("/") + 1);
+}
+
+/** Best-effort confirmation that slskd created a transfer after accepting POST. */
+export async function waitForEnqueuedFiles(
+  username: string,
+  files: RemoteFile[],
+  timeoutMs = 5000
+): Promise<boolean> {
+  const wantedPaths = new Set(files.map((file) => normalizeRemotePath(file.filename)));
+  const wantedNames = new Set(files.map((file) => remoteBasename(file.filename)));
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+
+  while (Date.now() <= deadline) {
+    try {
+      const downloads = await getDownloads();
+      const user = downloads.find((entry) => entry.username === username);
+      if (user) {
+        for (const directory of user.directories ?? []) {
+          for (const file of directory.files ?? []) {
+            const candidatePath = normalizeRemotePath(file.filename);
+            if (wantedPaths.has(candidatePath) || wantedNames.has(remoteBasename(candidatePath))) {
+              return true;
+            }
+          }
+        }
+      }
+    } catch {
+      // POST already succeeded; verification must never turn a successful queue
+      // request into a false hard failure because the status endpoint hiccupped.
+    }
+    await sleep(500);
+  }
+
+  return false;
 }
 
 export async function cancelTransfer(
@@ -333,7 +387,6 @@ export async function collectSearchResults(
   const config = getConfig();
   const preferLrc = opts.preferLrc ?? false;
   const minMs = opts.minMs ?? config.SEARCH_COLLECTION_MS;
-  // When prefer_lrc is set, allow more collection time for lyric-bearing peers
   const maxMs = opts.maxMs ?? (preferLrc ? 45000 : 30000);
   const pollMs = 1000;
   const startedAt = Date.now();
@@ -362,13 +415,10 @@ export async function collectSearchResults(
       const audioDirs = countAudioDirectories(lastResponses);
 
       if (preferLrc && audioDirs > 0 && !allSettled && !pastMaximum) {
-        // When prefer_lrc, keep waiting past minimum if we have audio dirs
-        // but no LRC-bearing ones yet, unless settled or timed out
         const lrcDirs = countLrcDirectories(lastResponses);
         if (lrcDirs > 0 || allSettled || pastMaximum) {
           break;
         }
-        // Keep polling for LRC-bearing directories
       } else if (audioDirs > 0 || allSettled || pastMaximum) {
         break;
       }
@@ -385,7 +435,7 @@ export async function collectSearchResults(
 
 /**
  * Refresh collection: for an existing search, return immediately if
- * candidates already exist in the responses.  If empty and still
+ * candidates already exist in the responses. If empty and still
  * collecting, wait up to `waitMs` for a viable directory or settlement.
  */
 export async function refreshSearchResults(
