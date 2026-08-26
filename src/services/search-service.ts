@@ -51,18 +51,55 @@ export interface SemanticSearchResult {
 }
 
 /**
+ * Single-flight registry for semantic identities. music-api is deployed as a
+ * single process today, so this closes the phone/desktop race where two
+ * simultaneous requests could both create the same slskd searches.
+ */
+const inFlightSemanticSearches = new Map<string, Promise<SemanticSearchResult>>();
+
+/**
  * Core entrypoint: find or create a semantic search, reusing existing
- * slskd searches wherever possible.
+ * slskd searches wherever possible. Explicit forceNew requests intentionally
+ * bypass reuse/adoption and always create fresh slskd search variants.
  */
 export async function getOrCreateSemanticSearch(
   params: SemanticSearchParams
 ): Promise<SemanticSearchResult> {
-  const config = getConfig();
   const fingerprint = computeSemanticFingerprint(
     params.artist,
     params.title,
     params.releaseType
   );
+
+  if (params.forceNew) {
+    return getOrCreateSemanticSearchUnlocked(params, fingerprint);
+  }
+
+  const existingFlight = inFlightSemanticSearches.get(fingerprint);
+  if (existingFlight) {
+    log("info", "semantic_search_joined_inflight", {
+      fingerprint,
+      artist: params.artist,
+      title: params.title,
+    });
+    return existingFlight;
+  }
+
+  const flight = getOrCreateSemanticSearchUnlocked(params, fingerprint).finally(() => {
+    if (inFlightSemanticSearches.get(fingerprint) === flight) {
+      inFlightSemanticSearches.delete(fingerprint);
+    }
+  });
+
+  inFlightSemanticSearches.set(fingerprint, flight);
+  return flight;
+}
+
+async function getOrCreateSemanticSearchUnlocked(
+  params: SemanticSearchParams,
+  fingerprint: string
+): Promise<SemanticSearchResult> {
+  const config = getConfig();
 
   if (!params.forceNew) {
     const existing = findSearchByFingerprint(fingerprint);
@@ -92,12 +129,16 @@ export async function getOrCreateSemanticSearch(
     params.preferredFormats
   );
 
-  // Before creating anything in slskd, try to adopt existing slskd searches
   let adoptedCount = 0;
   let createdCount = 0;
   const slskdSearchIds: string[] = [];
 
-  const adoptable = await findAdoptableSlskdSearches(queries);
+  // A normal search may adopt a matching historical slskd search. An explicit
+  // re-search must not: it is the user's opt-in way to create genuinely fresh
+  // upstream searches.
+  const adoptable = params.forceNew
+    ? []
+    : await findAdoptableSlskdSearches(queries);
 
   const searchRecord = createSearch({
     artist: params.artist,
@@ -111,7 +152,6 @@ export async function getOrCreateSemanticSearch(
     maxCandidates: params.maxCandidates,
   });
 
-  // Register adopted searches as variants
   for (const adopted of adoptable) {
     const qfp = queryFingerprint(adopted.matchedQuery);
     upsertSearchVariant({
@@ -125,7 +165,6 @@ export async function getOrCreateSemanticSearch(
     adoptedCount++;
   }
 
-  // Create only missing query variants
   const adoptedFingerprints = new Set(
     adoptable.map((a) => queryFingerprint(a.matchedQuery))
   );
@@ -145,20 +184,21 @@ export async function getOrCreateSemanticSearch(
     createdCount++;
   }
 
-  // Update the legacy slskd_search_ids_json column for compatibility
-  updateSlskdIds(searchRecord.id, slskdSearchIds);
+  const uniqueIds = [...new Set(slskdSearchIds)];
+  updateSlskdIds(searchRecord.id, uniqueIds);
 
   log("info", "semantic_search_created", {
     search_id: searchRecord.id,
     fingerprint,
+    forced: Boolean(params.forceNew),
     adopted: adoptedCount,
     created: createdCount,
-    total_variants: slskdSearchIds.length,
+    total_variants: uniqueIds.length,
   });
 
   return {
     searchRecord: getSearchRecord(searchRecord.id) ?? searchRecord,
-    slskdSearchIds,
+    slskdSearchIds: uniqueIds,
     reused: false,
     adoptedCount,
     createdCount,
@@ -167,7 +207,7 @@ export async function getOrCreateSemanticSearch(
 
 /**
  * For an existing semantic search, verify slskd search IDs still exist,
- * adopt any new matches, and create missing variants.
+ * adopt any new matches, and create only variants that are truly missing.
  */
 async function reconcileSearchVariants(
   search: SearchRecord,
@@ -179,14 +219,15 @@ async function reconcileSearchVariants(
 }> {
   const variants = getVariantsForSearch(search.id);
   const activeIds: string[] = [];
+  const activeFingerprints = new Set<string>();
   let adoptedCount = 0;
   let createdCount = 0;
 
-  // Verify each existing variant's slskd search still exists
   for (const variant of variants) {
     try {
       await slskd.getSearch(variant.slskd_search_id);
       activeIds.push(variant.slskd_search_id);
+      activeFingerprints.add(variant.query_fingerprint);
     } catch {
       markVariantMissing(variant.id);
       log("info", "search_variant_missing_in_slskd", {
@@ -197,7 +238,6 @@ async function reconcileSearchVariants(
     }
   }
 
-  // Also check the legacy slskd_search_ids_json for IDs not yet in variants table
   const legacyIds = search.slskd_search_ids_json
     ? (JSON.parse(search.slskd_search_ids_json) as string[])
     : [];
@@ -207,37 +247,34 @@ async function reconcileSearchVariants(
     if (knownSlskdIds.has(legacyId)) continue;
     try {
       const slskdSearch = await slskd.getSearch(legacyId);
+      const query = slskdSearch.searchText ?? "";
+      const qfp = queryFingerprint(query || legacyId);
       upsertSearchVariant({
         semanticSearchId: search.id,
-        query: slskdSearch.searchText ?? "",
-        queryFingerprint: queryFingerprint(slskdSearch.searchText ?? legacyId),
+        query,
+        queryFingerprint: qfp,
         slskdSearchId: legacyId,
         discovered: true,
       });
       activeIds.push(legacyId);
+      activeFingerprints.add(qfp);
       adoptedCount++;
     } catch {
-      // Legacy ID no longer valid
+      // Legacy ID no longer exists in slskd.
     }
   }
 
-  // Generate expected queries and find any that are missing
   const queries = generateSearchQueries(
     params.artist,
     params.title,
     params.preferredFormats
   );
 
-  const existingFingerprints = new Set([
-    ...variants.filter((v) => !v.missing_at).map((v) => v.query_fingerprint),
-  ]);
-
   const missingQueries = queries.filter(
-    (q) => !existingFingerprints.has(queryFingerprint(q))
+    (q) => !activeFingerprints.has(queryFingerprint(q))
   );
 
   if (missingQueries.length > 0) {
-    // Try to adopt from slskd first
     const adoptable = await findAdoptableSlskdSearches(missingQueries);
     const adoptedFps = new Set<string>();
 
@@ -251,14 +288,14 @@ async function reconcileSearchVariants(
         discovered: true,
       });
       activeIds.push(adopted.slskdSearch.id);
+      activeFingerprints.add(qfp);
       adoptedFps.add(qfp);
       adoptedCount++;
     }
 
-    // Create what's still missing
     for (const query of missingQueries) {
       const qfp = queryFingerprint(query);
-      if (adoptedFps.has(qfp)) continue;
+      if (activeFingerprints.has(qfp) || adoptedFps.has(qfp)) continue;
 
       const slskdSearch = await slskd.startSearch(query);
       upsertSearchVariant({
@@ -268,11 +305,11 @@ async function reconcileSearchVariants(
         slskdSearchId: slskdSearch.id,
       });
       activeIds.push(slskdSearch.id);
+      activeFingerprints.add(qfp);
       createdCount++;
     }
   }
 
-  // Update legacy column
   const uniqueIds = [...new Set(activeIds)];
   updateSlskdIds(search.id, uniqueIds);
 
@@ -284,11 +321,6 @@ interface AdoptableSearch {
   matchedQuery: string;
 }
 
-/**
- * Scan slskd's search registry for existing searches that match our
- * intended query variants. This allows adoption of searches created
- * by other clients, before this migration, or from previous sessions.
- */
 async function findAdoptableSlskdSearches(
   queries: string[]
 ): Promise<AdoptableSearch[]> {
@@ -320,10 +352,6 @@ async function findAdoptableSlskdSearches(
   }
 }
 
-/**
- * Normalize a query string into a fingerprint for deduplication.
- * Same logic as slskd service's existing searchFingerprint.
- */
 function queryFingerprint(query: string): string {
   return query
     .normalize("NFKC")
@@ -339,14 +367,21 @@ function generateSearchQueries(
   title: string,
   preferredFormats: string[]
 ): string[] {
-  const queries: string[] = [];
-  queries.push(`${artist} ${title}`);
-  queries.push(`${artist} - ${title}`);
-  const topFormat = preferredFormats[0];
-  if (topFormat) {
-    queries.push(`${artist} ${title} ${topFormat}`);
+  const raw = [
+    `${artist} ${title}`,
+    `${artist} - ${title}`,
+    ...(preferredFormats[0] ? [`${artist} ${title} ${preferredFormats[0]}`] : []),
+  ];
+
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const query of raw) {
+    const fingerprint = queryFingerprint(query);
+    if (!fingerprint || seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    unique.push(query);
   }
-  return queries.slice(0, 4);
+  return unique.slice(0, 4);
 }
 
 function updateSlskdIds(searchId: string, ids: string[]): void {
