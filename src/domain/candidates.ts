@@ -1,6 +1,6 @@
 import type { SlskdSearchResponse, SlskdFile } from "../types/upstream";
 import type { FileKind } from "../types/api";
-import { normalizeFileStem } from "./normalization";
+import { normalizeFileStem, similarityScore } from "./normalization";
 
 export interface CandidateFile {
   filename: string;
@@ -38,7 +38,6 @@ export function classifyFile(filename: string): { kind: FileKind; extension: str
   if (ext === ".log") return { kind: "log", extension: ext };
   if (SIDECAR_EXTENSIONS.has(ext)) return { kind: "sidecar", extension: ext };
 
-  // .txt might be lyrics if it has a matching audio stem
   if (ext === ".txt") return { kind: "lyrics", extension: ext };
 
   return { kind: "other", extension: ext };
@@ -51,7 +50,6 @@ export function getExtension(filename: string): string {
 }
 
 export function getParentDirectory(filepath: string): string {
-  // Handle both / and \ path separators (Soulseek often uses Windows paths)
   const normalized = filepath.replace(/\\/g, "/");
   const lastSlash = normalized.lastIndexOf("/");
   if (lastSlash === -1) return "";
@@ -87,7 +85,6 @@ export function groupByDirectory(
         groups.set(key, group);
       }
 
-      // Multiple query variants can hit the same peer/file — keep one entry
       if (group.files.some((f) => f.filename === file.filename)) {
         continue;
       }
@@ -128,7 +125,6 @@ export function computeStats(files: CandidateFile[]): CandidateStats {
     (f) => f.kind === "cue" || f.kind === "log" || f.kind === "sidecar"
   );
 
-  // Count audio format distribution
   const formatCounts = new Map<string, number>();
   for (const f of audioFiles) {
     const ext = f.extension.replace(".", "").toUpperCase();
@@ -144,7 +140,6 @@ export function computeStats(files: CandidateFile[]): CandidateStats {
     }
   }
 
-  // LRC coverage: match LRC stems to audio stems
   const audioStems = new Set(audioFiles.map((f) => normalizeFileStem(getFilename(f.filename))));
   let matchingLrcCount = 0;
   for (const lrc of lrcFiles) {
@@ -186,20 +181,16 @@ export function buildDisplayRelease(
   artist?: string,
   title?: string
 ): string {
-  // Try to extract a clean release name from the directory path
-  const dirName = getFilename(directory) || directory;
-
-  // If we have artist + title from the query, construct a display name
-  if (artist && title) {
-    return `${artist} - ${title}`;
-  }
-
-  // Clean up directory name
-  return dirName.replace(/\\/g, "/").replace(/\/$/, "");
+  // Source lists need to distinguish actual Soulseek editions/directories. The
+  // old implementation returned the query (`artist - title`) for every result,
+  // making every candidate look identically named.
+  const dirName = getFilename(directory) || directory.replace(/\\/g, "/").replace(/\/$/, "");
+  if (dirName.trim()) return dirName.trim();
+  if (artist && title) return `${artist} - ${title}`;
+  return title || artist || "Soulseek source";
 }
 
 export function selectDownloadFiles(files: CandidateFile[]): CandidateFile[] {
-  // Select: audio, matching LRC, cover images, cue, log — deduped by remote path
   const audioFiles = dedupeByFilename(files.filter((f) => f.kind === "audio"));
   const audioStems = new Set(
     audioFiles.map((f) => normalizeFileStem(getFilename(f.filename)))
@@ -208,7 +199,6 @@ export function selectDownloadFiles(files: CandidateFile[]): CandidateFile[] {
   const selected: CandidateFile[] = [...audioFiles];
   const seen = new Set(audioFiles.map((f) => f.filename));
 
-  // Matching lyrics
   for (const f of files) {
     if (f.kind === "lyrics" && f.extension === ".lrc") {
       const stem = normalizeFileStem(getFilename(f.filename));
@@ -219,7 +209,6 @@ export function selectDownloadFiles(files: CandidateFile[]): CandidateFile[] {
     }
   }
 
-  // Images (covers)
   for (const f of files) {
     if (f.kind === "image" && !seen.has(f.filename)) {
       selected.push(f);
@@ -227,7 +216,6 @@ export function selectDownloadFiles(files: CandidateFile[]): CandidateFile[] {
     }
   }
 
-  // Cue/log sidecars
   for (const f of files) {
     if ((f.kind === "cue" || f.kind === "log") && !seen.has(f.filename)) {
       selected.push(f);
@@ -240,8 +228,8 @@ export function selectDownloadFiles(files: CandidateFile[]): CandidateFile[] {
 
 /**
  * Select only the audio file best matching `trackTitle`, its .lrc sidecar,
- * and one cover image. For track/single acquisition that avoids downloading
- * the entire directory.
+ * and one cover image. A candidate that has no plausible title match is
+ * rejected instead of silently downloading the first arbitrary file.
  */
 export function selectMatchedTrackFiles(
   files: CandidateFile[],
@@ -251,28 +239,26 @@ export function selectMatchedTrackFiles(
   if (audioFiles.length === 0) return [];
 
   const normalizedTitle = normalizeFileStem(trackTitle);
+  const strippedTitle = normalizedTitle.replace(/^\d+[\s.\-_]+/, "");
 
-  // Score each audio file by how well its stem matches the track title
   let bestFile = audioFiles[0]!;
   let bestScore = -1;
 
   for (const f of audioFiles) {
     const stem = normalizeFileStem(getFilename(f.filename));
+    const stripped = stem.replace(/^\d+[\s.\-_]+/, "");
     let score = 0;
 
     if (stem === normalizedTitle) {
       score = 100;
+    } else if (stripped === strippedTitle) {
+      score = 96;
     } else if (stem.includes(normalizedTitle) || normalizedTitle.includes(stem)) {
-      score = 60;
+      score = 75;
+    } else if (stripped.includes(strippedTitle) || strippedTitle.includes(stripped)) {
+      score = 70;
     } else {
-      // Strip leading track numbers like "01 - " or "01. "
-      const stripped = stem.replace(/^\d+[\s.\-_]+/, "");
-      const strippedTitle = normalizedTitle.replace(/^\d+[\s.\-_]+/, "");
-      if (stripped === strippedTitle) {
-        score = 90;
-      } else if (stripped.includes(strippedTitle) || strippedTitle.includes(stripped)) {
-        score = 50;
-      }
+      score = Math.round(similarityScore(stripped, strippedTitle) * 65);
     }
 
     if (score > bestScore) {
@@ -281,10 +267,13 @@ export function selectMatchedTrackFiles(
     }
   }
 
+  // Below this level the relation is weak enough that choosing the first file
+  // is more dangerous than returning a useful error and trying another source.
+  if (bestScore < 45) return [];
+
   const selected: CandidateFile[] = [bestFile];
   const audioStem = normalizeFileStem(getFilename(bestFile.filename));
 
-  // Add matching .lrc
   for (const f of files) {
     if (f.kind === "lyrics" && f.extension === ".lrc") {
       const lrcStem = normalizeFileStem(getFilename(f.filename));
@@ -294,7 +283,6 @@ export function selectMatchedTrackFiles(
     }
   }
 
-  // Add one cover image
   const cover = files.find((f) => {
     if (f.kind !== "image") return false;
     const name = getFilename(f.filename).toLowerCase();
