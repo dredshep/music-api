@@ -57,6 +57,8 @@ describe("OpenAPI GPT Actions limits", () => {
 describe("Manager OpenAPI spec", () => {
   const REQUIRED_MANAGER_PATHS = [
     "/manager/v1/soulseek/searches",
+    "/manager/v1/soulseek/semantic-searches/{id}/refresh",
+    "/manager/v1/soulseek/semantic-searches/{id}/research",
     "/manager/v1/soulseek/transfers/downloads",
     "/manager/v1/soulseek/transfers/uploads",
     "/manager/v1/soulseek/transfers/cancel",
@@ -71,6 +73,12 @@ describe("Manager OpenAPI spec", () => {
     const paths = new Set(Object.keys(getManagerOpenApiSpec().paths));
     const missing = REQUIRED_MANAGER_PATHS.filter((p) => !paths.has(p));
     expect(missing).toEqual([]);
+  });
+
+  test("raw slskd IDs are not reused as semantic-action routes", () => {
+    const paths = new Set(Object.keys(getManagerOpenApiSpec().paths));
+    expect(paths.has("/manager/v1/soulseek/searches/{id}/refresh")).toBe(false);
+    expect(paths.has("/manager/v1/soulseek/searches/{id}/research")).toBe(false);
   });
 
   test("no agent API paths leak into manager spec", () => {
