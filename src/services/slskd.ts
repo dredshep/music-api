@@ -154,6 +154,10 @@ export async function startSearches(queries: string[]): Promise<SlskdSearchState
   return results;
 }
 
+export async function listSearches(): Promise<SlskdSearchState[]> {
+  return slskdFetch<SlskdSearchState[]>("/searches");
+}
+
 export async function getSearch(searchId: string): Promise<SlskdSearchState> {
   return slskdFetch<SlskdSearchState>(`/searches/${searchId}`);
 }

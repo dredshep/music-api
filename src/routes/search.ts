@@ -6,13 +6,13 @@ import { log } from "../middleware/logging";
 import * as slskd from "../services/slskd";
 import type { SearchCollectionDiagnostics } from "../services/slskd";
 import {
-  createSearch,
   getSearch,
-  isSearchExpired,
   updateSearchLifecycle,
   buildSearchLifecycle,
+  touchSearchUsage,
   type SearchRecord,
 } from "../db/repositories/searches";
+import { getVariantsForSearch } from "../db/repositories/search-variants";
 import {
   upsertCandidate,
   getCandidatesBySearch,
@@ -32,10 +32,13 @@ import { scoreCandidate } from "../domain/scoring";
 import { matchLibraryAlbums } from "../domain/matching";
 import * as navidrome from "../services/navidrome";
 import { searchSemaphore } from "../middleware/semaphore";
+import { getOrCreateSemanticSearch } from "../services/search-service";
 
 export const searchRoutes = new Hono();
 
 const formatEnum = z.enum(["FLAC", "MP3", "AAC", "OGG", "OPUS", "WAV", "ALAC", "WMA", "APE"]);
+
+// --- POST /search: start a new search ---
 
 const searchSchema = z.object({
   artist: z.string().min(1).max(500),
@@ -47,9 +50,8 @@ const searchSchema = z.object({
   preferred_formats: z.array(formatEnum).max(10).optional().default(["FLAC", "MP3"]),
   prefer_lrc: z.boolean().optional().default(true),
   max_candidates: z.coerce.number().min(1).max(20).optional().default(10),
+  force_new: z.boolean().optional().default(false),
 });
-
-// --- POST /search: start a new search ---
 
 searchRoutes.post("/search", async (c) => {
   return searchSemaphore.run(async () => {
@@ -64,43 +66,65 @@ searchRoutes.post("/search", async (c) => {
       );
     }
 
-    const { artist, title, release_type, preferred_formats, prefer_lrc, max_candidates } =
+    const { artist, title, release_type, preferred_formats, prefer_lrc, max_candidates, force_new } =
       parsed.data;
     const config = getConfig();
-
-    const queries = generateSearchQueries(artist, title, preferred_formats);
 
     log("info", "soulseek_search_initiated", {
       artist,
       title,
-      queries: queries.length,
+      force_new,
     });
 
-    // Start slskd searches serially
-    const searches = await slskd.startSearches(queries);
-    const slskdSearchIds = searches.map((s) => s.id);
-
-    // Create the search record immediately with original options
-    const searchRecord = createSearch({
+    const semantic = await getOrCreateSemanticSearch({
       artist,
       title,
       releaseType: release_type,
-      rawQuery: queries.join(" | "),
-      slskdSearchIds,
-      ttlMinutes: config.SEARCH_RESULT_TTL_MINUTES,
       preferredFormats: preferred_formats,
       preferLrc: prefer_lrc,
       maxCandidates: max_candidates,
+      forceNew: force_new,
     });
 
-    // Adaptive collection. When prefer_lrc, poll longer for LRC-bearing peers.
-    const { responses, diagnostics } = await slskd.collectSearchResults(slskdSearchIds, {
-      minMs: config.SEARCH_COLLECTION_MS,
-      maxMs: prefer_lrc ? 45000 : 30000,
-      preferLrc: prefer_lrc,
-    });
+    const { searchRecord, slskdSearchIds } = semantic;
 
-    // Build, enrich, score, and persist candidates
+    // If reused and we have existing candidates, check if they're still fresh
+    if (semantic.reused) {
+      const existingCandidates = getCandidatesBySearch(searchRecord.id);
+      const hasFreshCandidates = existingCandidates.length > 0 &&
+        existingCandidates.some((c) => new Date(c.expires_at) > new Date());
+
+      if (hasFreshCandidates) {
+        const finalCandidates = existingCandidates.slice(0, max_candidates);
+        const lifecycle = buildFallbackLifecycle(searchRecord);
+
+        log("info", "soulseek_search_reused_cached", {
+          search_id: searchRecord.id,
+          cached_candidates: finalCandidates.length,
+        });
+
+        return c.json({
+          search_id: searchRecord.id,
+          query: { artist, title, release_type },
+          lifecycle,
+          reused: true,
+          warnings: [],
+          candidates: finalCandidates.map(serializeCandidate),
+        });
+      }
+    }
+
+    // Collect results from slskd (fresh or refreshed)
+    const collectFn = semantic.reused
+      ? () => slskd.refreshSearchResults(slskdSearchIds, { waitMs: 15000 })
+      : () => slskd.collectSearchResults(slskdSearchIds, {
+          minMs: config.SEARCH_COLLECTION_MS,
+          maxMs: prefer_lrc ? 45000 : 30000,
+          preferLrc: prefer_lrc,
+        });
+
+    const { responses, diagnostics } = await collectFn();
+
     const result = await processResponses({
       responses,
       searchRecord,
@@ -112,7 +136,6 @@ searchRoutes.post("/search", async (c) => {
       maxCandidates: max_candidates,
     });
 
-    // Update lifecycle
     const lifecycle = buildSearchLifecycle(searchRecord, diagnostics);
     updateSearchLifecycle(searchRecord.id, {
       state: diagnostics.settled ? "settled" : "collecting",
@@ -130,12 +153,14 @@ searchRoutes.post("/search", async (c) => {
       directories_enriched: result.enrichedCount,
       returned_candidates: result.candidates.length,
       settled: diagnostics.settled,
+      reused: semantic.reused,
     });
 
     return c.json({
       search_id: searchRecord.id,
       query: { artist, title, release_type },
       lifecycle,
+      reused: semantic.reused,
       diagnostics: {
         raw_file_count: diagnostics.rawFileCount,
         locked_file_count: diagnostics.lockedFileCount,
@@ -164,32 +189,32 @@ searchRoutes.get("/searches/:search_id", async (c) => {
     throw new AppError("SEARCH_NOT_FOUND", "Search not found", 404);
   }
 
-  if (isSearchExpired(search)) {
-    throw new AppError(
-      "SEARCH_EXPIRED",
-      "The search has expired. Run the search again.",
-      410
-    );
-  }
+  touchSearchUsage(search.id);
 
-  const config = getConfig();
-
-  // Recover original search options
   const opts = parseSearchOptions(search);
 
-  const slskdIds: string[] = search.slskd_search_ids_json
-    ? JSON.parse(search.slskd_search_ids_json)
-    : [];
+  // Resolve active slskd IDs: prefer the variants table, fall back to legacy column
+  const variants = getVariantsForSearch(search.id);
+  let slskdIds: string[] = variants.length > 0
+    ? variants.map((v) => v.slskd_search_id)
+    : search.slskd_search_ids_json
+      ? JSON.parse(search.slskd_search_ids_json)
+      : [];
 
   let diagnostics: SearchCollectionDiagnostics | null = null;
 
-  if (slskdIds.length > 0) {
+  // Check if candidates are stale (expired or absent)
+  const existingCandidates = getCandidatesBySearch(searchId);
+  const hasFreshCandidates = existingCandidates.length > 0 &&
+    existingCandidates.some((c) => new Date(c.expires_at) > new Date());
+
+  if (slskdIds.length > 0 && !hasFreshCandidates) {
+    // Candidates are stale — refresh from existing slskd searches
     const collection = await slskd.refreshSearchResults(slskdIds, {
       waitMs: 15000,
     });
     diagnostics = collection.diagnostics;
 
-    // Re-process and upsert candidates
     await processResponses({
       responses: collection.responses,
       searchRecord: search,
@@ -208,9 +233,35 @@ searchRoutes.get("/searches/:search_id", async (c) => {
       candidateCount: getCandidatesBySearch(search.id).length,
       lifecycle,
     });
+  } else if (slskdIds.length > 0) {
+    // Candidates are fresh — still poll for latest responses but don't block long
+    try {
+      const collection = await slskd.refreshSearchResults(slskdIds, {
+        waitMs: 5000,
+      });
+      diagnostics = collection.diagnostics;
+
+      await processResponses({
+        responses: collection.responses,
+        searchRecord: search,
+        artist: search.artist,
+        title: search.title,
+        releaseType: search.release_type ?? opts.releaseType,
+        preferredFormats: opts.preferredFormats,
+        preferLrc: opts.preferLrc,
+        maxCandidates: opts.maxCandidates,
+      });
+
+      updateSearchLifecycle(search.id, {
+        state: diagnostics.settled ? "settled" : "collecting",
+        diagnostics,
+        candidateCount: getCandidatesBySearch(search.id).length,
+      });
+    } catch {
+      // Non-critical: return existing candidates if refresh fails
+    }
   }
 
-  // Return current candidates (deduped by upsert, sorted by score)
   const candidates = getCandidatesBySearch(searchId);
   const maxCandidates = opts.maxCandidates;
   const finalCandidates = candidates.slice(0, maxCandidates);
@@ -294,29 +345,49 @@ searchRoutes.post("/acquire/preview", async (c) => {
     });
   }
 
-  // Not owned — search via unified path
   const preferredFormats: Array<"FLAC" | "MP3"> = ["FLAC", "MP3"];
-  const queries = generateSearchQueries(artist, title, preferredFormats);
-  const searches = await slskd.startSearches(queries);
-  const slskdSearchIds = searches.map((s) => s.id);
 
-  const searchRecord = createSearch({
+  const semantic = await getOrCreateSemanticSearch({
     artist,
     title,
     releaseType: release_type,
-    rawQuery: queries.join(" | "),
-    slskdSearchIds,
-    ttlMinutes: config.SEARCH_RESULT_TTL_MINUTES,
     preferredFormats,
     preferLrc: true,
     maxCandidates: config.DEFAULT_MAX_CANDIDATES,
   });
 
-  const { responses, diagnostics } = await slskd.collectSearchResults(slskdSearchIds, {
-    minMs: config.SEARCH_COLLECTION_MS,
-    maxMs: 45000,
-    preferLrc: true,
-  });
+  const { searchRecord, slskdSearchIds } = semantic;
+
+  // If reused with fresh candidates, return them immediately
+  if (semantic.reused) {
+    const existingCandidates = getCandidatesBySearch(searchRecord.id);
+    const hasFresh = existingCandidates.length > 0 &&
+      existingCandidates.some((c) => new Date(c.expires_at) > new Date());
+
+    if (hasFresh) {
+      const finalCandidates = existingCandidates.slice(0, config.DEFAULT_MAX_CANDIDATES);
+
+      return c.json({
+        status: "not_owned",
+        library_match: null,
+        search_id: searchRecord.id,
+        lifecycle: buildFallbackLifecycle(searchRecord),
+        reused: true,
+        candidates: finalCandidates.map(serializeCandidate),
+      });
+    }
+  }
+
+  // Collect results from slskd
+  const collectFn = semantic.reused
+    ? () => slskd.refreshSearchResults(slskdSearchIds, { waitMs: 15000 })
+    : () => slskd.collectSearchResults(slskdSearchIds, {
+        minMs: config.SEARCH_COLLECTION_MS,
+        maxMs: 45000,
+        preferLrc: true,
+      });
+
+  const { responses, diagnostics } = await collectFn();
 
   const result = await processResponses({
     responses,
@@ -344,6 +415,7 @@ searchRoutes.post("/acquire/preview", async (c) => {
     library_match: null,
     search_id: searchRecord.id,
     lifecycle,
+    reused: semantic.reused,
     candidates: finalCandidates.map(serializeCandidate),
   });
 });
@@ -461,7 +533,7 @@ async function enrichCandidatesWithTimeout(
     if (Date.now() >= deadline) {
       // Budget exhausted — use original files for remaining
       for (let j = i; j < candidates.length; j++) {
-        enriched.push(candidates[j]);
+        enriched.push(candidates[j]!);
       }
       break;
     }
@@ -516,24 +588,6 @@ async function enrichSingleCandidate(
 }
 
 // --- Helpers ---
-
-function generateSearchQueries(
-  artist: string,
-  title: string,
-  preferredFormats: string[]
-): string[] {
-  const queries: string[] = [];
-
-  queries.push(`${artist} ${title}`);
-  queries.push(`${artist} - ${title}`);
-
-  const topFormat = preferredFormats[0];
-  if (topFormat) {
-    queries.push(`${artist} ${title} ${topFormat}`);
-  }
-
-  return queries.slice(0, 4);
-}
 
 function preRankCandidates(
   candidates: RawCandidate[],

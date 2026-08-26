@@ -3,27 +3,30 @@ import { log } from "../middleware/logging";
 
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
+/**
+ * Prune stale candidate snapshots and generic cache entries.
+ *
+ * Searches themselves are DURABLE and never deleted by TTL cleanup.
+ * Only candidate rows (refreshable snapshots) and generic cache entries
+ * are pruned. The search identity and its variant mappings persist
+ * indefinitely so that cross-client/cross-restart search reuse works.
+ */
 export function runCleanup(): void {
   const db = getDb();
   const now = new Date().toISOString();
 
-  const expiredSearches = db
+  const expiredCandidates = db
     .query("DELETE FROM candidates WHERE expires_at < ?")
-    .run(now);
-  const expiredSearchRows = db
-    .query("DELETE FROM searches WHERE expires_at < ?")
     .run(now);
   const expiredCache = db
     .query("DELETE FROM cache WHERE expires_at < ?")
     .run(now);
 
-  const totalCleaned =
-    expiredSearches.changes + expiredSearchRows.changes + expiredCache.changes;
+  const totalCleaned = expiredCandidates.changes + expiredCache.changes;
 
   if (totalCleaned > 0) {
     log("info", "ttl_cleanup", {
-      candidates_removed: expiredSearches.changes,
-      searches_removed: expiredSearchRows.changes,
+      candidates_removed: expiredCandidates.changes,
       cache_removed: expiredCache.changes,
     });
   }

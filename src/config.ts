@@ -9,6 +9,11 @@ const configSchema = z.object({
   SLSKD_API_VERSION: z.string().default("v0"),
   SLSKD_API_KEY: z.string().default(""),
 
+  SLSKD_TRANSFERS_DB_PATH: z.string().default(""),
+  SLSKD_MESSAGING_DB_PATH: z.string().default(""),
+
+  MANAGER_API_KEY: z.string().default(""),
+
   NAVIDROME_URL: z.string().url().default("http://navidrome:4533"),
   NAVIDROME_USERNAME: z.string().min(1, "NAVIDROME_USERNAME is required"),
   NAVIDROME_PASSWORD: z.string().min(1, "NAVIDROME_PASSWORD is required"),

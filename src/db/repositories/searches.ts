@@ -1,6 +1,10 @@
 import { getDb } from "../database";
 import { ulid } from "ulid";
 import type { SearchCollectionDiagnostics } from "../../services/slskd";
+import {
+  computeSemanticFingerprint,
+  normalizeForComparison,
+} from "../../domain/normalization";
 
 export type SearchState = "collecting" | "settled" | "expired";
 
@@ -23,6 +27,10 @@ export interface SearchRecord {
   settled_at: string | null;
   created_at: string;
   expires_at: string;
+  fingerprint: string | null;
+  normalized_artist: string | null;
+  normalized_title: string | null;
+  last_used_at: string | null;
 }
 
 export interface SearchLifecycle {
@@ -46,17 +54,39 @@ export interface CreateSearchParams {
   maxCandidates?: number;
 }
 
+export function findSearchByFingerprint(fingerprint: string): SearchRecord | null {
+  const db = getDb();
+  return (
+    db
+      .query<SearchRecord, [string]>(
+        "SELECT * FROM searches WHERE fingerprint = ? ORDER BY created_at DESC LIMIT 1"
+      )
+      .get(fingerprint) ?? null
+  );
+}
+
+export function touchSearchUsage(id: string): void {
+  const db = getDb();
+  db.query("UPDATE searches SET last_used_at = ? WHERE id = ?")
+    .run(new Date().toISOString(), id);
+}
+
 export function createSearch(params: CreateSearchParams): SearchRecord {
   const db = getDb();
   const id = `search_${ulid()}`;
   const now = new Date();
   const expiresAt = new Date(now.getTime() + params.ttlMinutes * 60 * 1000);
 
+  const releaseType = params.releaseType ?? "album";
+  const fingerprint = computeSemanticFingerprint(params.artist, params.title, releaseType);
+  const normalizedArtist = normalizeForComparison(params.artist);
+  const normalizedTitle = normalizeForComparison(params.title);
+
   const record: SearchRecord = {
     id,
     artist: params.artist,
     title: params.title,
-    release_type: params.releaseType ?? null,
+    release_type: releaseType,
     raw_query: params.rawQuery ?? null,
     slskd_search_ids_json: params.slskdSearchIds
       ? JSON.stringify(params.slskdSearchIds)
@@ -66,7 +96,7 @@ export function createSearch(params: CreateSearchParams): SearchRecord {
       preferred_formats: params.preferredFormats ?? ["FLAC", "MP3"],
       prefer_lrc: params.preferLrc ?? true,
       max_candidates: params.maxCandidates ?? 10,
-      release_type: params.releaseType ?? "album",
+      release_type: releaseType,
     }),
     preferred_formats_json: params.preferredFormats
       ? JSON.stringify(params.preferredFormats)
@@ -80,6 +110,10 @@ export function createSearch(params: CreateSearchParams): SearchRecord {
     settled_at: null,
     created_at: now.toISOString(),
     expires_at: expiresAt.toISOString(),
+    fingerprint,
+    normalized_artist: normalizedArtist,
+    normalized_title: normalizedTitle,
+    last_used_at: now.toISOString(),
   };
 
   db.query(`
@@ -87,8 +121,9 @@ export function createSearch(params: CreateSearchParams): SearchRecord {
       id, artist, title, release_type, raw_query, slskd_search_ids_json,
       state, search_options_json, preferred_formats_json, prefer_lrc,
       max_candidates, lifecycle_json, diagnostics_json, candidate_count,
-      last_refreshed_at, settled_at, created_at, expires_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      last_refreshed_at, settled_at, created_at, expires_at,
+      fingerprint, normalized_artist, normalized_title, last_used_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     record.id,
     record.artist,
@@ -107,7 +142,11 @@ export function createSearch(params: CreateSearchParams): SearchRecord {
     record.last_refreshed_at,
     record.settled_at,
     record.created_at,
-    record.expires_at
+    record.expires_at,
+    record.fingerprint,
+    record.normalized_artist,
+    record.normalized_title,
+    record.last_used_at
   );
 
   return record;

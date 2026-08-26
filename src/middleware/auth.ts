@@ -46,3 +46,40 @@ export function authMiddleware(): MiddlewareHandler {
     await next();
   };
 }
+
+/**
+ * Manager auth: accepts either API_KEY or MANAGER_API_KEY.
+ * When MANAGER_API_KEY is unset, falls back to API_KEY only.
+ */
+export function managerAuthMiddleware(): MiddlewareHandler {
+  return async (c, next) => {
+    const authHeader = c.req.header("Authorization");
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+      recordAuthFailure(getClientIp(c));
+      return c.json(
+        { error: { code: "UNAUTHORIZED", message: "Missing or invalid authorization", retryable: false } },
+        401
+      );
+    }
+
+    const token = authHeader.slice(7);
+    const config = getConfig();
+
+    const validKeys = [config.API_KEY];
+    if (config.MANAGER_API_KEY) {
+      validKeys.push(config.MANAGER_API_KEY);
+    }
+
+    const isValid = validKeys.some((key) => timingSafeEqual(token, key));
+    if (!isValid) {
+      recordAuthFailure(getClientIp(c));
+      return c.json(
+        { error: { code: "UNAUTHORIZED", message: "Invalid API key", retryable: false } },
+        401
+      );
+    }
+
+    await next();
+  };
+}
