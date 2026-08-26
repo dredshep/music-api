@@ -68,16 +68,19 @@ downloadRoutes.post("/downloads", async (c) => {
     );
   }
 
-  // Check for existing active job (idempotency)
-  const existingJob = getJobByCandidateId(candidate_id);
-  if (existingJob) {
-    return c.json({
-      job_id: existingJob.id,
-      status: "already_queued",
-    });
+  // A full-release job is idempotent by candidate. A matched-track job is NOT:
+  // the same Soulseek directory/candidate can legitimately satisfy several
+  // different tracks, so candidate-level dedupe would silently no-op track 2+.
+  if (!matched_only) {
+    const existingJob = getJobByCandidateId(candidate_id);
+    if (existingJob) {
+      return c.json({
+        job_id: existingJob.id,
+        status: "already_queued",
+      });
+    }
   }
 
-  // Load candidate
   const candidate = getCandidate(candidate_id);
   if (!candidate) {
     throw new AppError("CANDIDATE_NOT_FOUND", "Candidate not found", 404);
@@ -91,7 +94,6 @@ downloadRoutes.post("/downloads", async (c) => {
     );
   }
 
-  // Parse stored files
   const storedFiles: CandidateFile[] = candidate.files_json
     ? JSON.parse(candidate.files_json)
     : [];
@@ -104,16 +106,26 @@ downloadRoutes.post("/downloads", async (c) => {
     );
   }
 
-  // Select files for download
   const filesToDownload = matched_only && track_title
     ? selectMatchedTrackFiles(storedFiles, track_title)
     : selectDownloadFiles(storedFiles);
 
-  // Create job
+  if (filesToDownload.length === 0) {
+    throw new AppError(
+      "CANDIDATE_NOT_FOUND",
+      matched_only
+        ? `Candidate does not contain a usable match for track: ${track_title}`
+        : "Candidate has no downloadable audio files",
+      409
+    );
+  }
+
   const job = createJob({
     candidateId: candidate.id,
     artist: candidate.display_release?.split(" - ")[0],
-    releaseTitle: candidate.display_release?.split(" - ").slice(1).join(" - "),
+    releaseTitle: matched_only && track_title
+      ? track_title
+      : candidate.display_release?.split(" - ").slice(1).join(" - "),
     selectedFormat: candidate.format ?? undefined,
     peer: candidate.peer,
     remoteDirectory: candidate.remote_directory,
@@ -121,10 +133,11 @@ downloadRoutes.post("/downloads", async (c) => {
       search_id: candidate.search_id,
       peer: candidate.peer,
       directory: candidate.remote_directory,
+      matched_only,
+      track_title: track_title ?? undefined,
     },
   });
 
-  // Create file records
   const fileParams = filesToDownload.map((f) => ({
     jobId: job.id,
     logicalFilename: getFilename(f.filename),
@@ -136,7 +149,6 @@ downloadRoutes.post("/downloads", async (c) => {
 
   createJobFiles(fileParams);
 
-  // Enqueue through slskd
   try {
     const remoteFiles = filesToDownload.map((f) => ({
       filename: f.filename,
@@ -151,6 +163,8 @@ downloadRoutes.post("/downloads", async (c) => {
       peer: candidate.peer,
       files: filesToDownload.length,
       audio_files: filesToDownload.filter((f) => f.kind === "audio").length,
+      matched_only,
+      track_title,
     });
   } catch (err) {
     const message =
@@ -191,14 +205,12 @@ downloadRoutes.get("/downloads", async (c) => {
   const q = c.req.query("q")?.trim();
   const hasIdentityFilter = !!(artist || release || q);
 
-  // When looking up a specific release, default to full job history not just active
   const status = c.req.query("status") ?? (hasIdentityFilter ? "all" : "active");
   const limit = parseInt(c.req.query("limit") ?? (hasIdentityFilter ? "100" : "50"), 10);
   const sinceDaysRaw = c.req.query("since_days");
   const sinceDays = sinceDaysRaw ? parseInt(sinceDaysRaw, 10) : undefined;
   const includeFiles = c.req.query("include_files") === "true";
 
-  // Refresh logical jobs from live slskd transfer state before reading
   if (status === "active" || status === "all") {
     try {
       await syncActiveJobsFromSlskd();
@@ -248,10 +260,14 @@ downloadRoutes.get("/downloads", async (c) => {
 
     if (includeFiles) {
       entry.file_list = jobFiles.map((f) => ({
+        file_id: f.id,
         filename: f.logical_filename,
+        remote_path: f.remote_filename,
         kind: f.kind,
         status: f.status,
         size: f.size,
+        peer: f.current_peer,
+        error: f.last_error ?? undefined,
       }));
       entry.audio_files = jobFiles
         .filter((f) => f.kind === "audio")
@@ -323,6 +339,7 @@ downloadRoutes.get("/downloads/:job_id", async (c) => {
     },
     progress: Math.round(progress * 100) / 100,
     file_list: files.map((f) => ({
+      file_id: f.id,
       filename: f.logical_filename,
       remote_path: f.remote_filename,
       kind: f.kind,
@@ -376,7 +393,6 @@ async function handleCancel(
 ) {
   const files = getJobFiles(job.id);
 
-  // Cancel active transfers
   for (const file of files) {
     if (
       file.status === "queued" ||
@@ -416,7 +432,6 @@ async function handleRetry(
     });
   }
 
-  // Re-enqueue failed files
   const filesToRetry = retryableFiles.map((f) => ({
     filename: f.remote_filename,
     size: f.size ?? 0,
@@ -466,7 +481,6 @@ async function handleRetryAlternate(
     });
   }
 
-  // Use job's persistent release identity to search again
   const artist = job.artist ?? "";
   const title = job.release_title ?? "";
 
@@ -478,7 +492,6 @@ async function handleRetryAlternate(
     );
   }
 
-  // Search for alternate source
   const query = `${artist} ${title}`;
   let responses: Awaited<ReturnType<typeof slskd.collectSearchResults>>["responses"];
   try {
