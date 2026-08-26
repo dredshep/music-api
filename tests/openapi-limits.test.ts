@@ -21,6 +21,8 @@ const MANAGER_ONLY_PATHS = [
   "/v1/library/starred",
   "/v1/library/genres",
   "/v1/library/delete",
+  "/v1/downloads/{job_id}/files",
+  "/v1/downloads/{job_id}/files/{file_id}/control",
 ] as const;
 
 function operations() {
@@ -46,7 +48,7 @@ describe("OpenAPI GPT Actions limits", () => {
     expect(violations).toEqual([]);
   });
 
-  test("manager-only playback and filesystem routes are excluded", () => {
+  test("manager-only routes are excluded", () => {
     const paths = new Set(Object.keys(getOpenApiSpec().paths));
     expect(MANAGER_ONLY_PATHS.filter((path) => paths.has(path))).toEqual([]);
   });
