@@ -15,15 +15,12 @@ import {
   getSearch,
   touchSearchUsage,
 } from "../db/repositories/searches";
-import {
-  getCandidatesBySearch,
-} from "../db/repositories/candidates";
 import { getVariantsForSearch } from "../db/repositories/search-variants";
 import { getOrCreateSemanticSearch } from "../services/search-service";
 
 export const managerRoutes = new Hono();
 
-// --- Soulseek Searches ---
+// --- Raw slskd searches ---
 
 managerRoutes.get("/soulseek/searches", async (c) => {
   try {
@@ -69,27 +66,25 @@ managerRoutes.get("/soulseek/searches/:id/responses", async (c) => {
   }
 });
 
-const refreshSchema = z.object({
-  force_new: z.boolean().optional().default(false),
-});
+// --- Durable semantic searches ---
 
-managerRoutes.post("/soulseek/searches/:id/refresh", async (c) => {
+managerRoutes.post("/soulseek/semantic-searches/:id/refresh", async (c) => {
   const id = c.req.param("id");
   const search = getSearch(id);
   if (!search) {
-    throw new AppError("SEARCH_NOT_FOUND", "Search not found", 404);
+    throw new AppError("SEARCH_NOT_FOUND", "Semantic search not found", 404);
   }
 
   touchSearchUsage(search.id);
   const variants = getVariantsForSearch(search.id);
   const slskdIds = variants.length > 0
-    ? variants.map((v) => v.slskd_search_id)
+    ? variants.filter((v) => !v.missing_at).map((v) => v.slskd_search_id)
     : search.slskd_search_ids_json
       ? JSON.parse(search.slskd_search_ids_json)
       : [];
 
   if (slskdIds.length === 0) {
-    return c.json({ search_id: id, candidates: [], refreshed: false });
+    return c.json({ search_id: id, response_count: 0, refreshed: false });
   }
 
   const { responses, diagnostics } = await slskd.refreshSearchResults(slskdIds, {
@@ -104,11 +99,11 @@ managerRoutes.post("/soulseek/searches/:id/refresh", async (c) => {
   });
 });
 
-managerRoutes.post("/soulseek/searches/:id/research", async (c) => {
+managerRoutes.post("/soulseek/semantic-searches/:id/research", async (c) => {
   const id = c.req.param("id");
   const search = getSearch(id);
   if (!search) {
-    throw new AppError("SEARCH_NOT_FOUND", "Search not found", 404);
+    throw new AppError("SEARCH_NOT_FOUND", "Semantic search not found", 404);
   }
 
   const opts = search.search_options_json
