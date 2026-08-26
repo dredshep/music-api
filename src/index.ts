@@ -15,6 +15,7 @@ import { suggestionRoutes } from "./routes/suggestions";
 import { suggestionsUiRoute } from "./routes/suggestions-ui";
 import { recommendationRoutes } from "./routes/recommendations";
 import { lyricsRoutes } from "./routes/lyrics";
+import { playerRoutes } from "./routes/player";
 import { openapiRoute } from "./routes/openapi";
 import { initDatabase } from "./db/database";
 import { startCleanupTimer } from "./db/cleanup";
@@ -69,6 +70,7 @@ app.route("/v1", downloadRoutes);
 app.route("/v1", suggestionRoutes);
 app.route("/v1", recommendationRoutes);
 app.route("/v1", lyricsRoutes);
+app.route("/v1", playerRoutes);
 
 startCleanupTimer();
 warmLibraryDiskUsageCache();

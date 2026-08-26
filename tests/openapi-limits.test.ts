@@ -2,29 +2,52 @@ import { describe, test, expect } from "bun:test";
 import { getOpenApiSpec } from "../src/routes/openapi";
 
 const MAX_OPERATION_DESCRIPTION_LENGTH = 300;
+const MAX_OPERATIONS = 30;
 const HTTP_METHODS = ["get", "post", "put", "patch", "delete"] as const;
 
+const MANAGER_ONLY_PATHS = [
+  "/v1/player/stream/{id}",
+  "/v1/player/download/{id}",
+  "/v1/player/cover/{id}",
+  "/v1/player/song/{id}",
+  "/v1/player/lyrics/{id}",
+  "/v1/player/scrobble",
+  "/v1/player/star",
+  "/v1/player/lyrics/sidecar",
+  "/v1/library/songs",
+  "/v1/library/albums",
+  "/v1/library/albums/{id}",
+  "/v1/library/artists/{id}",
+  "/v1/library/starred",
+  "/v1/library/genres",
+  "/v1/library/delete",
+] as const;
+
+function operations() {
+  const spec = getOpenApiSpec();
+  return Object.entries(spec.paths).flatMap(([path, pathItem]) =>
+    HTTP_METHODS.flatMap((method) => {
+      const operation = pathItem[method];
+      return operation?.operationId ? [{ path, method, operation }] : [];
+    }),
+  );
+}
+
 describe("OpenAPI GPT Actions limits", () => {
+  test("contains at most 30 operations", () => {
+    expect(operations().length).toBeLessThanOrEqual(MAX_OPERATIONS);
+  });
+
   test("operation descriptions are at most 300 characters", () => {
-    const spec = getOpenApiSpec();
-    const violations: string[] = [];
-
-    for (const [path, pathItem] of Object.entries(spec.paths)) {
-      for (const method of HTTP_METHODS) {
-        const operation = pathItem[method];
-        if (!operation?.operationId) continue;
-
-        const description = operation.description;
-        if (typeof description !== "string") continue;
-
-        if (description.length > MAX_OPERATION_DESCRIPTION_LENGTH) {
-          violations.push(
-            `${method.toUpperCase()} ${path} (${operation.operationId}): ${description.length}`
-          );
-        }
-      }
-    }
+    const violations = operations()
+      .filter(({ operation }) => typeof operation.description === "string" && operation.description.length > MAX_OPERATION_DESCRIPTION_LENGTH)
+      .map(({ path, method, operation }) => `${method.toUpperCase()} ${path} (${operation.operationId}): ${operation.description.length}`);
 
     expect(violations).toEqual([]);
+  });
+
+  test("manager-only playback and filesystem routes are excluded", () => {
+    const paths = new Set(Object.keys(getOpenApiSpec().paths));
+    expect(MANAGER_ONLY_PATHS.filter((path) => paths.has(path))).toEqual([]);
   });
 });
