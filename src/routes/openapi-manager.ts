@@ -18,7 +18,7 @@ const managerSpec = {
         type: "http",
         scheme: "bearer",
         description:
-          "Manager API key (MANAGER_API_KEY) or main API key, passed as Bearer token.",
+          "Manager API key (MANAGER_API_KEY when configured; otherwise the deployment falls back to API_KEY).",
       },
     },
     schemas: {
@@ -42,7 +42,7 @@ const managerSpec = {
     "/manager/v1/soulseek/searches": {
       get: {
         operationId: "listSlskdSearches",
-        summary: "List all slskd searches",
+        summary: "List all raw slskd searches",
         description:
           "Returns the current slskd search registry, including historical searches.",
         responses: {
@@ -77,7 +77,7 @@ const managerSpec = {
     "/manager/v1/soulseek/searches/{id}": {
       get: {
         operationId: "getSlskdSearch",
-        summary: "Get a single slskd search",
+        summary: "Get a single raw slskd search",
         parameters: [
           {
             name: "id",
@@ -94,7 +94,7 @@ const managerSpec = {
     "/manager/v1/soulseek/searches/{id}/responses": {
       get: {
         operationId: "getSlskdSearchResponses",
-        summary: "Get responses for a slskd search",
+        summary: "Get responses for a raw slskd search",
         parameters: [
           {
             name: "id",
@@ -108,12 +108,12 @@ const managerSpec = {
         },
       },
     },
-    "/manager/v1/soulseek/searches/{id}/refresh": {
+    "/manager/v1/soulseek/semantic-searches/{id}/refresh": {
       post: {
-        operationId: "refreshSlskdSearch",
-        summary: "Refresh an existing search's responses",
+        operationId: "refreshSemanticSearch",
+        summary: "Refresh a durable semantic search",
         description:
-          "Re-polls slskd for current responses without creating new searches.",
+          "Re-polls its existing slskd variants for current responses without creating new searches.",
         parameters: [
           {
             name: "id",
@@ -123,14 +123,14 @@ const managerSpec = {
           },
         ],
         responses: {
-          "200": { description: "Refreshed search results" },
+          "200": { description: "Refreshed semantic search responses" },
         },
       },
     },
-    "/manager/v1/soulseek/searches/{id}/research": {
+    "/manager/v1/soulseek/semantic-searches/{id}/research": {
       post: {
-        operationId: "researchSlskdSearch",
-        summary: "Create fresh slskd searches for an existing semantic search",
+        operationId: "researchSemanticSearch",
+        summary: "Create fresh slskd variants for a semantic search",
         description:
           "Deliberately creates new slskd searches. This is the explicit re-search action.",
         parameters: [
@@ -142,7 +142,7 @@ const managerSpec = {
           },
         ],
         responses: {
-          "200": { description: "New search created with fresh variants" },
+          "200": { description: "New semantic search and fresh variants" },
         },
       },
     },
