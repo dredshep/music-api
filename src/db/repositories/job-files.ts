@@ -89,6 +89,17 @@ export function getJobFiles(jobId: string): JobFileRecord[] {
     .all(jobId);
 }
 
+export function getJobFile(jobId: string, fileId: string): JobFileRecord | null {
+  const db = getDb();
+  return (
+    db
+      .query<JobFileRecord, [string, string]>(
+        "SELECT * FROM download_job_files WHERE job_id = ? AND id = ?"
+      )
+      .get(jobId, fileId) ?? null
+  );
+}
+
 export function getFailedJobFiles(jobId: string): JobFileRecord[] {
   const db = getDb();
   return db
