@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { getConfig } from "../config";
 import { MIGRATIONS } from "./schema";
+import { ACQUISITION_MIGRATIONS } from "./acquisition-migrations";
 import { log } from "../middleware/logging";
 
 let _db: Database | null = null;
@@ -40,7 +41,7 @@ function runMigrations(db: Database): void {
     .all()
     .map((r) => r.version);
 
-  for (const migration of MIGRATIONS) {
+  for (const migration of [...MIGRATIONS, ...ACQUISITION_MIGRATIONS]) {
     if (!applied.includes(migration.version)) {
       log("info", "migration_apply", { version: migration.version });
       db.exec(migration.sql);

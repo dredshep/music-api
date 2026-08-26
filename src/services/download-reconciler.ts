@@ -17,6 +17,10 @@ import {
 import { syncActiveJobsFromSlskd } from "../domain/sync-transfers";
 import { deriveJobStatus } from "../domain/transfers";
 import * as slskd from "./slskd";
+import {
+  advanceActiveAcquisitions,
+  shouldAutoRetryAcquisitionJob,
+} from "./acquisition-service";
 import type { FileStatus } from "../types/api";
 
 const RECONCILE_INTERVAL_MS = 30_000;
@@ -74,10 +78,13 @@ async function runReconciliation(): Promise<void> {
   }
 
   // Then retry bounded transient failures, including freshly-detected ghosts.
+  // Acquisition jobs only receive same-source retries while they are the
+  // current attempt and the source has not failed systemically.
   const failedJobs = listJobs({ status: "failed", limit: 50 });
   const partialJobs = listJobs({ status: "partial_failure", limit: 50 });
 
   const retryableJobs = [...failedJobs, ...partialJobs].filter((job) => {
+    if (!shouldAutoRetryAcquisitionJob(job.id)) return false;
     const files = getRetryableJobFiles(job.id);
     return files.some(
       (f) => f.attempts < MAX_FILE_RETRY_ATTEMPTS && isAutoRetryable(f.last_error)
@@ -93,6 +100,14 @@ async function runReconciliation(): Promise<void> {
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  }
+
+  // Finally advance the higher-level acquisition intent. At this point the
+  // same-source retry policy has already had its chance; exhausted or systemic
+  // attempts can fail over to another candidate without user intervention.
+  const advanced = await advanceActiveAcquisitions();
+  if (advanced > 0) {
+    log("info", "reconciler_acquisitions_advanced", { acquisitions_updated: advanced });
   }
 }
 
