@@ -34,10 +34,11 @@ export const ACQUISITION_MIGRATIONS = [
         created_at DATETIME NOT NULL,
         completed_at DATETIME,
         FOREIGN KEY (acquisition_id) REFERENCES acquisitions(id),
-        FOREIGN KEY (candidate_id) REFERENCES candidates(id),
         FOREIGN KEY (job_id) REFERENCES download_jobs(id)
       );
 
+      -- candidate_id is intentionally historical text rather than an FK:
+      -- candidate snapshots are TTL-pruned while acquisition history persists.
       CREATE INDEX IF NOT EXISTS idx_acquisitions_status
         ON acquisitions(status);
       CREATE INDEX IF NOT EXISTS idx_acquisitions_current_job
