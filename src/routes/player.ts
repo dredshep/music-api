@@ -262,15 +262,17 @@ playerRoutes.post("/library/delete", async (c) => {
   const candidates = await songsForDeletion(parsed.data.entity, parsed.data.id);
   if (!candidates.length) throw new AppError("NOT_FOUND", "No local tracks resolved for this entity", 404);
 
-  const resolved = candidates.map((song) => {
-    if (!song.path) throw new AppError("NO_SONG_PATH", `Navidrome did not return a file path for ${song.artist} — ${song.title}`, 422);
-    const audioPath = safeLibraryFilePath(root, song.path);
-    return {
+  const resolved = [];
+  for (const song of candidates) {
+    // Subsonic path is virtual; resolve the real library-relative path for FS ops.
+    const libraryPath = await navidromePlayer.getSongLibraryPath(song.id);
+    const audioPath = safeLibraryFilePath(root, libraryPath);
+    resolved.push({
       song,
       audioPath,
       sidecarPath: audioPath.replace(/\.[^.]+$/, ".lrc"),
-    };
-  });
+    });
+  }
 
   const unique = new Map(resolved.map((item) => [item.audioPath, item]));
   const deleted: Array<{ id: string; path: string; sidecar_deleted: boolean }> = [];
@@ -309,9 +311,9 @@ playerRoutes.post("/player/lyrics/sidecar", async (c) => {
   if (!libraryRoot) {
     throw new AppError("LIBRARY_NOT_WRITABLE", "LIBRARY_MUSIC_PATH is not configured", 422);
   }
-  const song = await navidromePlayer.getSong(navidrome_song_id);
-  if (!song.path) throw new AppError("NO_SONG_PATH", "Navidrome did not return a file path", 422);
-  const target = targetSidecarPath(libraryRoot, song.path);
+  // Subsonic path is virtual; resolve the real library-relative path for FS ops.
+  const libraryPath = await navidromePlayer.getSongLibraryPath(navidrome_song_id);
+  const target = targetSidecarPath(libraryRoot, libraryPath);
   if (existsSync(target) && !overwrite) {
     throw new AppError("LRC_EXISTS", "A .lrc sidecar already exists; retry with overwrite=true to replace it", 409);
   }

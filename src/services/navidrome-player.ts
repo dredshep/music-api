@@ -223,6 +223,60 @@ export async function getSong(id: string): Promise<PlayerSong> {
   return mapSong(result.song);
 }
 
+type NativeAuth = { token: string; expiresAtMs: number };
+let nativeAuth: NativeAuth | null = null;
+
+async function navidromeNativeToken(force = false): Promise<string> {
+  if (!force && nativeAuth && Date.now() < nativeAuth.expiresAtMs) return nativeAuth.token;
+  const config = getConfig();
+  const response = await fetch(`${config.NAVIDROME_URL.replace(/\/$/, "")}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      username: config.NAVIDROME_USERNAME,
+      password: config.NAVIDROME_PASSWORD,
+    }),
+  });
+  if (!response.ok) {
+    throw new AppError("NAVIDROME_UNAVAILABLE", `Navidrome login returned ${response.status}`, 502, true);
+  }
+  const body = (await response.json()) as { token?: string };
+  if (!body.token) {
+    throw new AppError("NAVIDROME_UNAVAILABLE", "Navidrome login did not return a token", 502, true);
+  }
+  // JWT lifetime is opaque; refresh proactively and on 401.
+  nativeAuth = { token: body.token, expiresAtMs: Date.now() + 30 * 60_000 };
+  return body.token;
+}
+
+/**
+ * Subsonic `path` is a virtual Artist/Album/Title path. Filesystem ops need the
+ * real library-relative path from Navidrome's native song API.
+ */
+export async function getSongLibraryPath(id: string): Promise<string> {
+  const config = getConfig();
+  const url = `${config.NAVIDROME_URL.replace(/\/$/, "")}/api/song/${encodeURIComponent(id)}`;
+
+  const fetchOnce = async (token: string) =>
+    fetch(url, { headers: { "x-nd-authorization": `Bearer ${token}` } });
+
+  let response = await fetchOnce(await navidromeNativeToken());
+  if (response.status === 401) {
+    response = await fetchOnce(await navidromeNativeToken(true));
+  }
+  if (response.status === 404) {
+    throw new AppError("NOT_FOUND", "Navidrome song not found", 404);
+  }
+  if (!response.ok) {
+    throw new AppError("NAVIDROME_UNAVAILABLE", `Navidrome song API returned ${response.status}`, 502, true);
+  }
+  const body = (await response.json()) as { path?: string };
+  if (!body.path?.trim()) {
+    throw new AppError("NO_SONG_PATH", "Navidrome did not return a filesystem path", 422);
+  }
+  return body.path;
+}
+
 export async function getArtist(id: string): Promise<{ artist: PlayerArtist; albums: PlayerAlbum[] }> {
   const result = await jsonRequest<{
     artist: SubsonicArtist & { starred?: string; album?: Array<SubsonicAlbum & { starred?: string; playCount?: number }> };

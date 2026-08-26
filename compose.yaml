@@ -11,7 +11,8 @@ services:
       - 8.8.8.8
     volumes:
       - /home/dd/server/music-api/data:/app/data
-      - /mnt/storage_6tb/Music/complete:/music:ro
+      # RW required for player sidecar writes and library deletion (PR #3).
+      - /mnt/storage_6tb/Music/complete:/music
     # Match SQLite data dir ownership (nobody/nogroup on this host).
     user: "65534:65534"
     group_add:
