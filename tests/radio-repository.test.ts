@@ -14,6 +14,14 @@ import {
   snapshotGeneration,
   updateTrackPin,
 } from "../src/db/repositories/radio";
+import {
+  canonicalRadioTrackKey,
+  cloneGeneration,
+  insertManualGenerationTrack,
+  listGenerationRevisions,
+  reorderGenerationTracks,
+  revertGenerationRevision,
+} from "../src/services/radio";
 
 const dbPath = `/tmp/music-api-radio-test-${Date.now()}.sqlite`;
 
@@ -33,6 +41,12 @@ afterAll(() => {
 });
 
 describe("radio persistence", () => {
+  test("uses stable cross-provider text identity", () => {
+    expect(canonicalRadioTrackKey("Beyoncé", "  Halo! ")).toBe(canonicalRadioTrackKey("beyonce", "Halo"));
+    expect(canonicalRadioTrackKey("AC/DC", "Back in Black")).toBe(canonicalRadioTrackKey("AC DC", "Back-in-Black"));
+    expect(canonicalRadioTrackKey("Artist A", "Same title")).not.toBe(canonicalRadioTrackKey("Artist B", "Same title"));
+  });
+
   test("keeps station recipe separate from dated generations", () => {
     const station = createStation({
       name: "Pop to black metal",
@@ -125,5 +139,53 @@ describe("radio persistence", () => {
     snapshotGeneration(generation.id, "before pin");
     expect(updateTrackPin(generation.id, tracks[1]!.id, true)).toBe(true);
     expect(Boolean(getGenerationTracks(generation.id)[1]?.pinned)).toBe(true);
+  });
+
+  test("snapshots edits, reorders, clones, and can restore a prior generation revision", () => {
+    const station = createStation({
+      name: "Editable Radio",
+      seeds: [{ type: "artist", artist: "A", label: "A", weight: 1 }],
+    });
+    const generation = createGeneration({
+      stationId: station.id,
+      requestedLength: 3,
+      generatorVersion: "radio-v2",
+      randomSeed: "editable",
+      settingsSnapshot: parseRadioSettings(station.settings_json),
+    });
+    const original = replaceGenerationTracks(generation.id, ["One", "Two", "Three"].map((title) => ({
+      canonical_key: canonicalRadioTrackKey("A", title),
+      artist: "A",
+      title,
+      album: null,
+      duration_ms: null,
+      isrc: null,
+      spotify_id: null,
+      navidrome_id: null,
+      musicbrainz_id: null,
+      playback_source: null,
+      availability_status: "unavailable" as const,
+      pinned: 0,
+      manual: 0,
+      selection_score: 1,
+      trajectory_position: null,
+      metadata_json: null,
+    })));
+
+    const reordered = reorderGenerationTracks(generation.id, [original[2]!.id, original[0]!.id, original[1]!.id]);
+    expect(reordered?.tracks.map((track) => track.title)).toEqual(["Three", "One", "Two"]);
+    const reorderRevision = listGenerationRevisions(generation.id).find((revision) => revision.reason === "reorder");
+    expect(reorderRevision).toBeTruthy();
+
+    const inserted = insertManualGenerationTrack(generation.id, { position: 1, artist: "B", title: "Inserted" });
+    expect(inserted?.tracks[1]?.title).toBe("Inserted");
+    expect(inserted?.tracks[1]?.manual).toBe(true);
+
+    const restored = revertGenerationRevision(generation.id, reorderRevision!.id);
+    expect(restored?.tracks.map((track) => track.title)).toEqual(["One", "Two", "Three"]);
+
+    const clone = cloneGeneration(generation.id);
+    expect(clone?.id).not.toBe(generation.id);
+    expect(clone?.tracks.map((track) => track.title)).toEqual(["One", "Two", "Three"]);
   });
 });
