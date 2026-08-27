@@ -20,6 +20,8 @@ export interface ExternalRadioTrack {
   isrc?: string | null;
 }
 
+type LocalResolver = (tracks: ExternalRadioTrack[]) => Promise<ExternalRadioTrack[]>;
+
 async function resolveLocalTracks(tracks: ExternalRadioTrack[]): Promise<ExternalRadioTrack[]> {
   const resolved = tracks.map((track) => ({ ...track }));
   for (let i = 0; i < resolved.length; i += 12) {
@@ -52,11 +54,15 @@ async function resolveLocalTracks(tracks: ExternalRadioTrack[]): Promise<Externa
  * intentionally never automatic: the current generation is snapshotted first.
  * Local Navidrome matches remain the preferred playback source after import.
  */
-export async function importExternalGeneration(generationId: string, tracks: ExternalRadioTrack[]) {
+export async function importExternalGeneration(
+  generationId: string,
+  tracks: ExternalRadioTrack[],
+  resolveLocal: LocalResolver = resolveLocalTracks,
+) {
   const generation = getGeneration(generationId);
   if (!generation) return null;
 
-  const resolvedTracks = await resolveLocalTracks(tracks);
+  const resolvedTracks = await resolveLocal(tracks);
   snapshotGeneration(generationId, "external_playlist_import");
   const rows: Array<Omit<RadioTrackRow, "id" | "generation_id" | "created_at" | "position">> = resolvedTracks.map((track) => ({
     canonical_key: canonicalRadioTrackKey(track.artist, track.title),
