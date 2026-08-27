@@ -86,4 +86,13 @@ describe("Gradient pipeline observability", () => {
     resolved[1].navidrome_id = "nav-b";
     expect(countResolutionChanges(before, resolved)).toBe(1);
   });
+
+  test("does not report movement solely because playlist rows were recreated", () => {
+    const before = [track("a", 0, 0.1), track("b", 1, 0.9)];
+    const recreated = [track("a", 0, 0.1), track("b", 1, 0.9)];
+    recreated[0].id = "new-row-a";
+    recreated[1].id = "new-row-b";
+    expect(countMovedTracks(before, recreated)).toBe(0);
+    expect(countResolutionChanges(before, recreated)).toBe(0);
+  });
 });
