@@ -1,6 +1,7 @@
 import { getDb } from "../db/database";
 import { queueRadioGenerationAnalysis } from "./audio-analysis";
 import { resequenceRadioGeneration } from "./radio-dj-sequencer";
+import { enforceGradientRouteOrder } from "./radio-gradient-order-guard";
 import { resolveRadioGenerationLocally } from "./radio-local-resolution";
 import { presentGeneration } from "./radio";
 
@@ -30,8 +31,13 @@ export async function finalizeRadioGeneration(
   if (!resolved) return null;
 
   const shouldResequence = options.resequence !== false;
+  let gradientRouteOrderGuard: ReturnType<typeof enforceGradientRouteOrder> = null;
   if (shouldResequence) {
     resequenceRadioGeneration(generationId, { fromPosition: options.fromPosition });
+    // Audio compatibility is a local optimization. A discovered musical route
+    // is the global constraint, so repair any meaningful route inversions the
+    // DJ pass introduced before persisting the exact saved playlist order.
+    gradientRouteOrderGuard = enforceGradientRouteOrder(generationId, { fromPosition: options.fromPosition });
   }
   const finalGeneration = presentGeneration(generationId);
   if (!finalGeneration) return null;
@@ -41,6 +47,7 @@ export async function finalizeRadioGeneration(
     ...summarizeRadioAvailability(finalGeneration.tracks),
     dj_resequenced: shouldResequence,
     ...(shouldResequence ? { dj_resequence_from: Math.max(0, options.fromPosition ?? 0) } : {}),
+    ...(gradientRouteOrderGuard ? { gradient_route_order_guard: gradientRouteOrderGuard } : {}),
   };
   getDb().query("UPDATE radio_generations SET diagnostics_json=? WHERE id=?")
     .run(JSON.stringify(diagnostics), generationId);
