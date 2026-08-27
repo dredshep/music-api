@@ -1,5 +1,7 @@
 import { canonicalRadioTrackKey, presentGeneration } from "./radio";
 import { getDb } from "../db/database";
+import { normalizeForComparison } from "../domain/normalization";
+import * as navidrome from "./navidrome";
 import {
   finishGeneration,
   getGeneration,
@@ -18,15 +20,45 @@ export interface ExternalRadioTrack {
   isrc?: string | null;
 }
 
+async function resolveLocalTracks(tracks: ExternalRadioTrack[]): Promise<ExternalRadioTrack[]> {
+  const resolved = tracks.map((track) => ({ ...track }));
+  for (let i = 0; i < resolved.length; i += 12) {
+    await Promise.all(resolved.slice(i, i + 12).map(async (track) => {
+      if (track.navidromeId) return;
+      try {
+        const result = await navidrome.search3(`${track.artist} ${track.title}`, {
+          artistCount: 0,
+          albumCount: 0,
+          songCount: 8,
+        });
+        const best = result.songs.find((song) =>
+          normalizeForComparison(song.artist) === normalizeForComparison(track.artist) &&
+          normalizeForComparison(song.title) === normalizeForComparison(track.title)
+        );
+        if (!best) return;
+        track.navidromeId = best.id;
+        track.album ||= best.album || null;
+        track.durationMs ||= Math.max(0, Math.round(best.duration * 1000));
+      } catch {
+        // External import remains valid even when Navidrome is temporarily unavailable.
+      }
+    }));
+  }
+  return resolved;
+}
+
 /**
  * Explicitly replace a generation with an imported external playlist. This is
  * intentionally never automatic: the current generation is snapshotted first.
+ * Local Navidrome matches remain the preferred playback source after import.
  */
-export function importExternalGeneration(generationId: string, tracks: ExternalRadioTrack[]) {
+export async function importExternalGeneration(generationId: string, tracks: ExternalRadioTrack[]) {
   const generation = getGeneration(generationId);
   if (!generation) return null;
+
+  const resolvedTracks = await resolveLocalTracks(tracks);
   snapshotGeneration(generationId, "external_playlist_import");
-  const rows: Array<Omit<RadioTrackRow, "id" | "generation_id" | "created_at" | "position">> = tracks.map((track) => ({
+  const rows: Array<Omit<RadioTrackRow, "id" | "generation_id" | "created_at" | "position">> = resolvedTracks.map((track) => ({
     canonical_key: canonicalRadioTrackKey(track.artist, track.title),
     artist: track.artist,
     title: track.title,
@@ -45,10 +77,11 @@ export function importExternalGeneration(generationId: string, tracks: ExternalR
     metadata_json: JSON.stringify({ importedFromExternalPlaylist: true }),
   }));
   replaceGenerationTracks(generationId, rows);
-  getDb().query("UPDATE radio_generations SET requested_length=? WHERE id=?").run(tracks.length, generationId);
+  getDb().query("UPDATE radio_generations SET requested_length=? WHERE id=?").run(resolvedTracks.length, generationId);
   finishGeneration(generationId, "ready", {
     imported_external_playlist: true,
-    imported_track_count: tracks.length,
+    imported_track_count: resolvedTracks.length,
+    local_match_count: resolvedTracks.filter((track) => Boolean(track.navidromeId)).length,
   });
   return presentGeneration(generationId);
 }
