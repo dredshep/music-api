@@ -62,6 +62,47 @@ function copy(track: RadioTrackRow) {
   };
 }
 
+type StoredCopy = ReturnType<typeof copy>;
+
+function isProtected(track: StoredCopy, index: number, lockedPrefix: number) {
+  return index < lockedPrefix || Boolean(track.pinned) || Boolean(track.manual);
+}
+
+function nearestReplaceableIndex(
+  output: StoredCopy[],
+  desiredIndex: number,
+  lockedPrefix: number,
+  waypointKeys: Set<string>,
+  allowKey?: string,
+) {
+  let best = -1;
+  let bestDistance = Infinity;
+  for (let index = 0; index < output.length; index++) {
+    const track = output[index]!;
+    if (isProtected(track, index, lockedPrefix)) continue;
+    if (waypointKeys.has(track.canonical_key) && track.canonical_key !== allowKey) continue;
+    const distance = Math.abs(index - desiredIndex);
+    if (distance < bestDistance) {
+      best = index;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
+function stampWaypoint(track: StoredCopy, artist: string, routePosition: number) {
+  const meta = parseObject(track.metadata_json);
+  track.trajectory_position = routePosition;
+  track.metadata_json = JSON.stringify({
+    ...meta,
+    gradientWaypoint: true,
+    gradientRoutePosition: routePosition,
+    gradientRouteConfidence: 1,
+    gradientRouteArtist: artist,
+    trajectoryCoordinateKind: "musical_route",
+  });
+}
+
 /**
  * A track waypoint is stronger than a recommendation hint: if the user asks for
  * Track A → Track B, those exact recordings must occur at their waypoint regions.
@@ -70,6 +111,11 @@ function copy(track: RadioTrackRow) {
  * exact track waypoints are only stamped/enforced when their coordinate belongs
  * to a leg that was actually discovered; disconnected legs must never acquire a
  * fake authoritative `musical_route` coordinate.
+ *
+ * Prefix, pinned and manual slots are stronger user locks. Missing exact-waypoint
+ * tracks replace the nearest generated/unlocked slot instead of inserting rows
+ * and shifting pins. Existing unlocked waypoint tracks are swapped into place so
+ * every protected position remains byte-for-byte at the same playlist index.
  */
 export function enforceExplicitGradientTrackWaypoints(
   generationId: string,
@@ -93,86 +139,74 @@ export function enforceExplicitGradientTrackWaypoints(
     seed,
     routePosition: Math.max(0, Math.min(1, seed.position ?? (seeds.length <= 1 ? index : index / (seeds.length - 1)))),
   })).sort((a, b) => a.routePosition - b.routePosition);
+  const waypointKeys = new Set(desired.map((item) => canonicalRadioTrackKey(item.seed.artist!, item.seed.title!)));
 
   for (const { seed, routePosition } of desired) {
     if (!supportsPosition(support, routePosition)) {
       skippedUnsupported++;
       continue;
     }
+
     const key = canonicalRadioTrackKey(seed.artist!, seed.title!);
-    const targetIndex = Math.max(0, Math.min(output.length - 1, Math.round(routePosition * Math.max(0, output.length - 1))));
+    const idealIndex = Math.max(0, Math.min(output.length - 1, Math.round(routePosition * Math.max(0, output.length - 1))));
     let sourceIndex = output.findIndex((track) => track.canonical_key === key);
-    if (targetIndex < lockedPrefix || (sourceIndex >= 0 && sourceIndex < lockedPrefix)) {
-      skippedLocked++;
+
+    if (sourceIndex >= 0) {
+      stampWaypoint(output[sourceIndex]!, seed.artist!, routePosition);
+      if (isProtected(output[sourceIndex]!, sourceIndex, lockedPrefix)) {
+        // Respect the user's lock even when it means the exact seed recording is
+        // not physically located at its ideal route slot.
+        if (sourceIndex !== idealIndex) skippedLocked++;
+        continue;
+      }
+      const targetIndex = nearestReplaceableIndex(output, idealIndex, lockedPrefix, waypointKeys, key);
+      if (targetIndex < 0) {
+        skippedLocked++;
+        continue;
+      }
+      if (sourceIndex !== targetIndex) {
+        [output[sourceIndex], output[targetIndex]] = [output[targetIndex]!, output[sourceIndex]!];
+        moved++;
+      }
       continue;
     }
 
-    if (sourceIndex < 0) {
-      const metadata = {
-        gradientWaypoint: true,
-        gradientRoutePosition: routePosition,
-        gradientRouteConfidence: 1,
-        gradientRouteArtist: seed.artist,
-        trajectoryCoordinateKind: "musical_route",
-        providerScores: { seed: 1, gradient_route: 1 },
-      };
-      output.splice(targetIndex, 0, {
-        canonical_key: key,
-        artist: seed.artist!,
-        title: seed.title!,
-        album: null,
-        duration_ms: null,
-        isrc: null,
-        spotify_id: null,
-        navidrome_id: null,
-        musicbrainz_id: null,
-        playback_source: null,
-        availability_status: "unknown",
-        pinned: 0,
-        manual: 0,
-        selection_score: 2,
-        trajectory_position: routePosition,
-        metadata_json: JSON.stringify(metadata),
-      });
-      // Preserve the requested finite length. Prefer dropping an unlocked,
-      // non-waypoint track farthest from the inserted waypoint.
-      if (output.length > generation.requested_length) {
-        const waypointKeys = new Set(desired.map((item) => canonicalRadioTrackKey(item.seed.artist!, item.seed.title!)));
-        let drop = -1;
-        let bestDistance = -1;
-        for (let i = lockedPrefix; i < output.length; i++) {
-          if (waypointKeys.has(output[i]!.canonical_key)) continue;
-          const distance = Math.abs(i - targetIndex);
-          if (distance > bestDistance) { bestDistance = distance; drop = i; }
-        }
-        if (drop >= 0) output.splice(drop, 1);
-      }
-      inserted++;
-      sourceIndex = output.findIndex((track) => track.canonical_key === key);
+    const targetIndex = nearestReplaceableIndex(output, idealIndex, lockedPrefix, waypointKeys);
+    if (targetIndex < 0) {
+      skippedLocked++;
+      continue;
     }
-
-    if (sourceIndex >= 0) {
-      const row = output[sourceIndex]!;
-      const meta = parseObject(row.metadata_json);
-      row.trajectory_position = routePosition;
-      row.metadata_json = JSON.stringify({
-        ...meta,
-        gradientWaypoint: true,
-        gradientRoutePosition: routePosition,
-        gradientRouteConfidence: 1,
-        gradientRouteArtist: seed.artist,
-        trajectoryCoordinateKind: "musical_route",
-      });
-      if (sourceIndex !== targetIndex) {
-        const [item] = output.splice(sourceIndex, 1);
-        output.splice(Math.min(targetIndex, output.length), 0, item!);
-        moved++;
-      }
-    }
+    const metadata = {
+      gradientWaypoint: true,
+      gradientRoutePosition: routePosition,
+      gradientRouteConfidence: 1,
+      gradientRouteArtist: seed.artist,
+      trajectoryCoordinateKind: "musical_route",
+      providerScores: { seed: 1, gradient_route: 1 },
+    };
+    output[targetIndex] = {
+      canonical_key: key,
+      artist: seed.artist!,
+      title: seed.title!,
+      album: null,
+      duration_ms: null,
+      isrc: null,
+      spotify_id: null,
+      navidrome_id: null,
+      musicbrainz_id: null,
+      playback_source: null,
+      availability_status: "unknown",
+      pinned: 0,
+      manual: 0,
+      selection_score: 2,
+      trajectory_position: routePosition,
+      metadata_json: JSON.stringify(metadata),
+    };
+    inserted++;
   }
 
   if (!inserted && !moved) return { applied: true, inserted: 0, moved: 0, skippedLocked, skippedUnsupported };
-  replaceGenerationTracks(generationId, output.slice(0, generation.requested_length));
+  replaceGenerationTracks(generationId, output);
   return { applied: true, inserted, moved, skippedLocked, skippedUnsupported };
 }
 
