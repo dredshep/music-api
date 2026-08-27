@@ -2,18 +2,61 @@ import { Hono } from "hono";
 
 export const openapiRadioRoute = new Hono();
 
+const seedCommon = {
+  entityId: { type: ["string", "null"] },
+  label: { type: "string" },
+  weight: { type: "number", minimum: 0.01 },
+  position: { type: ["number", "null"], minimum: 0, maximum: 100 },
+} as const;
+
 const seed = {
-  type: "object",
-  required: ["type", "label"],
-  properties: {
-    type: { type: "string", enum: ["track", "artist", "album", "genre", "playlist", "liked", "library", "collection"] },
-    entityId: { type: ["string", "null"] },
-    artist: { type: ["string", "null"] },
-    title: { type: ["string", "null"] },
-    label: { type: "string" },
-    weight: { type: "number", minimum: 0.01 },
-    position: { type: ["number", "null"] },
-  },
+  oneOf: [
+    {
+      type: "object",
+      required: ["type", "label", "artist", "title"],
+      properties: {
+        ...seedCommon,
+        type: { const: "track" },
+        artist: { type: "string" },
+        title: { type: "string" },
+      },
+    },
+    {
+      type: "object",
+      required: ["type", "label", "artist"],
+      properties: {
+        ...seedCommon,
+        type: { const: "artist" },
+        artist: { type: "string" },
+      },
+    },
+    {
+      type: "object",
+      required: ["type", "label", "artist", "title"],
+      properties: {
+        ...seedCommon,
+        type: { const: "album" },
+        artist: { type: "string" },
+        title: { type: "string" },
+      },
+    },
+    {
+      type: "object",
+      required: ["type", "label"],
+      properties: {
+        ...seedCommon,
+        type: { const: "genre" },
+      },
+    },
+    {
+      type: "object",
+      required: ["type", "label"],
+      properties: {
+        ...seedCommon,
+        type: { const: "library" },
+      },
+    },
+  ],
 } as const;
 
 const spec = {
@@ -38,7 +81,7 @@ const spec = {
       post: {
         operationId: "createRadio",
         summary: "Create a finite saved radio",
-        description: "Create a station from one or more weighted seeds. Set type=gradient for an A→B or multipoint musical trajectory. A finite generation is created by default.",
+        description: "Create a station from self-sufficient track, artist, album, genre, or local-library seeds. Set type=gradient for an A→B or multipoint musical trajectory. A finite generation is created by default.",
         requestBody: {
           required: true,
           content: { "application/json": { schema: {
