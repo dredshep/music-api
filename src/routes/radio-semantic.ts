@@ -9,6 +9,8 @@ import {
   presentStation,
   recordRadioFeedback,
 } from "../services/radio";
+import { hydrateNativeRadioSeeds } from "../services/radio-native-seeds";
+import { queueRadioGenerationAnalysis } from "../services/audio-analysis";
 
 export const radioSemanticRoutes = new Hono();
 
@@ -63,7 +65,9 @@ radioSemanticRoutes.get("/radio/stations", (c) => c.json({ stations: listRadioSt
 
 radioSemanticRoutes.post("/radio/stations", async (c) => {
   const input = createSchema.parse(await c.req.json());
-  return c.json(await createRadio(input), 201);
+  const result = await createRadio({ ...input, seeds: await hydrateNativeRadioSeeds(input.seeds) });
+  if (result.generation) queueRadioGenerationAnalysis(result.generation.id);
+  return c.json(result, 201);
 });
 
 radioSemanticRoutes.get("/radio/stations/:id", (c) => {
@@ -75,7 +79,9 @@ radioSemanticRoutes.get("/radio/stations/:id", (c) => {
 radioSemanticRoutes.post("/radio/stations/:id/generate", async (c) => {
   if (!presentStation(c.req.param("id"))) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   const body = z.object({ length: z.number().int().min(1).max(200).optional() }).parse(await c.req.json().catch(() => ({})));
-  return c.json(await generateStation(c.req.param("id"), body), 201);
+  const generation = await generateStation(c.req.param("id"), body);
+  queueRadioGenerationAnalysis(generation.id);
+  return c.json(generation, 201);
 });
 
 radioSemanticRoutes.get("/radio/generations/:id", (c) => {
