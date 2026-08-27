@@ -9,7 +9,7 @@ import {
   presentStation,
   recordRadioFeedback,
 } from "../services/radio";
-import { hydrateNativeRadioSeeds } from "../services/radio-native-seeds";
+import { hydrateNativeRadioSeeds, refreshNativeRadioSeedSnapshots } from "../services/radio-native-seeds";
 import { queueRadioGenerationAnalysis } from "../services/audio-analysis";
 
 export const radioSemanticRoutes = new Hono();
@@ -77,9 +77,11 @@ radioSemanticRoutes.get("/radio/stations/:id", (c) => {
 });
 
 radioSemanticRoutes.post("/radio/stations/:id/generate", async (c) => {
-  if (!presentStation(c.req.param("id"))) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
+  const stationId = c.req.param("id");
+  if (!presentStation(stationId)) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   const body = z.object({ length: z.number().int().min(1).max(200).optional() }).parse(await c.req.json().catch(() => ({})));
-  const generation = await generateStation(c.req.param("id"), body);
+  await refreshNativeRadioSeedSnapshots(stationId);
+  const generation = await generateStation(stationId, body);
   queueRadioGenerationAnalysis(generation.id);
   return c.json(generation, 201);
 });
