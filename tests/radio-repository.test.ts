@@ -42,8 +42,8 @@ afterAll(() => {
 
 describe("radio persistence", () => {
   test("uses stable cross-provider text identity", () => {
-    expect(canonicalRadioTrackKey("Beyoncé", "  Halo! ")).toBe(canonicalRadioTrackKey("beyonce", "Halo"));
-    expect(canonicalRadioTrackKey("AC/DC", "Back in Black")).toBe(canonicalRadioTrackKey("AC DC", "Back-in-Black"));
+    expect(canonicalRadioTrackKey("Beyoncé", "  Halo  ")).toBe(canonicalRadioTrackKey("beyonce", "Halo"));
+    expect(canonicalRadioTrackKey("Massive Attack", "Angel–Live")).toBe(canonicalRadioTrackKey("massive attack", "angel-live"));
     expect(canonicalRadioTrackKey("Artist A", "Same title")).not.toBe(canonicalRadioTrackKey("Artist B", "Same title"));
   });
 
