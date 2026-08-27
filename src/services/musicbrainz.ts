@@ -231,6 +231,48 @@ export async function getArtistAliases(
   return artist.aliases;
 }
 
+export interface MBRecordingResult {
+  id: string;
+  title: string;
+  artistCredit: string;
+  score: number;
+  firstReleaseDate?: string;
+}
+
+type MBRecordingSearchResponse = {
+  recordings?: Array<{
+    id: string;
+    title: string;
+    score?: number;
+    "first-release-date"?: string;
+    "artist-credit"?: Array<{
+      name?: string;
+      joinphrase?: string;
+      artist?: { name?: string };
+    }>;
+  }>;
+};
+
+/** Cached recording search used as an independent Radio candidate source. */
+export async function searchRecordings(query: string, limit = 25): Promise<MBRecordingResult[]> {
+  const config = getConfig();
+  const bounded = Math.max(1, Math.min(100, Math.floor(limit)));
+  const url = `${config.MUSICBRAINZ_URL}/recording?query=${encodeURIComponent(query)}&limit=${bounded}&fmt=json`;
+  const cacheKey = `mb:recording_search:${query.toLowerCase()}:${bounded}`;
+  const cacheTtl = config.CATALOG_CACHE_HOURS * 60 * 60 * 1000;
+  const result = await rateLimitedFetch<MBRecordingSearchResponse>(url, cacheKey, cacheTtl);
+  return (result.recordings ?? []).map((recording) => ({
+    id: recording.id,
+    title: recording.title,
+    score: Math.max(0, Math.min(100, recording.score ?? 0)),
+    firstReleaseDate: recording["first-release-date"],
+    artistCredit: (recording["artist-credit"] ?? [])
+      .map((credit) => `${credit.name ?? credit.artist?.name ?? ""}${credit.joinphrase ?? ""}`)
+      .join("")
+      .trim(),
+  })).filter((recording) => recording.title && recording.artistCredit);
+}
+
 export interface MBReleaseGroupResult {
   id: string;
   title: string;
