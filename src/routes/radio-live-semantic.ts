@@ -8,6 +8,7 @@ export const radioLiveSemanticRoutes = new Hono();
 const liveSchema = z.object({
   count: z.number().int().min(4).max(30).optional(),
   excludeKeys: z.array(z.string().min(1).max(1000)).max(5000).optional(),
+  routeCursor: z.number().min(0).max(1).nullable().optional(),
 });
 
 radioLiveSemanticRoutes.post("/radio/stations/:id/live-batch", async (c) => {
