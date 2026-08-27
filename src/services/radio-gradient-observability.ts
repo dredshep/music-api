@@ -36,8 +36,8 @@ export function summarizeGradientStage(tracks: RadioTrackRow[], maxTracks = 250)
     positioned_count: positioned,
     positioned_ratio: tracks.length ? Number((positioned / tracks.length).toFixed(4)) : 0,
     backtracks: countGradientStageBacktracks(tracks),
-    first_route_position: routePositions.at(0) ?? null,
-    last_route_position: routePositions.at(-1) ?? null,
+    first_route_position: routePositions.length ? routePositions[0]! : null,
+    last_route_position: routePositions.length ? routePositions[routePositions.length - 1]! : null,
     truncated: tracks.length > maxTracks,
     tracks: tracks.slice(0, maxTracks).map((track) => {
       const metadata = parseMetadata(track);
@@ -75,14 +75,14 @@ export function summarizeGradientCandidateRegions(tracks: Array<{
 }
 
 export function countMovedTracks(before: RadioTrackRow[], after: RadioTrackRow[]) {
-  const beforePosition = new Map(before.map((track) => [track.id, track.position]));
-  return after.reduce((count, track) => count + (beforePosition.get(track.id) === track.position ? 0 : 1), 0);
+  const beforePosition = new Map(before.map((track) => [track.canonical_key, track.position]));
+  return after.reduce((count, track) => count + (beforePosition.get(track.canonical_key) === track.position ? 0 : 1), 0);
 }
 
 export function countResolutionChanges(before: RadioTrackRow[], after: RadioTrackRow[]) {
-  const prior = new Map(before.map((track) => [track.id, `${track.playback_source ?? ""}|${track.availability_status}|${track.navidrome_id ?? ""}`]));
+  const prior = new Map(before.map((track) => [track.canonical_key, `${track.playback_source ?? ""}|${track.availability_status}|${track.navidrome_id ?? ""}`]));
   return after.reduce((count, track) => {
     const current = `${track.playback_source ?? ""}|${track.availability_status}|${track.navidrome_id ?? ""}`;
-    return count + (prior.get(track.id) === current ? 0 : 1);
+    return count + (prior.get(track.canonical_key) === current ? 0 : 1);
   }, 0);
 }
