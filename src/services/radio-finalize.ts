@@ -15,28 +15,32 @@ export function summarizeRadioAvailability(tracks: Array<{ availability: string 
 }
 
 /**
- * Final generation lifecycle pass owned by music-api.
+ * Final lifecycle pass owned by music-api.
  *
- * First resolve final local playback, then improve ordering using any audio
- * analysis already cached for these tracks. Fresh DSP is queued only after the
- * saved order is fixed, so analysis never silently mutates an old generation.
+ * New/generated material may be DJ-resequenced using already-cached analysis.
+ * Explicit user edits, clones, revision restores and external imports must retain
+ * their exact order, so callers can disable resequencing while still receiving
+ * final local resolution, fresh diagnostics and background analysis scheduling.
  */
 export async function finalizeRadioGeneration(
   generationId: string,
-  options: { fromPosition?: number } = {},
+  options: { fromPosition?: number; resequence?: boolean } = {},
 ) {
   const resolved = await resolveRadioGenerationLocally(generationId);
   if (!resolved) return null;
 
-  resequenceRadioGeneration(generationId, options);
+  const shouldResequence = options.resequence !== false;
+  if (shouldResequence) {
+    resequenceRadioGeneration(generationId, { fromPosition: options.fromPosition });
+  }
   const finalGeneration = presentGeneration(generationId);
   if (!finalGeneration) return null;
 
   const diagnostics = {
     ...(finalGeneration.diagnostics ?? {}),
     ...summarizeRadioAvailability(finalGeneration.tracks),
-    dj_resequenced: true,
-    dj_resequence_from: Math.max(0, options.fromPosition ?? 0),
+    dj_resequenced: shouldResequence,
+    ...(shouldResequence ? { dj_resequence_from: Math.max(0, options.fromPosition ?? 0) } : {}),
   };
   getDb().query("UPDATE radio_generations SET diagnostics_json=? WHERE id=?")
     .run(JSON.stringify(diagnostics), generationId);
