@@ -10,7 +10,7 @@ import {
   recordRadioFeedback,
 } from "../services/radio";
 import { hydrateNativeRadioSeeds, refreshNativeRadioSeedSnapshots } from "../services/radio-native-seeds";
-import { queueRadioGenerationAnalysis } from "../services/audio-analysis";
+import { finalizeRadioGeneration } from "../services/radio-finalize";
 
 export const radioSemanticRoutes = new Hono();
 
@@ -70,7 +70,7 @@ radioSemanticRoutes.get("/radio/stations", (c) => c.json({ stations: listRadioSt
 radioSemanticRoutes.post("/radio/stations", async (c) => {
   const input = createSchema.parse(await c.req.json());
   const result = await createRadio({ ...input, seeds: await hydrateNativeRadioSeeds(input.seeds) });
-  if (result.generation) queueRadioGenerationAnalysis(result.generation.id);
+  if (result.generation) result.generation = await finalizeRadioGeneration(result.generation.id);
   return c.json(result, 201);
 });
 
@@ -86,8 +86,7 @@ radioSemanticRoutes.post("/radio/stations/:id/generate", async (c) => {
   const body = z.object({ length: z.number().int().min(1).max(200).optional() }).parse(await c.req.json().catch(() => ({})));
   await refreshNativeRadioSeedSnapshots(stationId);
   const generation = await generateStation(stationId, body);
-  queueRadioGenerationAnalysis(generation.id);
-  return c.json(generation, 201);
+  return c.json(await finalizeRadioGeneration(generation.id), 201);
 });
 
 radioSemanticRoutes.get("/radio/generations/:id", (c) => {
