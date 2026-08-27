@@ -1,5 +1,6 @@
 import { getDb } from "../db/database";
 import { queueRadioGenerationAnalysis } from "./audio-analysis";
+import { resequenceRadioGeneration } from "./radio-dj-sequencer";
 import { resolveRadioGenerationLocally } from "./radio-local-resolution";
 import { presentGeneration } from "./radio";
 
@@ -16,18 +17,26 @@ export function summarizeRadioAvailability(tracks: Array<{ availability: string 
 /**
  * Final generation lifecycle pass owned by music-api.
  *
- * Every generated or materially edited playlist gets one last Navidrome lookup
- * after selection, then any resolved local files are queued for background DSP
- * analysis. Availability diagnostics are recomputed after that final resolution
- * so the UI never reports stale pre-resolution counts.
+ * First resolve final local playback, then improve ordering using any audio
+ * analysis already cached for these tracks. Fresh DSP is queued only after the
+ * saved order is fixed, so analysis never silently mutates an old generation.
  */
-export async function finalizeRadioGeneration(generationId: string) {
+export async function finalizeRadioGeneration(
+  generationId: string,
+  options: { fromPosition?: number } = {},
+) {
   const resolved = await resolveRadioGenerationLocally(generationId);
   if (!resolved) return null;
 
+  resequenceRadioGeneration(generationId, options);
+  const finalGeneration = presentGeneration(generationId);
+  if (!finalGeneration) return null;
+
   const diagnostics = {
-    ...(resolved.diagnostics ?? {}),
-    ...summarizeRadioAvailability(resolved.tracks),
+    ...(finalGeneration.diagnostics ?? {}),
+    ...summarizeRadioAvailability(finalGeneration.tracks),
+    dj_resequenced: true,
+    dj_resequence_from: Math.max(0, options.fromPosition ?? 0),
   };
   getDb().query("UPDATE radio_generations SET diagnostics_json=? WHERE id=?")
     .run(JSON.stringify(diagnostics), generationId);
