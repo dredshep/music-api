@@ -6,7 +6,7 @@ const seedCommon = {
   entityId: { type: ["string", "null"] },
   label: { type: "string" },
   weight: { type: "number", minimum: 0.01 },
-  position: { type: ["number", "null"], minimum: 0, maximum: 100 },
+  position: { type: ["number", "null"], minimum: 0, maximum: 1, description: "Gradient waypoint position normalized from 0 (start) to 1 (end)." },
 } as const;
 
 const seed = {
