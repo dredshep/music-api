@@ -90,8 +90,8 @@ const spec = {
   openapi: "3.1.0",
   info: {
     title: "Music Radio API",
-    version: "1.1.0",
-    description: "Semantic API for finite saved Radio plus explicit bounded live continuation. Gradient Radio can discover graph-based musical routes whose intermediate regions need no direct endpoint similarity. Saved generations never silently mutate or auto-extend.",
+    version: "1.2.0",
+    description: "Semantic API for finite saved Radio plus cursor-aware bounded live continuation. Gradient Radio can discover graph-based musical routes whose intermediate regions need no direct endpoint similarity. Saved generations never silently mutate or auto-extend.",
   },
   servers: [{ url: "https://music-api.besto.me" }],
   security: [{ bearerAuth: [] }],
@@ -148,16 +148,17 @@ const spec = {
       post: {
         operationId: "continueLiveRadio",
         summary: "Generate a bounded live continuation",
-        description: "Return an ephemeral continuation batch without adding it to saved-generation history. Gradient stations use the same selected graph-route strategy as saved generations.",
+        description: "Return an ephemeral continuation batch without adding it to saved-generation history. For Gradient stations pass each response next_cursor back as routeCursor so later batches continue forward through the musical route and wrap only after reaching its end.",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         requestBody: { content: { "application/json": { schema: {
           type: "object",
           properties: {
             count: { type: "integer", minimum: 4, maximum: 30 },
             excludeKeys: { type: "array", maxItems: 5000, items: { type: "string" } },
+            routeCursor: { type: ["number", "null"], minimum: 0, maximum: 1, description: "Normalized musical-route continuation coordinate from the previous next_cursor. Use 0 or omit for the first batch." },
           },
         } } } },
-        responses: { "200": { description: "Ephemeral continuation batch" } },
+        responses: { "200": { description: "Ephemeral continuation with route_cursor, next_cursor and route_wrapped for Gradient sessions" } },
       },
     },
     "/v1/radio/generations/{id}": {
