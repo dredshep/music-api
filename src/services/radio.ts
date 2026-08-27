@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
+import { ulid } from "ulid";
 import * as lastfm from "./lastfm";
 import * as navidrome from "./navidrome";
 import { normalizeForComparison } from "../domain/normalization";
+import { getDb } from "../db/database";
 import {
   addFeedback,
   createGeneration,
@@ -37,6 +39,8 @@ export interface TasteTrack {
   isrc?: string | null;
   spotifyId?: string | null;
   weight?: number;
+  releaseYear?: number | null;
+  popularity?: number | null;
 }
 
 export interface CreateRadioInput {
@@ -67,9 +71,12 @@ interface Candidate {
   metadata: Record<string, unknown>;
 }
 
-function canonicalKey(artist: string, title: string, isrc?: string | null, mbid?: string | null): string {
-  if (isrc) return `isrc:${isrc.toUpperCase()}`;
-  if (mbid) return `mbid:${mbid}`;
+/**
+ * Cross-provider identity deliberately uses normalized artist/title as the common
+ * denominator. ISRC/MBID/Spotify/Navidrome IDs are retained as aliases/evidence,
+ * but no single provider ID is allowed to prevent the same recording from merging.
+ */
+export function canonicalRadioTrackKey(artist: string, title: string): string {
   return `text:${normalizeForComparison(artist)}|${normalizeForComparison(title)}`;
 }
 
@@ -107,7 +114,7 @@ function upsertCandidate(map: Map<string, Candidate>, input: {
   metadata?: Record<string, unknown>;
 }): void {
   if (!input.artist.trim() || !input.title.trim()) return;
-  const key = canonicalKey(input.artist, input.title, input.isrc, input.mbid);
+  const key = canonicalRadioTrackKey(input.artist, input.title);
   const current = map.get(key) ?? {
     key,
     artist: input.artist,
@@ -126,19 +133,28 @@ function upsertCandidate(map: Map<string, Candidate>, input: {
     selectionScore: 0,
     metadata: input.metadata ?? {},
   };
+
   current.providerScores[input.provider] = Math.max(current.providerScores[input.provider] ?? 0, input.providerScore);
   current.seedScores[input.seedId] = Math.max(current.seedScores[input.seedId] ?? 0, input.seedScore);
   current.familiarity = Math.max(current.familiarity, input.familiarity ?? 0);
-  if (!current.spotifyId && input.spotifyId) { current.spotifyId = input.spotifyId; current.availability = "spotify"; current.playbackSource = "spotify"; }
-  if (!current.isrc && input.isrc) current.isrc = input.isrc;
-  if (!current.musicbrainzId && input.mbid) current.musicbrainzId = input.mbid;
-  if (!current.album && input.album) current.album = input.album;
-  if (!current.durationMs && input.durationMs) current.durationMs = input.durationMs;
+  if (!current.spotifyId && input.spotifyId) {
+    current.spotifyId = input.spotifyId;
+    current.availability = "spotify";
+    current.playbackSource = "spotify";
+  }
+  current.isrc ||= input.isrc ?? null;
+  current.musicbrainzId ||= input.mbid ?? null;
+  current.album ||= input.album ?? null;
+  current.durationMs ||= input.durationMs ?? null;
   current.metadata = { ...current.metadata, ...(input.metadata ?? {}) };
   map.set(key, current);
 }
 
-async function collectSeedCandidates(seed: ReturnType<typeof getSeeds>[number], map: Map<string, Candidate>, errors: string[]): Promise<void> {
+async function collectSeedCandidates(
+  seed: ReturnType<typeof getSeeds>[number],
+  map: Map<string, Candidate>,
+  errors: string[],
+): Promise<void> {
   const weight = Math.max(0.01, seed.weight);
   const addLastFm = (track: lastfm.LastFmTrack, provider: string, score = track.match) => upsertCandidate(map, {
     artist: track.artist,
@@ -148,12 +164,24 @@ async function collectSeedCandidates(seed: ReturnType<typeof getSeeds>[number], 
     providerScore: Math.max(0, Math.min(1, score)),
     seedId: seed.id,
     seedScore: weight * Math.max(0.05, score),
-    metadata: { lastfmUrl: track.url, playcount: track.playcount },
+    metadata: {
+      lastfmUrl: track.url,
+      playcount: track.playcount,
+      popularity: Math.max(0, Math.min(1, score)),
+    },
   });
 
   try {
     if (seed.seed_type === "track" && seed.artist && seed.title) {
-      upsertCandidate(map, { artist: seed.artist, title: seed.title, provider: "seed", providerScore: 1, seedId: seed.id, seedScore: weight, familiarity: 1 });
+      upsertCandidate(map, {
+        artist: seed.artist,
+        title: seed.title,
+        provider: "seed",
+        providerScore: 1,
+        seedId: seed.id,
+        seedScore: weight,
+        familiarity: 1,
+      });
       (await lastfm.getSimilarTracks(seed.artist, seed.title, 60)).forEach((t) => addLastFm(t, "lastfm_similar"));
       return;
     }
@@ -175,13 +203,20 @@ async function collectSeedCandidates(seed: ReturnType<typeof getSeeds>[number], 
       const tracks = await lastfm.getAlbumTracks(seed.artist, album);
       tracks.forEach((t) => addLastFm(t, "lastfm_album", Math.max(0.5, t.match)));
       for (const track of tracks.slice(0, 5)) {
-        try { (await lastfm.getSimilarTracks(track.artist, track.name, 12)).forEach((t) => addLastFm(t, "lastfm_similar")); } catch { /* partial */ }
+        try {
+          (await lastfm.getSimilarTracks(track.artist, track.name, 12)).forEach((t) => addLastFm(t, "lastfm_similar"));
+        } catch { /* partial */ }
       }
       return;
     }
 
     if (seed.seed_type === "genre") {
-      (await lastfm.getTagTopTracks(seed.label, 80)).forEach((t) => addLastFm(t, "lastfm_tag"));
+      (await lastfm.getTagTopTracks(seed.label, 80)).forEach((t) => {
+        addLastFm(t, "lastfm_tag");
+        const key = canonicalRadioTrackKey(t.artist, t.name);
+        const candidate = map.get(key);
+        if (candidate) candidate.metadata.genreSeed = seed.label;
+      });
       return;
     }
 
@@ -199,9 +234,15 @@ async function collectSeedCandidates(seed: ReturnType<typeof getSeeds>[number], 
         seedId: seed.id,
         seedScore: weight * (track.weight ?? 1),
         familiarity: 1,
+        metadata: {
+          releaseYear: track.releaseYear ?? undefined,
+          popularity: track.popularity ?? undefined,
+        },
       }));
       for (const track of supplied.slice(0, 16)) {
-        try { (await lastfm.getSimilarTracks(track.artist, track.title, 8)).forEach((t) => addLastFm(t, "lastfm_similar")); } catch { /* partial */ }
+        try {
+          (await lastfm.getSimilarTracks(track.artist, track.title, 8)).forEach((t) => addLastFm(t, "lastfm_similar"));
+        } catch { /* partial */ }
       }
     }
   } catch (error) {
@@ -213,16 +254,20 @@ async function buildTasteMaps(tasteProfile: TasteTrack[] = []) {
   const recent = await lastfm.getUserTopTracks("1month", 150).catch(() => []);
   const historical = await lastfm.getUserTopTracks("overall", 250).catch(() => []);
   const map = new Map<string, { recent: number; historical: number; spotify: number }>();
-  for (const t of historical) map.set(canonicalKey(t.artist, t.name, null, t.mbid), { recent: 0, historical: t.match, spotify: 0 });
+  for (const t of historical) {
+    map.set(canonicalRadioTrackKey(t.artist, t.name), { recent: 0, historical: t.match, spotify: 0 });
+  }
   for (const t of recent) {
-    const key = canonicalKey(t.artist, t.name, null, t.mbid);
+    const key = canonicalRadioTrackKey(t.artist, t.name);
     const row = map.get(key) ?? { recent: 0, historical: 0, spotify: 0 };
-    row.recent = t.match; map.set(key, row);
+    row.recent = t.match;
+    map.set(key, row);
   }
   for (const t of tasteProfile) {
-    const key = canonicalKey(t.artist, t.title, t.isrc, null);
+    const key = canonicalRadioTrackKey(t.artist, t.title);
     const row = map.get(key) ?? { recent: 0, historical: 0, spotify: 0 };
-    row.spotify = t.weight ?? 1; map.set(key, row);
+    row.spotify = t.weight ?? 1;
+    map.set(key, row);
   }
   return map;
 }
@@ -232,8 +277,11 @@ async function resolveAvailability(candidates: Candidate[]): Promise<void> {
   for (let i = 0; i < batch.length; i += 12) {
     await Promise.all(batch.slice(i, i + 12).map(async (candidate) => {
       try {
-        const query = `${candidate.artist} ${candidate.title}`;
-        const result = await navidrome.search3(query, { artistCount: 0, albumCount: 0, songCount: 8 });
+        const result = await navidrome.search3(`${candidate.artist} ${candidate.title}`, {
+          artistCount: 0,
+          albumCount: 0,
+          songCount: 8,
+        });
         const best = result.songs.find((song) =>
           normalizeForComparison(song.artist) === normalizeForComparison(candidate.artist) &&
           normalizeForComparison(song.title) === normalizeForComparison(candidate.title)
@@ -252,30 +300,65 @@ async function resolveAvailability(candidates: Candidate[]): Promise<void> {
           candidate.playbackSource = null;
         }
       } catch {
-        if (!candidate.spotifyId) candidate.availability = "unknown";
+        candidate.availability = candidate.spotifyId ? "spotify" : "unknown";
+        candidate.playbackSource = candidate.spotifyId ? "spotify" : null;
       }
     }));
   }
 }
 
+function loadAudioAnalysis(candidates: Candidate[]): void {
+  const db = getDb();
+  const stmt = db.query<{
+    bpm: number | null;
+    musical_key: string | null;
+    mode: string | null;
+    loudness: number | null;
+    energy: number | null;
+    timbre_json: string | null;
+    intro_json: string | null;
+    outro_json: string | null;
+  }, [string]>(`SELECT bpm,musical_key,mode,loudness,energy,timbre_json,intro_json,outro_json
+      FROM track_audio_analysis
+      WHERE canonical_key=? AND status='ready'
+      ORDER BY analysis_version DESC LIMIT 1`);
+
+  for (const candidate of candidates) {
+    const row = stmt.get(candidate.key);
+    if (!row) continue;
+    candidate.metadata = {
+      ...candidate.metadata,
+      bpm: row.bpm ?? undefined,
+      key: row.musical_key ?? undefined,
+      mode: row.mode ?? undefined,
+      loudness: row.loudness ?? undefined,
+      energy: row.energy ?? undefined,
+      timbre: row.timbre_json ? JSON.parse(row.timbre_json) : undefined,
+      intro: row.intro_json ? JSON.parse(row.intro_json) : undefined,
+      outro: row.outro_json ? JSON.parse(row.outro_json) : undefined,
+    };
+  }
+}
+
 function targetSeedWeights(seeds: ReturnType<typeof getSeeds>, t: number): Record<string, number> {
   if (seeds.length === 1) return { [seeds[0]!.id]: 1 };
-  const positions = seeds.map((seed, index) => {
-    const raw = seed.position == null ? index / Math.max(1, seeds.length - 1) : seed.position;
-    return { id: seed.id, pos: raw > 1 ? raw / Math.max(1, seeds.length - 1) : raw, weight: seed.weight };
-  });
+  const positions = seeds.map((seed, index) => ({
+    id: seed.id,
+    pos: seed.position == null ? index / Math.max(1, seeds.length - 1) : Math.min(1, Math.max(0, seed.position)),
+    weight: seed.weight,
+  }));
   const values: Record<string, number> = {};
   let total = 0;
   for (const row of positions) {
-    const distance = Math.abs(t - row.pos);
-    const value = row.weight / Math.max(0.08, distance + 0.08);
-    values[row.id] = value; total += value;
+    const value = row.weight / Math.max(0.08, Math.abs(t - row.pos) + 0.08);
+    values[row.id] = value;
+    total += value;
   }
   for (const key of Object.keys(values)) values[key] = values[key]! / Math.max(0.0001, total);
   return values;
 }
 
-function feedbackAdjustment(candidate: Candidate, feedback: ReturnType<typeof listFeedback>): { banned: boolean; score: number } {
+function feedbackAdjustment(candidate: Candidate, feedback: ReturnType<typeof listFeedback>) {
   let score = 0;
   for (const row of feedback) {
     const matchTrack = row.entity_type === "track" && row.entity_key === candidate.key;
@@ -289,51 +372,124 @@ function feedbackAdjustment(candidate: Candidate, feedback: ReturnType<typeof li
   return { banned: false, score };
 }
 
-function scoreCandidates(candidates: Candidate[], settings: RadioSettings, seeds: ReturnType<typeof getSeeds>, tasteMap: Map<string, { recent: number; historical: number; spotify: number }>, feedback: ReturnType<typeof listFeedback>, randomSeed: string): Candidate[] {
+function recentStationTrackKeys(stationId: string, maxTracks: number): Set<string> {
+  if (maxTracks <= 0) return new Set();
+  const keys = new Set<string>();
+  let seen = 0;
+  for (const generation of listGenerations(stationId)) {
+    for (const track of getGenerationTracks(generation.id)) {
+      keys.add(track.canonical_key);
+      if (++seen >= maxTracks) return keys;
+    }
+  }
+  return keys;
+}
+
+function scoreCandidates(
+  candidates: Candidate[],
+  settings: RadioSettings,
+  seeds: ReturnType<typeof getSeeds>,
+  tasteMap: Map<string, { recent: number; historical: number; spotify: number }>,
+  feedback: ReturnType<typeof listFeedback>,
+  randomSeed: string,
+  recentKeys: Set<string>,
+): Candidate[] {
   const seedArtists = new Set(seeds.map((s) => normalizeForComparison(s.artist ?? "")).filter(Boolean));
+  const currentYear = new Date().getUTCFullYear();
+
   for (const candidate of candidates) {
     const f = feedbackAdjustment(candidate, feedback);
-    if (f.banned) { candidate.selectionScore = -999; continue; }
+    if (f.banned) {
+      candidate.selectionScore = -999;
+      continue;
+    }
+
     const taste = tasteMap.get(candidate.key) ?? { recent: 0, historical: 0, spotify: 0 };
-    const provider = Object.entries(candidate.providerScores).reduce((sum, [name, value]) => sum + value * (settings.providerWeights[name] ?? 0.55), 0);
-    const seed = Object.values(candidate.seedScores).reduce((a, b) => a + b, 0);
+    const provider = Object.entries(candidate.providerScores)
+      .reduce((sum, [name, value]) => sum + value * (settings.providerWeights[name] ?? 0.55), 0);
+    const seedAffinity = Object.values(candidate.seedScores).reduce((a, b) => a + b, 0);
     const familiar = Math.max(candidate.familiarity, taste.spotify, taste.recent, taste.historical * 0.8);
     candidate.familiarity = familiar;
+
     const familiarityPreference = (settings.familiarity - 0.5) * 2;
-    const familiarityScore = familiarityPreference >= 0 ? familiar * familiarityPreference : (1 - familiar) * -familiarityPreference;
-    const knownScore = settings.knownBias >= 0 ? familiar * settings.knownBias : (1 - familiar) * -settings.knownBias;
+    const familiarityScore = familiarityPreference >= 0
+      ? familiar * familiarityPreference
+      : (1 - familiar) * -familiarityPreference;
+    const knownScore = settings.knownBias >= 0
+      ? familiar * settings.knownBias
+      : (1 - familiar) * -settings.knownBias;
     const owned = candidate.availability === "local" ? 1 : 0;
-    const ownedScore = settings.ownedBias >= 0 ? owned * settings.ownedBias : (1 - owned) * -settings.ownedBias;
+    const ownedScore = settings.ownedBias >= 0
+      ? owned * settings.ownedBias
+      : (1 - owned) * -settings.ownedBias;
     const sameArtist = seedArtists.has(normalizeForComparison(candidate.artist)) ? settings.sameArtistBias : 0;
-    const tasteScore = taste.spotify * settings.providerWeights.spotify_taste + taste.recent * settings.providerWeights.lastfm_recent + taste.historical * settings.providerWeights.lastfm_history;
+    const tasteScore =
+      taste.spotify * (settings.providerWeights.spotify_taste ?? 1) +
+      taste.recent * (settings.providerWeights.lastfm_recent ?? 0.95) +
+      taste.historical * (settings.providerWeights.lastfm_history ?? 0.8);
+
+    const popularity = typeof candidate.metadata.popularity === "number" ? candidate.metadata.popularity : 0.5;
+    const popularityScore = (popularity - 0.5) * 2 * settings.popularityBias;
+    const releaseYear = typeof candidate.metadata.releaseYear === "number" ? candidate.metadata.releaseYear : null;
+    const recency = releaseYear ? Math.max(0, Math.min(1, 1 - (currentYear - releaseYear) / 30)) : 0.5;
+    const releaseAgeScore = (recency - 0.5) * 2 * settings.releaseAgeBias;
+    const genreAffinity = Math.min(1, Math.max(0, ...Object.values(candidate.seedScores)));
+    const genreScore = genreAffinity * settings.genreSimilarity * 0.25;
+    const cooldownPenalty = recentKeys.has(candidate.key) ? settings.repeatStrength * 0.65 : 0;
     const surprise = seededUnit(randomSeed, candidate.key) * settings.surprise;
-    candidate.selectionScore = provider + seed * 1.4 + tasteScore + familiarityScore + knownScore + ownedScore + sameArtist + f.score + surprise;
+
+    candidate.selectionScore =
+      provider + seedAffinity * 1.4 + tasteScore + familiarityScore + knownScore + ownedScore +
+      sameArtist + popularityScore + releaseAgeScore + genreScore + f.score + surprise - cooldownPenalty;
   }
+
   return candidates.filter((c) => c.selectionScore > -100).sort((a, b) => b.selectionScore - a.selectionScore);
 }
 
 function transitionScore(a: Candidate | null, b: Candidate, settings: RadioSettings): number {
   if (!a) return 0;
   let score = 0;
-  if (normalizeForComparison(a.artist) === normalizeForComparison(b.artist)) score -= settings.repeatStrength * 0.5;
+  const sameArtist = normalizeForComparison(a.artist) === normalizeForComparison(b.artist);
+  if (sameArtist) score -= settings.repeatStrength * (0.5 + (settings.djWeights.artistSpacing ?? 0));
   if (a.album && b.album && normalizeForComparison(a.album) === normalizeForComparison(b.album)) score -= 0.12;
-  const aMeta = a.metadata as { bpm?: number; energy?: number; key?: string };
-  const bMeta = b.metadata as { bpm?: number; energy?: number; key?: string };
-  if (aMeta.bpm && bMeta.bpm) score += Math.max(0, 1 - Math.abs(aMeta.bpm - bMeta.bpm) / 60) * settings.djWeights.tempo;
-  if (aMeta.energy != null && bMeta.energy != null) score += Math.max(0, 1 - Math.abs(aMeta.energy - bMeta.energy)) * settings.djWeights.energy;
-  if (aMeta.key && bMeta.key && aMeta.key === bMeta.key) score += settings.djWeights.key;
+
+  const aMeta = a.metadata as { bpm?: number; energy?: number; key?: string; loudness?: number };
+  const bMeta = b.metadata as { bpm?: number; energy?: number; key?: string; loudness?: number };
+  if (aMeta.bpm && bMeta.bpm) {
+    score += Math.max(0, 1 - Math.abs(aMeta.bpm - bMeta.bpm) / 60) * (settings.djWeights.tempo ?? 0);
+  }
+  if (aMeta.energy != null && bMeta.energy != null) {
+    score += Math.max(0, 1 - Math.abs(aMeta.energy - bMeta.energy)) * (settings.djWeights.energy ?? 0);
+  }
+  if (aMeta.key && bMeta.key) {
+    score += (aMeta.key === bMeta.key ? 1 : 0) * (settings.djWeights.key ?? 0);
+  }
+  if (aMeta.loudness != null && bMeta.loudness != null) {
+    score += Math.max(0, 1 - Math.abs(aMeta.loudness - bMeta.loudness) / 12) * (settings.djWeights.timbre ?? 0) * 0.5;
+  }
   return score * settings.djFlow;
 }
 
-function selectSequence(scored: Candidate[], length: number, settings: RadioSettings, seeds: ReturnType<typeof getSeeds>, stationType: RadioStationType, randomSeed: string): Candidate[] {
+function selectSequence(
+  scored: Candidate[],
+  length: number,
+  settings: RadioSettings,
+  seeds: ReturnType<typeof getSeeds>,
+  stationType: RadioStationType,
+  randomSeed: string,
+): Candidate[] {
   const selected: Candidate[] = [];
   const used = new Set<string>();
   const artistLast = new Map<string, number>();
+  const seedArtists = new Set(seeds.map((s) => normalizeForComparison(s.artist ?? "")).filter(Boolean));
+  let seedArtistCount = 0;
+
   for (let position = 0; position < length && used.size < scored.length; position++) {
     const t = length <= 1 ? 0 : position / (length - 1);
     const targets = stationType === "gradient" ? targetSeedWeights(seeds, t) : null;
     let best: Candidate | null = null;
     let bestScore = -Infinity;
+
     for (const candidate of scored.slice(0, Math.max(120, length * 8))) {
       if (used.has(candidate.key)) continue;
       const artistKey = normalizeForComparison(candidate.artist);
@@ -343,40 +499,74 @@ function selectSequence(scored: Candidate[], length: number, settings: RadioSett
         const gap = position - last;
         repeatPenalty = Math.max(0, (settings.artistCooldown - gap + 1) / Math.max(1, settings.artistCooldown)) * settings.repeatStrength;
       }
-      const trajectory = targets ? Object.entries(targets).reduce((sum, [seedId, weight]) => sum + (candidate.seedScores[seedId] ?? 0) * weight, 0) * 2 : 0;
+
+      const trajectory = targets
+        ? Object.entries(targets).reduce((sum, [seedId, weight]) => sum + (candidate.seedScores[seedId] ?? 0) * weight, 0) * 2
+        : 0;
       const previous = selected.at(-1) ?? null;
       const flow = transitionScore(previous, candidate, settings);
+      const isSeedArtist = seedArtists.has(artistKey);
+      const currentRatio = position === 0 ? 0 : seedArtistCount / position;
+      const frequencyAdjustment = isSeedArtist
+        ? (settings.seedArtistFrequency - currentRatio) * 0.75
+        : Math.max(0, currentRatio - settings.seedArtistFrequency) * 0.25;
       const jitter = seededUnit(randomSeed, `${position}:${candidate.key}`) * 0.025;
-      const score = candidate.selectionScore + trajectory + flow - repeatPenalty + jitter;
-      if (score > bestScore) { best = candidate; bestScore = score; }
+      const score = candidate.selectionScore + trajectory + flow - repeatPenalty + frequencyAdjustment + jitter;
+
+      if (score > bestScore) {
+        best = candidate;
+        bestScore = score;
+      }
     }
+
     if (!best) break;
     used.add(best.key);
     artistLast.set(normalizeForComparison(best.artist), position);
-    selected.push({ ...best, selectionScore: bestScore, metadata: { ...best.metadata, trajectoryTarget: stationType === "gradient" ? t : null } });
+    if (seedArtists.has(normalizeForComparison(best.artist))) seedArtistCount++;
+    selected.push({
+      ...best,
+      selectionScore: bestScore,
+      metadata: { ...best.metadata, trajectoryTarget: stationType === "gradient" ? t : null },
+    });
   }
+
   return selected;
 }
 
-async function generateCandidates(stationId: string, settings: RadioSettings, tasteProfile: TasteTrack[] | undefined, randomSeed: string) {
+async function generateCandidates(
+  stationId: string,
+  settings: RadioSettings,
+  tasteProfile: TasteTrack[] | undefined,
+  randomSeed: string,
+) {
   const seeds = getSeeds(stationId);
   const errors: string[] = [];
   const map = new Map<string, Candidate>();
   for (const seed of seeds) await collectSeedCandidates(seed, map, errors);
+
   const tasteMap = await buildTasteMaps(tasteProfile);
   for (const track of tasteProfile ?? []) {
-    const key = canonicalKey(track.artist, track.title, track.isrc, null);
+    const key = canonicalRadioTrackKey(track.artist, track.title);
     const existing = map.get(key);
     if (existing) {
       existing.spotifyId ||= track.spotifyId ?? null;
       existing.isrc ||= track.isrc ?? null;
       existing.familiarity = Math.max(existing.familiarity, track.weight ?? 1);
+      if (track.releaseYear) existing.metadata.releaseYear = track.releaseYear;
+      if (track.popularity != null) existing.metadata.popularity = track.popularity;
     }
   }
+
   const candidates = [...map.values()];
   await resolveAvailability(candidates);
+  loadAudioAnalysis(candidates);
   const feedback = listFeedback(stationId);
-  return { scored: scoreCandidates(candidates, settings, seeds, tasteMap, feedback, randomSeed), seeds, errors };
+  const recentKeys = recentStationTrackKeys(stationId, settings.trackCooldown);
+  return {
+    scored: scoreCandidates(candidates, settings, seeds, tasteMap, feedback, randomSeed, recentKeys),
+    seeds,
+    errors,
+  };
 }
 
 function toStoredTrack(candidate: Candidate, trajectory: number | null): Omit<RadioTrackRow, "id" | "generation_id" | "created_at" | "position"> {
@@ -400,9 +590,35 @@ function toStoredTrack(candidate: Candidate, trajectory: number | null): Omit<Ra
   };
 }
 
+function storedTrackCopy(track: RadioTrackRow) {
+  return {
+    canonical_key: track.canonical_key,
+    artist: track.artist,
+    title: track.title,
+    album: track.album,
+    duration_ms: track.duration_ms,
+    isrc: track.isrc,
+    spotify_id: track.spotify_id,
+    navidrome_id: track.navidrome_id,
+    musicbrainz_id: track.musicbrainz_id,
+    playback_source: track.playback_source,
+    availability_status: track.availability_status,
+    pinned: track.pinned,
+    manual: track.manual,
+    selection_score: track.selection_score,
+    trajectory_position: track.trajectory_position,
+    metadata_json: track.metadata_json,
+  };
+}
+
 export async function createRadio(input: CreateRadioInput) {
   if (!input.seeds.length) throw new Error("Radio requires at least one seed");
-  const seeds = input.seeds.map((seed, index) => ({ ...seed, position: input.type === "gradient" ? (seed.position ?? index / Math.max(1, input.seeds.length - 1)) : seed.position }));
+  const seeds = input.seeds.map((seed, index) => ({
+    ...seed,
+    position: input.type === "gradient"
+      ? (seed.position ?? index / Math.max(1, input.seeds.length - 1))
+      : seed.position,
+  }));
   const station = createStation({ name: input.name, type: input.type, settings: input.settings, seeds });
   const generation = input.generate === false ? null : await generateStation(station.id, { tasteProfile: input.tasteProfile });
   return { station: presentStation(station.id), generation };
@@ -417,10 +633,24 @@ export function presentStation(stationId: string) {
     type: station.type,
     settings: parseRadioSettings(station.settings_json),
     seeds: getSeeds(station.id).map((seed) => ({
-      id: seed.id, type: seed.seed_type, entity_id: seed.entity_id, artist: seed.artist, title: seed.title,
-      label: seed.label, weight: seed.weight, position: seed.position, metadata: parseSeedMetadata(seed.metadata_json),
+      id: seed.id,
+      type: seed.seed_type,
+      entity_id: seed.entity_id,
+      artist: seed.artist,
+      title: seed.title,
+      label: seed.label,
+      weight: seed.weight,
+      position: seed.position,
+      metadata: parseSeedMetadata(seed.metadata_json),
     })),
-    generations: listGenerations(station.id).map((g) => ({ id: g.id, revision: g.revision, status: g.status, requested_length: g.requested_length, created_at: g.created_at, completed_at: g.completed_at })),
+    generations: listGenerations(station.id).map((g) => ({
+      id: g.id,
+      revision: g.revision,
+      status: g.status,
+      requested_length: g.requested_length,
+      created_at: g.created_at,
+      completed_at: g.completed_at,
+    })),
     created_at: station.created_at,
     updated_at: station.updated_at,
   };
@@ -464,21 +694,35 @@ export function presentGeneration(generationId: string) {
   };
 }
 
-export function listRadioStations() { return listStations().map((s) => presentStation(s.id)!); }
+export function listRadioStations() {
+  return listStations().map((s) => presentStation(s.id)!);
+}
 
-export async function generateStation(stationId: string, input: { length?: number; tasteProfile?: TasteTrack[] } = {}) {
+export async function generateStation(
+  stationId: string,
+  input: { length?: number; tasteProfile?: TasteTrack[] } = {},
+) {
   const station = getStation(stationId);
   if (!station) throw new Error("Radio station not found");
   const settings = parseRadioSettings(station.settings_json);
   const length = Math.max(1, Math.min(200, input.length ?? settings.length ?? station.default_length));
   const randomSeed = crypto.randomUUID();
-  const generation = createGeneration({ stationId, requestedLength: length, generatorVersion: "radio-v1", randomSeed, settingsSnapshot: { ...settings, length } });
+  const generation = createGeneration({
+    stationId,
+    requestedLength: length,
+    generatorVersion: "radio-v2",
+    randomSeed,
+    settingsSnapshot: { ...settings, length },
+  });
   const started = performance.now();
+
   try {
     const { scored, seeds, errors } = await generateCandidates(stationId, settings, input.tasteProfile, randomSeed);
     const sequence = selectSequence(scored, length, settings, seeds, station.type, randomSeed);
-    const tracks = sequence.map((candidate, index) => toStoredTrack(candidate, station.type === "gradient" ? (length <= 1 ? 0 : index / (length - 1)) : null));
-    replaceGenerationTracks(generation.id, tracks);
+    replaceGenerationTracks(generation.id, sequence.map((candidate, index) => toStoredTrack(
+      candidate,
+      station.type === "gradient" ? (length <= 1 ? 0 : index / (length - 1)) : null,
+    )));
     finishGeneration(generation.id, sequence.length >= Math.min(length, 3) ? (errors.length ? "partial" : "ready") : "partial", {
       candidate_count: scored.length,
       selected_count: sequence.length,
@@ -487,8 +731,12 @@ export async function generateStation(stationId: string, input: { length?: numbe
       duration_ms: Math.round(performance.now() - started),
     });
   } catch (error) {
-    finishGeneration(generation.id, "failed", { error: error instanceof Error ? error.message : String(error), duration_ms: Math.round(performance.now() - started) });
+    finishGeneration(generation.id, "failed", {
+      error: error instanceof Error ? error.message : String(error),
+      duration_ms: Math.round(performance.now() - started),
+    });
   }
+
   return presentGeneration(generation.id)!;
 }
 
@@ -505,24 +753,41 @@ export async function regenerateTail(generationId: string, fromPosition: number,
   const randomSeed = crypto.randomUUID();
   const { scored, seeds, errors } = await generateCandidates(station.id, settings, tasteProfile, randomSeed);
   const used = new Set([...prefix, ...pinned].map((t) => t.canonical_key));
-  const replacement = selectSequence(scored.filter((c) => !used.has(c.key)), generation.requested_length, settings, seeds, station.type, randomSeed);
+  const replacement = selectSequence(
+    scored.filter((c) => !used.has(c.key)),
+    generation.requested_length,
+    settings,
+    seeds,
+    station.type,
+    randomSeed,
+  );
   const byPosition = new Map<number, RadioTrackRow>();
   prefix.forEach((t) => byPosition.set(t.position, t));
   pinned.forEach((t) => byPosition.set(t.position, t));
   let cursor = 0;
-  const output: Array<Omit<RadioTrackRow, "id" | "generation_id" | "created_at" | "position"> & { position?: number }> = [];
+  const output: Array<ReturnType<typeof storedTrackCopy> & { position?: number }> = [];
+
   for (let position = 0; position < generation.requested_length; position++) {
     const kept = byPosition.get(position);
     if (kept) {
-      output.push({ ...kept, position, metadata_json: kept.metadata_json });
+      output.push({ ...storedTrackCopy(kept), position });
       continue;
     }
     const candidate = replacement[cursor++];
     if (!candidate) continue;
-    output.push({ ...toStoredTrack(candidate, station.type === "gradient" ? (generation.requested_length <= 1 ? 0 : position / (generation.requested_length - 1)) : null), position });
+    output.push({
+      ...toStoredTrack(candidate, station.type === "gradient"
+        ? (generation.requested_length <= 1 ? 0 : position / (generation.requested_length - 1))
+        : null),
+      position,
+    });
   }
+
   replaceGenerationTracks(generationId, output);
-  finishGeneration(generationId, errors.length ? "partial" : "ready", { regenerated_from: fromPosition, provider_errors: errors });
+  finishGeneration(generationId, errors.length ? "partial" : "ready", {
+    regenerated_from: fromPosition,
+    provider_errors: errors,
+  });
   return presentGeneration(generationId)!;
 }
 
@@ -530,9 +795,18 @@ export function updateRadioStation(stationId: string, patch: Parameters<typeof u
   return updateStation(stationId, patch) ? presentStation(stationId) : null;
 }
 
-export function removeRadioStation(stationId: string) { return deleteStation(stationId); }
+export function removeRadioStation(stationId: string) {
+  return deleteStation(stationId);
+}
 
-export function recordRadioFeedback(input: { scope: "station" | "global"; stationId?: string | null; entityType: "track" | "artist"; entityKey: string; action: RadioFeedbackAction; strength?: number }) {
+export function recordRadioFeedback(input: {
+  scope: "station" | "global";
+  stationId?: string | null;
+  entityType: "track" | "artist";
+  entityKey: string;
+  action: RadioFeedbackAction;
+  strength?: number;
+}) {
   return addFeedback(input);
 }
 
@@ -544,6 +818,130 @@ export function pinGenerationTrack(generationId: string, trackId: string, pinned
 export function removeGenerationTrack(generationId: string, trackId: string) {
   snapshotGeneration(generationId, "remove_track");
   return deleteGenerationTrack(generationId, trackId);
+}
+
+export function resolveGenerationTracks(
+  generationId: string,
+  resolutions: Array<{
+    trackId: string;
+    spotifyId?: string | null;
+    isrc?: string | null;
+    album?: string | null;
+    durationMs?: number | null;
+  }>,
+) {
+  const db = getDb();
+  const stmt = db.query(`UPDATE radio_generation_tracks
+    SET spotify_id=COALESCE(?,spotify_id),
+        isrc=COALESCE(?,isrc),
+        album=COALESCE(?,album),
+        duration_ms=COALESCE(?,duration_ms),
+        playback_source=CASE WHEN navidrome_id IS NOT NULL THEN 'navidrome' WHEN COALESCE(?,spotify_id) IS NOT NULL THEN 'spotify' ELSE playback_source END,
+        availability_status=CASE WHEN navidrome_id IS NOT NULL THEN 'local' WHEN COALESCE(?,spotify_id) IS NOT NULL THEN 'spotify' ELSE availability_status END
+    WHERE generation_id=? AND id=?`);
+  db.transaction(() => {
+    for (const row of resolutions) {
+      stmt.run(
+        row.spotifyId ?? null,
+        row.isrc ?? null,
+        row.album ?? null,
+        row.durationMs ?? null,
+        row.spotifyId ?? null,
+        row.spotifyId ?? null,
+        generationId,
+        row.trackId,
+      );
+    }
+  })();
+  return presentGeneration(generationId);
+}
+
+export function listGenerationRevisions(generationId: string) {
+  return getDb().query<{
+    id: string;
+    revision: number;
+    reason: string;
+    created_at: string;
+  }, [string]>(`SELECT id,revision,reason,created_at FROM radio_generation_revisions
+      WHERE generation_id=? ORDER BY revision DESC`).all(generationId);
+}
+
+export function revertGenerationRevision(generationId: string, revisionId: string) {
+  const row = getDb().query<{ tracks_json: string }, [string, string]>(
+    "SELECT tracks_json FROM radio_generation_revisions WHERE generation_id=? AND id=?",
+  ).get(generationId, revisionId);
+  if (!row) return null;
+  snapshotGeneration(generationId, `before_revert:${revisionId}`);
+  const tracks = JSON.parse(row.tracks_json) as RadioTrackRow[];
+  replaceGenerationTracks(generationId, tracks.map(storedTrackCopy));
+  finishGeneration(generationId, "ready", { reverted_to_revision: revisionId });
+  return presentGeneration(generationId);
+}
+
+export function cloneGeneration(generationId: string) {
+  const source = getGeneration(generationId);
+  if (!source) return null;
+  const tracks = getGenerationTracks(generationId);
+  const next = createGeneration({
+    stationId: source.station_id,
+    requestedLength: source.requested_length,
+    generatorVersion: `${source.generator_version}:clone`,
+    randomSeed: crypto.randomUUID(),
+    settingsSnapshot: parseRadioSettings(source.settings_snapshot_json),
+  });
+  replaceGenerationTracks(next.id, tracks.map(storedTrackCopy));
+  finishGeneration(next.id, "ready", { cloned_from: generationId });
+  return presentGeneration(next.id);
+}
+
+export function insertManualGenerationTrack(
+  generationId: string,
+  input: {
+    position: number;
+    artist: string;
+    title: string;
+    album?: string | null;
+    durationMs?: number | null;
+    spotifyId?: string | null;
+    navidromeId?: string | null;
+    isrc?: string | null;
+  },
+) {
+  const generation = getGeneration(generationId);
+  if (!generation) return null;
+  snapshotGeneration(generationId, `insert:${input.position}`);
+  const existing = getGenerationTracks(generationId).map(storedTrackCopy);
+  const position = Math.max(0, Math.min(existing.length, input.position));
+  existing.splice(position, 0, {
+    canonical_key: canonicalRadioTrackKey(input.artist, input.title),
+    artist: input.artist,
+    title: input.title,
+    album: input.album ?? null,
+    duration_ms: input.durationMs ?? null,
+    isrc: input.isrc ?? null,
+    spotify_id: input.spotifyId ?? null,
+    navidrome_id: input.navidromeId ?? null,
+    musicbrainz_id: null,
+    playback_source: input.navidromeId ? "navidrome" : input.spotifyId ? "spotify" : null,
+    availability_status: input.navidromeId ? "local" : input.spotifyId ? "spotify" : "unavailable",
+    pinned: 0,
+    manual: 1,
+    selection_score: 0,
+    trajectory_position: null,
+    metadata_json: JSON.stringify({ manuallyInserted: true }),
+  });
+  replaceGenerationTracks(generationId, existing);
+  return presentGeneration(generationId);
+}
+
+export function reorderGenerationTracks(generationId: string, trackIds: string[]) {
+  const existing = getGenerationTracks(generationId);
+  if (existing.length !== trackIds.length || new Set(trackIds).size !== trackIds.length) return null;
+  const byId = new Map(existing.map((track) => [track.id, track]));
+  if (trackIds.some((id) => !byId.has(id))) return null;
+  snapshotGeneration(generationId, "reorder");
+  replaceGenerationTracks(generationId, trackIds.map((id) => storedTrackCopy(byId.get(id)!)));
+  return presentGeneration(generationId);
 }
 
 export { DEFAULT_RADIO_SETTINGS };
