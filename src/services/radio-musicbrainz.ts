@@ -23,7 +23,7 @@ function quote(value: string) {
   return `"${value.replaceAll('"', '\\"')}"`;
 }
 
-function queryForSeed(seed: RadioMusicBrainzSeed): string | null {
+export function musicBrainzQueryForRadioSeed(seed: RadioMusicBrainzSeed): string | null {
   if (seed.seed_type === "track" && seed.artist && seed.title) {
     return `recording:${quote(seed.title)} AND artist:${quote(seed.artist)}`;
   }
@@ -54,7 +54,7 @@ export async function getMusicBrainzRadioCandidates(
   const errors: string[] = [];
 
   for (const seed of seeds.slice(0, 8)) {
-    const query = queryForSeed(seed);
+    const query = musicBrainzQueryForRadioSeed(seed);
     if (!query) continue;
     try {
       const rows = await musicbrainz.searchRecordings(query, seed.seed_type === "artist" ? 35 : 20);
