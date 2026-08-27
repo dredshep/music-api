@@ -3,12 +3,12 @@ import { z } from "zod";
 import { AppError } from "../middleware/errors";
 import {
   createRadio,
-  generateStation,
   listRadioStations,
   presentGeneration,
   presentStation,
   recordRadioFeedback,
 } from "../services/radio";
+import { generateRadioStationWithGradient } from "../services/radio-gradient-generation";
 import { hydrateNativeRadioSeeds, refreshNativeRadioSeedSnapshots } from "../services/radio-native-seeds";
 import { finalizeRadioGeneration } from "../services/radio-finalize";
 
@@ -44,6 +44,9 @@ const partialSettingsSchema = z.object({
   repeatStrength: z.number().min(0).max(2).optional(),
   surprise: z.number().min(0).max(1).optional(),
   djFlow: z.number().min(0).max(1).optional(),
+  gradientAlgorithm: z.enum(["blend", "geodesic", "scenic"]).optional(),
+  gradientRouteStrength: z.number().min(0).max(8).optional(),
+  gradientRouteWidth: z.number().min(0.05).max(0.6).optional(),
   providerWeights: z.record(z.number().min(0).max(5)).optional(),
   djWeights: z.record(z.number().min(0).max(5)).optional(),
 });
@@ -69,8 +72,13 @@ radioSemanticRoutes.get("/radio/stations", (c) => c.json({ stations: listRadioSt
 
 radioSemanticRoutes.post("/radio/stations", async (c) => {
   const input = createSchema.parse(await c.req.json());
-  const result = await createRadio({ ...input, seeds: await hydrateNativeRadioSeeds(input.seeds) });
-  if (result.generation) result.generation = await finalizeRadioGeneration(result.generation.id);
+  const result = await createRadio({ ...input, seeds: await hydrateNativeRadioSeeds(input.seeds), generate: false });
+  if (input.generate !== false) {
+    const stationId = result.station?.id;
+    if (!stationId) throw new AppError("RADIO_CREATE_FAILED", "Radio station was not created", 500);
+    const generation = await generateRadioStationWithGradient(stationId);
+    result.generation = await finalizeRadioGeneration(generation.id);
+  }
   return c.json(result, 201);
 });
 
@@ -85,7 +93,7 @@ radioSemanticRoutes.post("/radio/stations/:id/generate", async (c) => {
   if (!presentStation(stationId)) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   const body = z.object({ length: z.number().int().min(1).max(200).optional() }).parse(await c.req.json().catch(() => ({})));
   await refreshNativeRadioSeedSnapshots(stationId);
-  const generation = await generateStation(stationId, body);
+  const generation = await generateRadioStationWithGradient(stationId, body);
   return c.json(await finalizeRadioGeneration(generation.id), 201);
 });
 
