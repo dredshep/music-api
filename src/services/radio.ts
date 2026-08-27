@@ -38,6 +38,7 @@ export interface TasteTrack {
   durationMs?: number | null;
   isrc?: string | null;
   spotifyId?: string | null;
+  navidromeId?: string | null;
   weight?: number;
   releaseYear?: number | null;
   popularity?: number | null;
@@ -80,6 +81,14 @@ export function canonicalRadioTrackKey(artist: string, title: string): string {
   return `text:${normalizeForComparison(artist)}|${normalizeForComparison(title)}`;
 }
 
+export function radioSeedProviderBucket(seedType: string): string {
+  if (seedType === "library") return "navidrome_library";
+  if (seedType === "liked") return "spotify_taste";
+  if (seedType === "playlist") return "spotify_playlist";
+  if (seedType === "collection") return "collection_seed";
+  return "seed_collection";
+}
+
 function seededUnit(seed: string, key: string): number {
   const hex = createHash("sha256").update(`${seed}:${key}`).digest("hex").slice(0, 13);
   return parseInt(hex, 16) / 0x1fffffffffffff;
@@ -105,6 +114,7 @@ function upsertCandidate(map: Map<string, Candidate>, input: {
   durationMs?: number | null;
   isrc?: string | null;
   spotifyId?: string | null;
+  navidromeId?: string | null;
   mbid?: string | null;
   provider: string;
   providerScore: number;
@@ -123,10 +133,10 @@ function upsertCandidate(map: Map<string, Candidate>, input: {
     durationMs: input.durationMs ?? null,
     isrc: input.isrc ?? null,
     spotifyId: input.spotifyId ?? null,
-    navidromeId: null,
+    navidromeId: input.navidromeId ?? null,
     musicbrainzId: input.mbid ?? null,
-    availability: input.spotifyId ? "spotify" as const : "unknown" as const,
-    playbackSource: input.spotifyId ? "spotify" as const : null,
+    availability: input.navidromeId ? "local" as const : input.spotifyId ? "spotify" as const : "unknown" as const,
+    playbackSource: input.navidromeId ? "navidrome" as const : input.spotifyId ? "spotify" as const : null,
     providerScores: {},
     seedScores: {},
     familiarity: input.familiarity ?? 0,
@@ -139,8 +149,15 @@ function upsertCandidate(map: Map<string, Candidate>, input: {
   current.familiarity = Math.max(current.familiarity, input.familiarity ?? 0);
   if (!current.spotifyId && input.spotifyId) {
     current.spotifyId = input.spotifyId;
-    current.availability = "spotify";
-    current.playbackSource = "spotify";
+    if (!current.navidromeId) {
+      current.availability = "spotify";
+      current.playbackSource = "spotify";
+    }
+  }
+  if (!current.navidromeId && input.navidromeId) {
+    current.navidromeId = input.navidromeId;
+    current.availability = "local";
+    current.playbackSource = "navidrome";
   }
   current.isrc ||= input.isrc ?? null;
   current.musicbrainzId ||= input.mbid ?? null;
@@ -222,6 +239,7 @@ async function collectSeedCandidates(
 
     const supplied = seedTracks(seed.metadata_json);
     if (supplied.length) {
+      const provider = radioSeedProviderBucket(seed.seed_type);
       supplied.forEach((track) => upsertCandidate(map, {
         artist: track.artist,
         title: track.title,
@@ -229,7 +247,8 @@ async function collectSeedCandidates(
         durationMs: track.durationMs,
         isrc: track.isrc,
         spotifyId: track.spotifyId,
-        provider: "spotify_taste",
+        navidromeId: track.navidromeId,
+        provider,
         providerScore: track.weight ?? 1,
         seedId: seed.id,
         seedScore: weight * (track.weight ?? 1),
@@ -237,6 +256,7 @@ async function collectSeedCandidates(
         metadata: {
           releaseYear: track.releaseYear ?? undefined,
           popularity: track.popularity ?? undefined,
+          suppliedSeedType: seed.seed_type,
         },
       }));
       for (const track of supplied.slice(0, 16)) {
@@ -300,6 +320,11 @@ async function resolveAvailability(candidates: Candidate[]): Promise<void> {
   const batch = candidates.slice(0, 350);
   for (let i = 0; i < batch.length; i += 12) {
     await Promise.all(batch.slice(i, i + 12).map(async (candidate) => {
+      if (candidate.navidromeId) {
+        candidate.availability = "local";
+        candidate.playbackSource = "navidrome";
+        return;
+      }
       try {
         const result = await navidrome.search3(`${candidate.artist} ${candidate.title}`, {
           artistCount: 0,
@@ -575,8 +600,13 @@ async function generateCandidates(
     const existing = map.get(key);
     if (existing) {
       existing.spotifyId ||= track.spotifyId ?? null;
+      existing.navidromeId ||= track.navidromeId ?? null;
       existing.isrc ||= track.isrc ?? null;
       existing.familiarity = Math.max(existing.familiarity, track.weight ?? 1);
+      if (existing.navidromeId) {
+        existing.availability = "local";
+        existing.playbackSource = "navidrome";
+      }
       if (track.releaseYear) existing.metadata.releaseYear = track.releaseYear;
       if (track.popularity != null) existing.metadata.popularity = track.popularity;
     }
