@@ -18,7 +18,7 @@ const seedBase = {
   entityId: z.string().max(256).nullable().optional(),
   label: z.string().min(1).max(500),
   weight: z.number().positive().max(100).optional(),
-  position: z.number().min(0).max(100).nullable().optional(),
+  position: z.number().min(0).max(1).nullable().optional(),
 };
 
 const seedSchema = z.discriminatedUnion("type", [
