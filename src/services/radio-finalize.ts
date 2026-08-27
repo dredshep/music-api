@@ -91,7 +91,8 @@ export async function finalizeRadioGeneration(
   const priorTiming = object(existingDiagnostics.gradient_pipeline_timing);
   const isGradientRouteGeneration = Boolean(existingDiagnostics.gradient_route);
   const finalizeTotalMs = elapsedMs(finalizeStartedAt);
-  const generationWithGradientMs = finite(priorTiming.generation_with_gradient_ms);
+  const preFinalizeTotalMs = finite(priorTiming.pre_finalize_total_ms)
+    ?? finite(priorTiming.generation_with_gradient_ms);
 
   const diagnostics = {
     ...existingDiagnostics,
@@ -117,8 +118,8 @@ export async function finalizeRadioGeneration(
         dj_resequence_ms: djResequenceMs,
         route_order_guard_ms: routeOrderGuardMs,
         finalize_total_ms: finalizeTotalMs,
-        ...(generationWithGradientMs != null ? {
-          total_until_finalized_ms: Number((generationWithGradientMs + finalizeTotalMs).toFixed(2)),
+        ...(preFinalizeTotalMs != null ? {
+          total_until_finalized_ms: Number((preFinalizeTotalMs + finalizeTotalMs).toFixed(2)),
         } : {}),
       },
     } : {}),
