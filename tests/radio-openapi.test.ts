@@ -17,10 +17,11 @@ describe("Radio OpenAPI", () => {
     expect(operations.filter((op) => (op.description?.length ?? 0) > 300)).toEqual([]);
   });
 
-  test("documents finite creation, saved generations and explicit feedback", () => {
+  test("documents saved generations, bounded live continuation and explicit feedback", () => {
     const paths = new Set(Object.keys(getRadioOpenApiSpec().paths));
     expect(paths.has("/v1/radio/stations")).toBe(true);
     expect(paths.has("/v1/radio/stations/{id}/generate")).toBe(true);
+    expect(paths.has("/v1/radio/stations/{id}/live-batch")).toBe(true);
     expect(paths.has("/v1/radio/generations/{id}")).toBe(true);
     expect(paths.has("/v1/radio/feedback")).toBe(true);
   });
