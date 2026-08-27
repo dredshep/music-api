@@ -21,6 +21,7 @@ import { lyricsRoutes } from "./routes/lyrics";
 import { playerRoutes } from "./routes/player";
 import { openapiRoute } from "./routes/openapi";
 import { openapiManagerRoute } from "./routes/openapi-manager";
+import { openapiRadioRoute } from "./routes/openapi-radio";
 import { managerRoutes } from "./routes/manager";
 import { initDatabase } from "./db/database";
 import { startCleanupTimer } from "./db/cleanup";
@@ -35,9 +36,7 @@ const app = new Hono<{ Variables: AppVariables }>();
 
 app.onError((err, c) => {
   const { status, body, retryAfterSeconds } = formatErrorResponse(err);
-  if (retryAfterSeconds != null) {
-    c.header("Retry-After", String(retryAfterSeconds));
-  }
+  if (retryAfterSeconds != null) c.header("Retry-After", String(retryAfterSeconds));
   return c.json(body, status as 400);
 });
 
@@ -52,6 +51,7 @@ app.use("/health", publicRateLimit());
 app.get("/health", (c) => c.json({ status: "ok" }));
 app.route("/", openapiRoute);
 app.route("/", openapiManagerRoute);
+app.route("/", openapiRadioRoute);
 app.route("/", suggestionsUiRoute);
 
 app.use("/v1/*", authMiddleware());
@@ -84,7 +84,4 @@ warmLibraryDiskUsageCache();
 
 console.log(JSON.stringify({ level: "info", event: "server_started", port: config.PORT, timestamp: new Date().toISOString() }));
 
-export default {
-  port: config.PORT,
-  fetch: app.fetch,
-};
+export default { port: config.PORT, fetch: app.fetch };
