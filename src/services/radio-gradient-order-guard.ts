@@ -11,6 +11,10 @@ function metadata(track: RadioTrackRow): Record<string, unknown> {
   catch { return {}; }
 }
 
+function isGradientWaypoint(track: RadioTrackRow) {
+  return metadata(track).gradientWaypoint === true;
+}
+
 export function musicalRoutePosition(track: RadioTrackRow): number | null {
   const meta = metadata(track);
   if (meta.trajectoryCoordinateKind !== "musical_route") return null;
@@ -54,10 +58,11 @@ export function repairGradientRouteSegmentOrder(segment: RadioTrackRow[]): Radio
 
 /**
  * Final safety pass after DJ resequencing. It never moves a regenerate prefix,
- * pinned track, or manual edit. Inside each remaining contiguous segment it
- * removes meaningful route-coordinate inversions while preserving unknown
- * coordinate slots. This keeps audio/DJ optimization subordinate to the global
- * A→B musical route instead of allowing BPM/key matching to undo it.
+ * pinned track, manual edit, or exact Gradient track waypoint. Inside each
+ * remaining contiguous segment it removes meaningful route-coordinate
+ * inversions while preserving unknown-coordinate slots. This keeps audio/DJ
+ * optimization subordinate to the global A→B musical route without undoing an
+ * exact recording the user placed as a waypoint.
  */
 export function enforceGradientRouteOrder(
   generationId: string,
@@ -84,7 +89,7 @@ export function enforceGradientRouteOrder(
   const fromPosition = Math.max(0, options.fromPosition ?? 0);
   const locked = new Set<number>();
   for (const track of tracks) {
-    if (track.position < fromPosition || track.pinned || track.manual) locked.add(track.position);
+    if (track.position < fromPosition || track.pinned || track.manual || isGradientWaypoint(track)) locked.add(track.position);
   }
   const byPosition = new Map(tracks.map((track) => [track.position, track]));
   const finalOrder: RadioTrackRow[] = [];
