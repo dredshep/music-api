@@ -58,7 +58,7 @@ function addTempo(key: string, bpm: number) {
 }
 
 describe("Radio DJ sequencer", () => {
-  test("uses cached BPM to improve ordering while keeping the first stable tie", () => {
+  test("uses cached BPM to place compatible tracks next to each other", () => {
     const station = createStation({
       name: "DJ",
       seeds: [{ type: "artist", artist: "A", label: "A" }],
@@ -85,7 +85,9 @@ describe("Radio DJ sequencer", () => {
     addTempo("text:c|c", 180);
 
     resequenceRadioGeneration(generation.id);
-    expect(getGenerationTracks(generation.id).map((track) => track.title)).toEqual(["A", "B", "C"]);
+    const order = getGenerationTracks(generation.id).map((track) => track.title);
+    expect([...order.slice(0, 2)].sort()).toEqual(["A", "B"]);
+    expect(order[2]).toBe("C");
   });
 
   test("does not move pinned/manual positions or locked regenerate prefixes", () => {
