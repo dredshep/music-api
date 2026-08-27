@@ -25,7 +25,7 @@ describe("Radio OpenAPI", () => {
     expect(paths.has("/v1/radio/feedback")).toBe(true);
   });
 
-  test("agent creation only advertises self-sufficient seed types", () => {
+  test("agent creation only advertises self-sufficient seed types and normalized waypoints", () => {
     const create = getRadioOpenApiSpec().paths["/v1/radio/stations"].post;
     const schema = create.requestBody.content["application/json"].schema;
     const item = schema.properties.seeds.items;
@@ -34,6 +34,10 @@ describe("Radio OpenAPI", () => {
     expect(types).not.toContain("liked");
     expect(types).not.toContain("playlist");
     expect(types).not.toContain("collection");
+    for (const variant of item.oneOf) {
+      expect(variant.properties.position.minimum).toBe(0);
+      expect(variant.properties.position.maximum).toBe(1);
+    }
   });
 
   test("does not leak manager-only mutation and workstation routes", () => {
