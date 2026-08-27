@@ -14,8 +14,8 @@ const managerRadioSpec = {
   openapi: "3.1.0",
   info: {
     title: "Music Manager Radio API",
-    version: "1.1.0",
-    description: `Internal workstation API for saved Radio generations, graph-routed Gradient Radio, bounded live continuation, playlist import/editing, and local audio analysis. ${gradientSettingsDescription} Not intended as the compact agent surface.`,
+    version: "1.2.0",
+    description: `Internal workstation API for saved Radio generations, graph-routed Gradient Radio, cursor-aware bounded live continuation, playlist import/editing, and local audio analysis. ${gradientSettingsDescription} Not intended as the compact agent surface.`,
   },
   servers: [{ url: "https://music-api.besto.me" }],
   security: [{ bearerAuth: [] }],
@@ -42,7 +42,7 @@ const managerRadioSpec = {
       post: {
         operationId: "generateManagerLiveRadioBatch",
         summary: "Generate an ephemeral bounded live continuation",
-        description: "Gradient live batches use the same graph-route algorithm as saved generations and do not create retained generation history.",
+        description: "Gradient live batches use the same graph-route algorithm as saved generations. Pass the previous response next_cursor as routeCursor so refills continue forward through the A→B musical route; reaching the end wraps to a new A→B cycle. No generation history is retained.",
         parameters: idParameter,
         requestBody: { content: { "application/json": { schema: {
           type: "object",
@@ -50,9 +50,10 @@ const managerRadioSpec = {
             count: { type: "integer", minimum: 4, maximum: 30 },
             excludeKeys: { type: "array", maxItems: 5000, items: { type: "string" } },
             tasteProfile: { type: "array", maxItems: 5000, items: { type: "object", additionalProperties: true } },
+            routeCursor: { type: ["number", "null"], minimum: 0, maximum: 1, description: "Normalized musical-route coordinate returned as next_cursor by the prior Gradient live batch. Omit/null for non-Gradient or first batch." },
           },
         } } } },
-        responses: { "200": { description: "Ephemeral continuation batch; not retained as saved generation history" } },
+        responses: { "200": { description: "Ephemeral continuation with route_cursor, next_cursor and route_wrapped for cursor-aware Gradient live playback" } },
       },
     },
     "/manager/v1/radio/generations/{id}": {
