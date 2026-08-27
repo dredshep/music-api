@@ -42,6 +42,8 @@ export interface GradientRouteSegment {
   toLabel: string;
   fromArtist: string | null;
   toArtist: string | null;
+  fromAnchors?: string[];
+  toAnchors?: string[];
   fromPosition: number;
   toPosition: number;
   connected: boolean;
@@ -92,9 +94,19 @@ type FrontierItem = {
   quality: number;
 };
 
+type RegionPathResult = {
+  path: PathResult | null;
+  graph: Graph;
+  queryCount: number;
+  fromArtist: string | null;
+  toArtist: string | null;
+};
+
 const ROUTE_CACHE_TTL_MS = 30 * 60 * 1000;
+const MAX_REGION_ANCHORS = 4;
 const similarArtistCache = new Map<string, { expires: number; promise: Promise<GradientArtistNeighbor[]> }>();
 const topTrackCache = new Map<string, { expires: number; promise: Promise<Array<{ artist: string; title: string; mbid: string | null; score: number }>> }>();
+const tagAnchorCache = new Map<string, { expires: number; promise: Promise<Array<{ artist: string; weight: number }>> }>();
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -130,9 +142,9 @@ function addEdge(graph: Graph, fromName: string, toName: string, similarity: num
     const current = bucket.get(b);
     if (!current || score > current.similarity) bucket.set(b, { to: b, similarity: score });
   };
-  // Last.fm similarity is directional, but treating a returned relationship as
-  // an undirected local adjacency makes path finding robust to asymmetric API
-  // neighbourhoods without pretending it is an endpoint-affinity score.
+  // Last.fm similarity is directional. For route discovery, a returned local
+  // relationship is treated as undirected adjacency so asymmetric API results
+  // do not make the musical graph arbitrarily one-way.
   addOne(from, to);
   addOne(to, from);
 }
@@ -350,29 +362,100 @@ function dedupeFrontier(items: FrontierItem[], seen: Map<string, FrontierItem>, 
     .slice(0, cap);
 }
 
-export async function discoverGradientArtistPath(
-  fromArtist: string,
-  toArtist: string,
+function uniqueArtists(values: string[], cap = MAX_REGION_ANCHORS) {
+  const seen = new Set<string>();
+  const output: string[] = [];
+  for (const value of values) {
+    const name = value.trim();
+    const key = artistKey(name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    output.push(name);
+    if (output.length >= cap) break;
+  }
+  return output;
+}
+
+function bestShortestPath(
+  graph: Graph,
+  startKeys: string[],
+  endKeys: string[],
+): { path: PathResult; start: string; end: string } | null {
+  let best: { path: PathResult; start: string; end: string; adjusted: number } | null = null;
+  for (let startIndex = 0; startIndex < startKeys.length; startIndex++) {
+    const start = startKeys[startIndex]!;
+    for (let endIndex = 0; endIndex < endKeys.length; endIndex++) {
+      const end = endKeys[endIndex]!;
+      const path = shortestPath(graph, start, end);
+      if (!path) continue;
+      // Broad seeds are regions, but their higher-ranked representative artists
+      // should still be preferred when two graph routes are similarly good.
+      const adjusted = path.cost + startIndex * 0.12 + endIndex * 0.12;
+      if (!best || adjusted < best.adjusted) best = { path, start, end, adjusted };
+    }
+  }
+  return best ? { path: best.path, start: best.start, end: best.end } : null;
+}
+
+/**
+ * Discover one bounded graph route between two musical regions. Each side may
+ * expose several representative artists; they share one search budget instead
+ * of launching an expensive independent graph crawl for every anchor pair.
+ */
+export async function discoverGradientArtistPathBetweenRegions(
+  fromArtists: string[],
+  toArtists: string[],
   algorithm: Exclude<GradientAlgorithm, "blend">,
   provider: GradientGraphProvider = DEFAULT_GRAPH_PROVIDER,
-): Promise<{ path: PathResult | null; graph: Graph; queryCount: number }> {
+): Promise<RegionPathResult> {
   const graph = newGraph();
-  const start = rememberArtist(graph, fromArtist);
-  const end = rememberArtist(graph, toArtist);
-  if (!start || !end) return { path: null, graph, queryCount: 0 };
-  if (start === end) return { path: { keys: [start], cost: 0, edges: [] }, graph, queryCount: 0 };
+  const from = uniqueArtists(fromArtists);
+  const to = uniqueArtists(toArtists);
+  const startKeys = from.flatMap((artist) => {
+    const key = rememberArtist(graph, artist);
+    return key ? [key] : [];
+  });
+  const endKeys = to.flatMap((artist) => {
+    const key = rememberArtist(graph, artist);
+    return key ? [key] : [];
+  });
+  if (!startKeys.length || !endKeys.length) {
+    return { path: null, graph, queryCount: 0, fromArtist: null, toArtist: null };
+  }
+
+  const overlap = startKeys.find((key) => endKeys.includes(key));
+  if (overlap) {
+    const artist = graph.nodes.get(overlap)?.name ?? overlap;
+    return {
+      path: { keys: [overlap], cost: 0, edges: [] },
+      graph,
+      queryCount: 0,
+      fromArtist: artist,
+      toArtist: artist,
+    };
+  }
 
   const scenic = algorithm === "scenic";
-  const beamPerSide = scenic ? 4 : 3;
-  const frontierCap = scenic ? 42 : 28;
+  const beamPerSide = scenic ? 5 : 4;
+  const frontierCap = scenic ? 48 : 34;
   const neighborLimit = scenic ? 28 : 20;
-  const queryBudget = scenic ? 48 : 32;
+  const queryBudget = scenic ? 56 : 40;
   const maxRounds = scenic ? 8 : 7;
   const expanded = new Set<string>();
   let queryCount = 0;
   let foundAt: number | null = null;
-  let startFrontier: FrontierItem[] = [{ key: start, name: fromArtist, depth: 0, quality: 1 }];
-  let endFrontier: FrontierItem[] = [{ key: end, name: toArtist, depth: 0, quality: 1 }];
+  let startFrontier: FrontierItem[] = startKeys.map((key, index) => ({
+    key,
+    name: graph.nodes.get(key)!.name,
+    depth: 0,
+    quality: 1 / (1 + index * 0.2),
+  }));
+  let endFrontier: FrontierItem[] = endKeys.map((key, index) => ({
+    key,
+    name: graph.nodes.get(key)!.name,
+    depth: 0,
+    quality: 1 / (1 + index * 0.2),
+  }));
   const startSeen = new Map(startFrontier.map((item) => [item.key, item]));
   const endSeen = new Map(endFrontier.map((item) => [item.key, item]));
 
@@ -382,9 +465,9 @@ export async function discoverGradientArtistPath(
     if (!startBatch.length && !endBatch.length) break;
     const remaining = queryBudget - queryCount;
     const combined = [...startBatch, ...endBatch].slice(0, remaining);
-    const startKeys = new Set(startBatch.map((item) => item.key));
-    const actualStart = combined.filter((item) => startKeys.has(item.key));
-    const actualEnd = combined.filter((item) => !startKeys.has(item.key));
+    const startBatchKeys = new Set(startBatch.map((item) => item.key));
+    const actualStart = combined.filter((item) => startBatchKeys.has(item.key));
+    const actualEnd = combined.filter((item) => !startBatchKeys.has(item.key));
 
     const [left, right] = await Promise.all([
       expandBatch(graph, actualStart, provider, neighborLimit, expanded),
@@ -394,21 +477,35 @@ export async function discoverGradientArtistPath(
     startFrontier = dedupeFrontier(left.discovered, startSeen, frontierCap);
     endFrontier = dedupeFrontier(right.discovered, endSeen, frontierCap);
 
-    const path = shortestPath(graph, start, end);
-    if (path && foundAt == null) foundAt = queryCount;
-    // Once the frontiers have connected, spend a small bounded refinement
-    // budget so Dijkstra/scenic search can choose among more than the first
-    // accidental connection.
-    if (path && foundAt != null && queryCount >= foundAt + (scenic ? 12 : 6)) break;
+    const candidate = bestShortestPath(graph, startKeys, endKeys);
+    if (candidate && foundAt == null) foundAt = queryCount;
+    // Refine briefly after the first connection so the selected route is not
+    // just whichever representative pair happened to touch first.
+    if (candidate && foundAt != null && queryCount >= foundAt + (scenic ? 12 : 6)) break;
   }
 
-  const shortest = shortestPath(graph, start, end);
-  if (!shortest) return { path: null, graph, queryCount };
+  const shortest = bestShortestPath(graph, startKeys, endKeys);
+  if (!shortest) {
+    return { path: null, graph, queryCount, fromArtist: null, toArtist: null };
+  }
+  const path = scenic ? scenicPath(graph, shortest.start, shortest.end, shortest.path) : shortest.path;
   return {
-    path: scenic ? scenicPath(graph, start, end, shortest) : shortest,
+    path,
     graph,
     queryCount,
+    fromArtist: graph.nodes.get(shortest.start)?.name ?? shortest.start,
+    toArtist: graph.nodes.get(shortest.end)?.name ?? shortest.end,
   };
+}
+
+export async function discoverGradientArtistPath(
+  fromArtist: string,
+  toArtist: string,
+  algorithm: Exclude<GradientAlgorithm, "blend">,
+  provider: GradientGraphProvider = DEFAULT_GRAPH_PROVIDER,
+): Promise<{ path: PathResult | null; graph: Graph; queryCount: number }> {
+  const discovered = await discoverGradientArtistPathBetweenRegions([fromArtist], [toArtist], algorithm, provider);
+  return { path: discovered.path, graph: discovered.graph, queryCount: discovered.queryCount };
 }
 
 function parseSeedTracks(raw: string | null) {
@@ -426,17 +523,66 @@ function parseSeedTracks(raw: string | null) {
   }
 }
 
-function seedAnchorArtist(seed: RadioSeedRow): string | null {
-  if (seed.artist?.trim()) return seed.artist.trim();
-  const supplied = parseSeedTracks(seed.metadata_json).sort((a, b) => b.weight - a.weight);
-  return supplied[0]?.artist ?? null;
+function rankAnchorArtists(rows: Array<{ artist: string; weight: number }>, explicit?: string | null) {
+  const weighted = new Map<string, { artist: string; weight: number }>();
+  const add = (artist: string, weight: number) => {
+    const name = artist.trim();
+    const key = artistKey(name);
+    if (!key) return;
+    const current = weighted.get(key);
+    if (!current) weighted.set(key, { artist: name, weight });
+    else current.weight += weight;
+  };
+  if (explicit?.trim()) add(explicit, 5);
+  for (const row of rows) add(row.artist, Math.max(0.01, row.weight));
+  return [...weighted.values()]
+    .sort((a, b) => b.weight - a.weight || a.artist.localeCompare(b.artist))
+    .slice(0, MAX_REGION_ANCHORS)
+    .map((row) => row.artist);
+}
+
+async function genreAnchorArtists(label: string) {
+  const key = normalizeForComparison(label);
+  const now = Date.now();
+  const current = tagAnchorCache.get(key);
+  if (current && current.expires > now) return current.promise;
+  const promise = lastfm.getTagTopTracks(label, 24).then((tracks) => tracks.map((track) => ({
+    artist: track.artist,
+    weight: Math.max(0.05, track.match || 1),
+  })));
+  tagAnchorCache.set(key, { expires: now + ROUTE_CACHE_TTL_MS, promise });
+  try {
+    return await promise;
+  } catch (error) {
+    tagAnchorCache.delete(key);
+    throw error;
+  }
+}
+
+/**
+ * Explicit track/artist/album seeds are narrow anchors. Playlist, liked,
+ * library and collection seeds are musical regions represented by several
+ * distinct artists from their supplied snapshot. Genre seeds derive several
+ * representative artists from Last.fm rather than collapsing to one act.
+ */
+export async function gradientSeedAnchorArtists(seed: RadioSeedRow): Promise<string[]> {
+  const supplied = parseSeedTracks(seed.metadata_json);
+  if (["track", "artist", "album"].includes(seed.seed_type) && seed.artist?.trim()) {
+    return [seed.artist.trim()];
+  }
+  if (seed.seed_type === "genre") {
+    let genreRows: Array<{ artist: string; weight: number }> = [];
+    try { genreRows = await genreAnchorArtists(seed.label); } catch { /* fallback to supplied metadata */ }
+    return rankAnchorArtists([...supplied, ...genreRows], seed.artist);
+  }
+  return rankAnchorArtists(supplied, seed.artist);
 }
 
 function normalizedSeedPositions(seeds: RadioSeedRow[]) {
   return [...seeds]
     .map((seed, index) => ({
       seed,
-      position: clamp(seed.position ?? (seeds.length <= 1 ? 0 : index / (seeds.length - 1)), 0, 1),
+      position: clamp(seed.position ?? (seeds.length <= 1 ? 0 : index / Math.max(1, seeds.length - 1)), 0, 1),
     }))
     .sort((a, b) => a.position - b.position);
 }
@@ -485,6 +631,11 @@ export async function planGradientRoute(
   }
 
   const positioned = normalizedSeedPositions(seeds);
+  const anchorEntries = await Promise.all(positioned.map(async ({ seed }) => [
+    seed.id,
+    await gradientSeedAnchorArtists(seed),
+  ] as const));
+  const anchorsBySeed = new Map(anchorEntries);
   const nodes: GradientRouteNode[] = [];
   const segments: GradientRouteSegment[] = [];
   let queryCount = 0;
@@ -492,26 +643,28 @@ export async function planGradientRoute(
   for (let index = 0; index < positioned.length - 1; index++) {
     const left = positioned[index]!;
     const right = positioned[index + 1]!;
-    const fromArtist = seedAnchorArtist(left.seed);
-    const toArtist = seedAnchorArtist(right.seed);
-    const base: Omit<GradientRouteSegment, "connected" | "queryCount" | "confidence" | "edges"> = {
+    const fromAnchors = anchorsBySeed.get(left.seed.id) ?? [];
+    const toAnchors = anchorsBySeed.get(right.seed.id) ?? [];
+    const base = {
       index,
       fromSeedId: left.seed.id,
       toSeedId: right.seed.id,
       fromLabel: left.seed.label,
       toLabel: right.seed.label,
-      fromArtist,
-      toArtist,
+      fromArtist: fromAnchors[0] ?? null,
+      toArtist: toAnchors[0] ?? null,
+      fromAnchors,
+      toAnchors,
       fromPosition: left.position,
       toPosition: right.position,
     };
 
-    if (!fromArtist || !toArtist) {
+    if (!fromAnchors.length || !toAnchors.length) {
       segments.push({ ...base, connected: false, queryCount: 0, confidence: 0, edges: [], fallbackReason: "seed_has_no_artist_anchor" });
       continue;
     }
 
-    const discovered = await discoverGradientArtistPath(fromArtist, toArtist, algorithm, provider);
+    const discovered = await discoverGradientArtistPathBetweenRegions(fromAnchors, toAnchors, algorithm, provider);
     queryCount += discovered.queryCount;
     if (!discovered.path) {
       segments.push({ ...base, connected: false, queryCount: discovered.queryCount, confidence: 0, edges: [], fallbackReason: "no_graph_path_found" });
@@ -524,6 +677,8 @@ export async function planGradientRoute(
       : 1;
     segments.push({
       ...base,
+      fromArtist: discovered.fromArtist ?? base.fromArtist,
+      toArtist: discovered.toArtist ?? base.toArtist,
       connected: true,
       queryCount: discovered.queryCount,
       confidence: clamp(confidence, 0.05, 1),
@@ -631,6 +786,8 @@ export function gradientRouteDiagnostics(plan: GradientRoutePlan | null) {
       to: segment.toLabel,
       from_artist: segment.fromArtist,
       to_artist: segment.toArtist,
+      from_anchors: segment.fromAnchors ?? [],
+      to_anchors: segment.toAnchors ?? [],
       from_position: segment.fromPosition,
       to_position: segment.toPosition,
       connected: segment.connected,
