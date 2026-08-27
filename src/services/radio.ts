@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { ulid } from "ulid";
 import * as lastfm from "./lastfm";
+import * as listenbrainz from "./listenbrainz";
 import * as navidrome from "./navidrome";
 import { normalizeForComparison } from "../domain/normalization";
 import { getDb } from "../db/database";
@@ -247,6 +247,30 @@ async function collectSeedCandidates(
     }
   } catch (error) {
     errors.push(`${seed.label}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function collectListenBrainzCandidates(map: Map<string, Candidate>, errors: string[]) {
+  try {
+    const tracks = await listenbrainz.getRecommendationTracks(80);
+    for (const track of tracks) {
+      upsertCandidate(map, {
+        artist: track.artist,
+        title: track.title,
+        album: track.album,
+        mbid: track.recordingMbid,
+        provider: "listenbrainz",
+        providerScore: Math.max(0.05, Math.min(1, track.score)),
+        seedId: "__listenbrainz__",
+        seedScore: 0,
+        metadata: {
+          listenbrainzScore: track.score,
+          releaseYear: track.releaseYear ?? undefined,
+        },
+      });
+    }
+  } catch (error) {
+    errors.push(`ListenBrainz: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -543,6 +567,7 @@ async function generateCandidates(
   const errors: string[] = [];
   const map = new Map<string, Candidate>();
   for (const seed of seeds) await collectSeedCandidates(seed, map, errors);
+  await collectListenBrainzCandidates(map, errors);
 
   const tasteMap = await buildTasteMaps(tasteProfile);
   for (const track of tasteProfile ?? []) {
