@@ -46,17 +46,22 @@ function copy(track: RadioTrackRow) {
  * This guard runs only for a discovered graph route. Artist/album/genre seeds are
  * regions and therefore remain free to choose a representative recording.
  */
-export function enforceExplicitGradientTrackWaypoints(generationId: string) {
+export function enforceExplicitGradientTrackWaypoints(
+  generationId: string,
+  options: { fromPosition?: number } = {},
+) {
   const generation = getGeneration(generationId);
-  if (!generation || !routeIsUsable(generation.diagnostics_json)) return { applied: false, inserted: 0, moved: 0 };
+  if (!generation || !routeIsUsable(generation.diagnostics_json)) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0 };
   const tracks = getGenerationTracks(generationId);
-  if (!tracks.length) return { applied: false, inserted: 0, moved: 0 };
+  if (!tracks.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0 };
   const seeds = getSeeds(generation.station_id).filter((seed) => seed.seed_type === "track" && seed.artist && seed.title);
-  if (!seeds.length) return { applied: false, inserted: 0, moved: 0 };
+  if (!seeds.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0 };
 
   const output = tracks.map(copy);
+  const lockedPrefix = Math.max(0, options.fromPosition ?? 0);
   let inserted = 0;
   let moved = 0;
+  let skippedLocked = 0;
   const desired = seeds.map((seed, index) => ({
     seed,
     routePosition: Math.max(0, Math.min(1, seed.position ?? (seeds.length <= 1 ? index : index / (seeds.length - 1)))),
@@ -66,6 +71,11 @@ export function enforceExplicitGradientTrackWaypoints(generationId: string) {
     const key = canonicalRadioTrackKey(seed.artist!, seed.title!);
     const targetIndex = Math.max(0, Math.min(output.length - 1, Math.round(routePosition * Math.max(0, output.length - 1))));
     let sourceIndex = output.findIndex((track) => track.canonical_key === key);
+    if (targetIndex < lockedPrefix || (sourceIndex >= 0 && sourceIndex < lockedPrefix)) {
+      skippedLocked++;
+      continue;
+    }
+
     if (sourceIndex < 0) {
       const metadata = {
         gradientWaypoint: true,
@@ -93,18 +103,18 @@ export function enforceExplicitGradientTrackWaypoints(generationId: string) {
         trajectory_position: routePosition,
         metadata_json: JSON.stringify(metadata),
       });
-      // Preserve the requested finite length. Prefer dropping a non-waypoint
-      // track farthest from the inserted waypoint rather than another seed.
+      // Preserve the requested finite length. Prefer dropping an unlocked,
+      // non-waypoint track farthest from the inserted waypoint.
       if (output.length > generation.requested_length) {
         const waypointKeys = new Set(desired.map((item) => canonicalRadioTrackKey(item.seed.artist!, item.seed.title!)));
-        let drop = output.length - 1;
+        let drop = -1;
         let bestDistance = -1;
-        for (let i = 0; i < output.length; i++) {
+        for (let i = lockedPrefix; i < output.length; i++) {
           if (waypointKeys.has(output[i]!.canonical_key)) continue;
           const distance = Math.abs(i - targetIndex);
           if (distance > bestDistance) { bestDistance = distance; drop = i; }
         }
-        output.splice(drop, 1);
+        if (drop >= 0) output.splice(drop, 1);
       }
       inserted++;
       sourceIndex = output.findIndex((track) => track.canonical_key === key);
@@ -130,9 +140,9 @@ export function enforceExplicitGradientTrackWaypoints(generationId: string) {
     }
   }
 
-  if (!inserted && !moved) return { applied: true, inserted: 0, moved: 0 };
+  if (!inserted && !moved) return { applied: true, inserted: 0, moved: 0, skippedLocked };
   replaceGenerationTracks(generationId, output.slice(0, generation.requested_length));
-  return { applied: true, inserted, moved };
+  return { applied: true, inserted, moved, skippedLocked };
 }
 
 export function isSameGradientWaypointTrack(track: RadioTrackRow, artist: string, title: string) {
