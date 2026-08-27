@@ -13,7 +13,7 @@ const managerRadioSpec = {
   info: {
     title: "Music Manager Radio API",
     version: "1.0.0",
-    description: "Internal workstation API for editing finite saved Radio generations, importing external playlists, and managing local audio analysis. Not intended as the compact agent surface.",
+    description: "Internal workstation API for saved Radio generations, bounded live continuation, playlist import/editing, and local audio analysis. Not intended as the compact agent surface.",
   },
   servers: [{ url: "https://music-api.besto.me" }],
   security: [{ bearerAuth: [] }],
@@ -35,6 +35,22 @@ const managerRadioSpec = {
     },
     "/manager/v1/radio/stations/{id}/generate": {
       post: { operationId: "generateManagerRadioVersion", summary: "Generate another finite saved version", parameters: idParameter, responses: { "201": { description: "New generation" } } },
+    },
+    "/manager/v1/radio/stations/{id}/live-batch": {
+      post: {
+        operationId: "generateManagerLiveRadioBatch",
+        summary: "Generate an ephemeral bounded live continuation",
+        parameters: idParameter,
+        requestBody: { content: { "application/json": { schema: {
+          type: "object",
+          properties: {
+            count: { type: "integer", minimum: 4, maximum: 30 },
+            excludeKeys: { type: "array", maxItems: 5000, items: { type: "string" } },
+            tasteProfile: { type: "array", maxItems: 5000, items: { type: "object", additionalProperties: true } },
+          },
+        } } } },
+        responses: { "200": { description: "Ephemeral continuation batch; not retained as saved generation history" } },
+      },
     },
     "/manager/v1/radio/generations/{id}": {
       get: { operationId: "getManagerRadioGeneration", summary: "Get an exact saved Radio generation", parameters: idParameter, responses: { "200": { description: "Generation with exact track order" } } },
