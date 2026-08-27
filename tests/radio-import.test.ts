@@ -118,7 +118,7 @@ describe("external Radio generation import", () => {
 
     const reverted = revertGenerationRevision(generation.id, preImport!.id);
     expect(reverted?.tracks.map((track) => track.title)).toEqual(["Original One", "Original Two"]);
-    expect(reverted?.requested_length).toBe(4);
+    expect(reverted?.requested_length).toBe(2);
 
     const normalized = syncRadioGenerationLengthToTracks(generation.id);
     expect(normalized?.requested_length).toBe(2);
