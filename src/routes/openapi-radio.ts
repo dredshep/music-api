@@ -64,7 +64,7 @@ const spec = {
   info: {
     title: "Music Radio API",
     version: "1.0.0",
-    description: "Semantic API for finite, saved music radio stations and generations. Radio generations never silently mutate or auto-extend.",
+    description: "Semantic API for finite saved Radio plus explicit bounded live continuation. Saved generations never silently mutate or auto-extend.",
   },
   servers: [{ url: "https://music-api.besto.me" }],
   security: [{ bearerAuth: [] }],
@@ -115,6 +115,22 @@ const spec = {
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         requestBody: { content: { "application/json": { schema: { type: "object", properties: { length: { type: "integer", minimum: 1, maximum: 200 } } } } } },
         responses: { "201": { description: "New saved generation" } },
+      },
+    },
+    "/v1/radio/stations/{id}/live-batch": {
+      post: {
+        operationId: "continueLiveRadio",
+        summary: "Generate a bounded live continuation",
+        description: "Return an ephemeral continuation batch without adding it to saved-generation history. The caller explicitly requests each bounded batch and may exclude tracks already buffered.",
+        parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
+        requestBody: { content: { "application/json": { schema: {
+          type: "object",
+          properties: {
+            count: { type: "integer", minimum: 4, maximum: 30 },
+            excludeKeys: { type: "array", maxItems: 5000, items: { type: "string" } },
+          },
+        } } } },
+        responses: { "200": { description: "Ephemeral continuation batch" } },
       },
     },
     "/v1/radio/generations/{id}": {
