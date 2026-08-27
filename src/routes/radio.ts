@@ -2,9 +2,12 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { AppError } from "../middleware/errors";
 import {
+  cloneGeneration,
   createRadio,
   DEFAULT_RADIO_SETTINGS,
   generateStation,
+  insertManualGenerationTrack,
+  listGenerationRevisions,
   listRadioStations,
   pinGenerationTrack,
   presentGeneration,
@@ -13,6 +16,9 @@ import {
   regenerateTail,
   removeGenerationTrack,
   removeRadioStation,
+  reorderGenerationTracks,
+  resolveGenerationTracks,
+  revertGenerationRevision,
   updateRadioStation,
 } from "../services/radio";
 
@@ -26,6 +32,8 @@ const tasteTrackSchema = z.object({
   isrc: z.string().max(32).nullable().optional(),
   spotifyId: z.string().max(128).nullable().optional(),
   weight: z.number().min(0).max(10).optional(),
+  releaseYear: z.number().int().min(1900).max(2200).nullable().optional(),
+  popularity: z.number().min(0).max(1).nullable().optional(),
 });
 
 const seedSchema = z.object({
@@ -94,13 +102,10 @@ const feedbackSchema = z.object({
 });
 
 radioRoutes.get("/radio/defaults", (c) => c.json({ settings: DEFAULT_RADIO_SETTINGS }));
-
 radioRoutes.get("/radio/stations", (c) => c.json({ stations: listRadioStations() }));
 
 radioRoutes.post("/radio/stations", async (c) => {
-  const input = createSchema.parse(await c.req.json());
-  const result = await createRadio(input);
-  return c.json(result, 201);
+  return c.json(await createRadio(createSchema.parse(await c.req.json())), 201);
 });
 
 radioRoutes.get("/radio/stations/:id", (c) => {
@@ -110,8 +115,7 @@ radioRoutes.get("/radio/stations/:id", (c) => {
 });
 
 radioRoutes.patch("/radio/stations/:id", async (c) => {
-  const patch = updateSchema.parse(await c.req.json());
-  const station = updateRadioStation(c.req.param("id"), patch);
+  const station = updateRadioStation(c.req.param("id"), updateSchema.parse(await c.req.json()));
   if (!station) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   return c.json(station);
 });
@@ -133,10 +137,63 @@ radioRoutes.get("/radio/generations/:id", (c) => {
   return c.json(generation);
 });
 
+radioRoutes.post("/radio/generations/:id/clone", (c) => {
+  const generation = cloneGeneration(c.req.param("id"));
+  if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
+  return c.json(generation, 201);
+});
+
 radioRoutes.post("/radio/generations/:id/regenerate-tail", async (c) => {
   if (!presentGeneration(c.req.param("id"))) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
   const input = regenerateSchema.parse(await c.req.json());
   return c.json(await regenerateTail(c.req.param("id"), input.fromPosition, input.tasteProfile));
+});
+
+radioRoutes.post("/radio/generations/:id/resolve", async (c) => {
+  const body = z.object({ resolutions: z.array(z.object({
+    trackId: z.string().min(1),
+    spotifyId: z.string().nullable().optional(),
+    isrc: z.string().nullable().optional(),
+    album: z.string().nullable().optional(),
+    durationMs: z.number().int().nonnegative().nullable().optional(),
+  })).max(500) }).parse(await c.req.json());
+  const generation = resolveGenerationTracks(c.req.param("id"), body.resolutions);
+  if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
+  return c.json(generation);
+});
+
+radioRoutes.get("/radio/generations/:id/revisions", (c) => {
+  if (!presentGeneration(c.req.param("id"))) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
+  return c.json({ revisions: listGenerationRevisions(c.req.param("id")) });
+});
+
+radioRoutes.post("/radio/generations/:id/revisions/:revisionId/revert", (c) => {
+  const generation = revertGenerationRevision(c.req.param("id"), c.req.param("revisionId"));
+  if (!generation) throw new AppError("RADIO_REVISION_NOT_FOUND", "Radio generation revision not found", 404);
+  return c.json(generation);
+});
+
+radioRoutes.post("/radio/generations/:id/reorder", async (c) => {
+  const body = z.object({ trackIds: z.array(z.string().min(1)).min(1).max(500) }).parse(await c.req.json());
+  const generation = reorderGenerationTracks(c.req.param("id"), body.trackIds);
+  if (!generation) throw new AppError("RADIO_REORDER_INVALID", "Track order does not match this generation", 400);
+  return c.json(generation);
+});
+
+radioRoutes.post("/radio/generations/:id/tracks", async (c) => {
+  const body = z.object({
+    position: z.number().int().min(0).max(500),
+    artist: z.string().min(1).max(300),
+    title: z.string().min(1).max(500),
+    album: z.string().max(500).nullable().optional(),
+    durationMs: z.number().int().nonnegative().nullable().optional(),
+    spotifyId: z.string().max(128).nullable().optional(),
+    navidromeId: z.string().max(128).nullable().optional(),
+    isrc: z.string().max(32).nullable().optional(),
+  }).parse(await c.req.json());
+  const generation = insertManualGenerationTrack(c.req.param("id"), body);
+  if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
+  return c.json(generation, 201);
 });
 
 radioRoutes.post("/radio/generations/:id/tracks/:trackId/pin", async (c) => {
@@ -156,6 +213,8 @@ radioRoutes.delete("/radio/generations/:id/tracks/:trackId", (c) => {
 
 radioRoutes.post("/radio/feedback", async (c) => {
   const input = feedbackSchema.parse(await c.req.json());
-  if (input.scope === "station" && !input.stationId) throw new AppError("VALIDATION_ERROR", "stationId is required for station feedback", 400);
+  if (input.scope === "station" && !input.stationId) {
+    throw new AppError("VALIDATION_ERROR", "stationId is required for station feedback", 400);
+  }
   return c.json({ feedback: recordRadioFeedback(input) }, 201);
 });
