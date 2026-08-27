@@ -107,6 +107,14 @@ function queueAnalysis(generation: ReturnType<typeof presentGeneration> | null |
   if (generation?.id) queueRadioGenerationAnalysis(generation.id);
 }
 
+function normalizeSeedPositions<T extends { position?: number | null }>(seeds: T[], type: "standard" | "gradient"): T[] {
+  if (type !== "gradient") return seeds;
+  return seeds.map((seed, index) => ({
+    ...seed,
+    position: seed.position ?? (seeds.length <= 1 ? 0 : index / (seeds.length - 1)),
+  }));
+}
+
 radioRoutes.get("/radio/defaults", (c) => c.json({ settings: DEFAULT_RADIO_SETTINGS }));
 radioRoutes.get("/radio/stations", (c) => c.json({ stations: listRadioStations() }));
 
@@ -124,10 +132,13 @@ radioRoutes.get("/radio/stations/:id", (c) => {
 });
 
 radioRoutes.patch("/radio/stations/:id", async (c) => {
+  const stationId = c.req.param("id");
+  const current = presentStation(stationId);
+  if (!current) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   const patch = updateSchema.parse(await c.req.json());
-  const station = updateRadioStation(c.req.param("id"), patch.seeds
-    ? { ...patch, seeds: await hydrateNativeRadioSeeds(patch.seeds) }
-    : patch);
+  const hydratedSeeds = patch.seeds ? await hydrateNativeRadioSeeds(patch.seeds) : undefined;
+  const seeds = hydratedSeeds ? normalizeSeedPositions(hydratedSeeds, patch.type ?? current.type) : undefined;
+  const station = updateRadioStation(stationId, seeds ? { ...patch, seeds } : patch);
   if (!station) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   return c.json(station);
 });
