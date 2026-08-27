@@ -14,6 +14,7 @@ function parseObject(raw: string | null): Record<string, unknown> {
 }
 
 type RouteSupport = {
+  usable: boolean;
   intervals: Array<{ from: number; to: number }> | null;
 };
 
@@ -22,23 +23,23 @@ function routeSupport(raw: string | null): RouteSupport | null {
   const route = diagnostics.gradient_route;
   if (!route || typeof route !== "object" || Array.isArray(route)) return null;
   const routeRow = route as Record<string, unknown>;
-  if (routeRow.usable !== true) return null;
+  if (routeRow.usable !== true) return { usable: false, intervals: [] };
   // Older stored generations may predate per-leg diagnostics. In that case the
   // old all-or-nothing usable flag is the only information available.
-  if (!Array.isArray(routeRow.segments)) return { intervals: null };
+  if (!Array.isArray(routeRow.segments)) return { usable: true, intervals: null };
   const intervals = routeRow.segments.flatMap((segment) => {
     if (!segment || typeof segment !== "object" || Array.isArray(segment)) return [];
     const row = segment as Record<string, unknown>;
     if (row.connected !== true || typeof row.from_position !== "number" || typeof row.to_position !== "number") return [];
     return [{ from: Math.min(row.from_position, row.to_position), to: Math.max(row.from_position, row.to_position) }];
   });
-  return { intervals };
+  return { usable: true, intervals };
 }
 
 function supportsPosition(support: RouteSupport, position: number) {
-  return support.intervals == null || support.intervals.some((interval) =>
+  return support.usable && (support.intervals == null || support.intervals.some((interval) =>
     position >= interval.from - 1e-6 && position <= interval.to + 1e-6
-  );
+  ));
 }
 
 function copy(track: RadioTrackRow) {
@@ -103,14 +104,32 @@ function stampWaypoint(track: StoredCopy, artist: string, routePosition: number)
   });
 }
 
+function markUnpositionedWaypoint(track: StoredCopy) {
+  const meta = parseObject(track.metadata_json);
+  delete meta.gradientRoutePosition;
+  delete meta.gradientRouteConfidence;
+  delete meta.gradientRouteArtist;
+  delete meta.trajectoryCoordinateKind;
+  track.trajectory_position = null;
+  track.metadata_json = JSON.stringify({
+    ...meta,
+    gradientWaypoint: true,
+    gradientRouteUnsupported: true,
+  });
+}
+
 /**
  * A track waypoint is stronger than a recommendation hint: if the user asks for
  * Track A → Track B, those exact recordings must occur at their waypoint regions.
  * Artist/album/genre/broad collection seeds remain regions where the route may
- * choose representative recordings. On a partially connected multipoint route,
- * exact track waypoints are only stamped/enforced when their coordinate belongs
- * to a leg that was actually discovered; disconnected legs must never acquire a
- * fake authoritative `musical_route` coordinate.
+ * choose representative recordings.
+ *
+ * Route support and exact-track identity are intentionally separate concerns.
+ * On a partially connected or fully disconnected graph route, the requested
+ * recording is still enforced near its requested waypoint, but it remains
+ * unpositioned: no `musical_route` coordinate is fabricated for an undiscovered
+ * leg. A later local-resolution pass may still resolve that exact recording to
+ * Navidrome/Spotify normally.
  *
  * Prefix, pinned and manual slots are stronger user locks. Missing exact-waypoint
  * tracks replace the nearest generated/unlocked slot instead of inserting rows
@@ -123,18 +142,18 @@ export function enforceExplicitGradientTrackWaypoints(
 ) {
   const generation = getGeneration(generationId);
   const support = generation ? routeSupport(generation.diagnostics_json) : null;
-  if (!generation || !support) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0 };
+  if (!generation || !support) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
   const tracks = getGenerationTracks(generationId);
-  if (!tracks.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0 };
+  if (!tracks.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
   const seeds = getSeeds(generation.station_id).filter((seed) => seed.seed_type === "track" && seed.artist && seed.title);
-  if (!seeds.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0 };
+  if (!seeds.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
 
   const output = tracks.map(copy);
   const lockedPrefix = Math.max(0, options.fromPosition ?? 0);
   let inserted = 0;
   let moved = 0;
   let skippedLocked = 0;
-  let skippedUnsupported = 0;
+  let unpositioned = 0;
   const desired = seeds.map((seed, index) => ({
     seed,
     routePosition: Math.max(0, Math.min(1, seed.position ?? (seeds.length <= 1 ? index : index / (seeds.length - 1)))),
@@ -142,17 +161,16 @@ export function enforceExplicitGradientTrackWaypoints(
   const waypointKeys = new Set(desired.map((item) => canonicalRadioTrackKey(item.seed.artist!, item.seed.title!)));
 
   for (const { seed, routePosition } of desired) {
-    if (!supportsPosition(support, routePosition)) {
-      skippedUnsupported++;
-      continue;
-    }
+    const coordinateSupported = supportsPosition(support, routePosition);
+    if (!coordinateSupported) unpositioned++;
 
     const key = canonicalRadioTrackKey(seed.artist!, seed.title!);
     const idealIndex = Math.max(0, Math.min(output.length - 1, Math.round(routePosition * Math.max(0, output.length - 1))));
     let sourceIndex = output.findIndex((track) => track.canonical_key === key);
 
     if (sourceIndex >= 0) {
-      stampWaypoint(output[sourceIndex]!, seed.artist!, routePosition);
+      if (coordinateSupported) stampWaypoint(output[sourceIndex]!, seed.artist!, routePosition);
+      else markUnpositionedWaypoint(output[sourceIndex]!);
       if (isProtected(output[sourceIndex]!, sourceIndex, lockedPrefix)) {
         // Respect the user's lock even when it means the exact seed recording is
         // not physically located at its ideal route slot.
@@ -176,14 +194,18 @@ export function enforceExplicitGradientTrackWaypoints(
       skippedLocked++;
       continue;
     }
-    const metadata = {
+    const metadata: Record<string, unknown> = {
       gradientWaypoint: true,
-      gradientRoutePosition: routePosition,
-      gradientRouteConfidence: 1,
-      gradientRouteArtist: seed.artist,
-      trajectoryCoordinateKind: "musical_route",
-      providerScores: { seed: 1, gradient_route: 1 },
+      providerScores: { seed: 1, gradient_route: coordinateSupported ? 1 : 0 },
     };
+    if (coordinateSupported) {
+      metadata.gradientRoutePosition = routePosition;
+      metadata.gradientRouteConfidence = 1;
+      metadata.gradientRouteArtist = seed.artist;
+      metadata.trajectoryCoordinateKind = "musical_route";
+    } else {
+      metadata.gradientRouteUnsupported = true;
+    }
     output[targetIndex] = {
       canonical_key: key,
       artist: seed.artist!,
@@ -199,15 +221,15 @@ export function enforceExplicitGradientTrackWaypoints(
       pinned: 0,
       manual: 0,
       selection_score: 2,
-      trajectory_position: routePosition,
+      trajectory_position: coordinateSupported ? routePosition : null,
       metadata_json: JSON.stringify(metadata),
     };
     inserted++;
   }
 
-  if (!inserted && !moved) return { applied: true, inserted: 0, moved: 0, skippedLocked, skippedUnsupported };
+  if (!inserted && !moved) return { applied: true, inserted: 0, moved: 0, skippedLocked, skippedUnsupported: 0, unpositioned };
   replaceGenerationTracks(generationId, output);
-  return { applied: true, inserted, moved, skippedLocked, skippedUnsupported };
+  return { applied: true, inserted, moved, skippedLocked, skippedUnsupported: 0, unpositioned };
 }
 
 export function isSameGradientWaypointTrack(track: RadioTrackRow, artist: string, title: string) {
