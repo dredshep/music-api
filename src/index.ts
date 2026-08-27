@@ -94,4 +94,4 @@ warmLibraryDiskUsageCache();
 
 console.log(JSON.stringify({ level: "info", event: "server_started", port: config.PORT, timestamp: new Date().toISOString() }));
 
-export default { port: config.PORT, fetch: app.fetch };
+export default { port: config.PORT, fetch: app.fetch, idleTimeout: 120 };
