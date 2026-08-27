@@ -1,6 +1,7 @@
 import { getDb } from "../db/database";
 import { finalizeRadioGeneration } from "./radio-finalize";
-import { generateStation, presentStation, type TasteTrack } from "./radio";
+import { presentStation, type TasteTrack } from "./radio";
+import { generateRadioStationWithGradient } from "./radio-gradient-generation";
 import { refreshNativeRadioSeedSnapshots } from "./radio-native-seeds";
 
 export type LiveRadioBatchInput = {
@@ -12,10 +13,10 @@ export type LiveRadioBatchInput = {
 /**
  * Generate a bounded continuation batch without retaining a saved generation.
  *
- * We intentionally reuse the exact saved-generation ranking/finalization path,
- * then delete the temporary generation before returning. This keeps live Radio
- * musically identical to normal Radio while preserving the product invariant
- * that saved generations only appear when the user explicitly creates one.
+ * We intentionally reuse the same standard/Gradient dispatcher and finalizer as
+ * saved generations, then delete the temporary generation before returning.
+ * Gradient live sessions therefore follow the station's selected route algorithm
+ * instead of silently reverting to the old endpoint-blend implementation.
  */
 export async function generateLiveRadioBatch(stationId: string, input: LiveRadioBatchInput = {}) {
   const station = presentStation(stationId);
@@ -30,7 +31,7 @@ export async function generateLiveRadioBatch(stationId: string, input: LiveRadio
 
   let temporaryGenerationId: string | null = null;
   try {
-    const generated = await generateStation(stationId, {
+    const generated = await generateRadioStationWithGradient(stationId, {
       length: requested,
       tasteProfile: input.tasteProfile,
     });
