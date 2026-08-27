@@ -25,6 +25,7 @@ import { playerRoutes } from "./routes/player";
 import { openapiRoute } from "./routes/openapi";
 import { openapiManagerRoute } from "./routes/openapi-manager";
 import { openapiRadioRoute } from "./routes/openapi-radio";
+import { openapiManagerRadioRoute } from "./routes/openapi-manager-radio";
 import { managerRoutes } from "./routes/manager";
 import { initDatabase } from "./db/database";
 import { startCleanupTimer } from "./db/cleanup";
@@ -54,6 +55,7 @@ app.get("/health", (c) => c.json({ status: "ok" }));
 app.route("/", openapiRoute);
 app.route("/", openapiManagerRoute);
 app.route("/", openapiRadioRoute);
+app.route("/", openapiManagerRadioRoute);
 app.route("/", suggestionsUiRoute);
 
 app.use("/v1/*", authMiddleware());
