@@ -22,6 +22,8 @@ interface TrackIdentityRow {
   title: string;
 }
 
+type SimilarTrackProvider = typeof lastfm.getSimilarTracks;
+
 /**
  * Explicit More Like feedback is a taste direction, not merely a request to
  * replay the exact same recording. Resolve the rated track from saved Radio
@@ -32,6 +34,7 @@ export async function expandPositiveRadioFeedback(
   stationId: string,
   limitFeedbackItems = 8,
   similarPerItem = 24,
+  getSimilarTracks: SimilarTrackProvider = lastfm.getSimilarTracks,
 ): Promise<{ candidates: RadioFeedbackExpansionCandidate[]; errors: string[] }> {
   const db = getDb();
   const feedback = db.query<FeedbackRow, [string, number]>(`SELECT entity_key,strength,station_id
@@ -64,7 +67,7 @@ export async function expandPositiveRadioFeedback(
       : findGlobal.get(row.entity_key);
     if (!source) continue;
     try {
-      const similar = await lastfm.getSimilarTracks(source.artist, source.title, similarPerItem);
+      const similar = await getSimilarTracks(source.artist, source.title, similarPerItem);
       for (const track of similar) {
         candidates.push({
           artist: track.artist,
