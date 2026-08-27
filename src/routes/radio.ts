@@ -163,7 +163,7 @@ radioRoutes.get("/radio/generations/:id", (c) => {
 radioRoutes.post("/radio/generations/:id/clone", async (c) => {
   const generation = cloneGeneration(c.req.param("id"));
   if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
-  return c.json(await finalizeRadioGeneration(generation.id), 201);
+  return c.json(await finalizeRadioGeneration(generation.id, { resequence: false }), 201);
 });
 
 radioRoutes.post("/radio/generations/:id/regenerate-tail", async (c) => {
@@ -173,7 +173,7 @@ radioRoutes.post("/radio/generations/:id/regenerate-tail", async (c) => {
   const input = regenerateSchema.parse(await c.req.json());
   await refreshNativeRadioSeedSnapshots(existing.station_id);
   const generation = await regenerateTail(generationId, input.fromPosition, input.tasteProfile);
-  return c.json(await finalizeRadioGeneration(generation.id));
+  return c.json(await finalizeRadioGeneration(generation.id, { fromPosition: input.fromPosition }));
 });
 
 radioRoutes.post("/radio/generations/:id/resolve", async (c) => {
@@ -199,7 +199,7 @@ radioRoutes.post("/radio/generations/:id/revisions/:revisionId/revert", async (c
   if (!generation) throw new AppError("RADIO_REVISION_NOT_FOUND", "Radio generation revision not found", 404);
   const normalized = syncRadioGenerationLengthToTracks(generation.id);
   if (!normalized) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found after revision restore", 404);
-  return c.json(await finalizeRadioGeneration(normalized.id));
+  return c.json(await finalizeRadioGeneration(normalized.id, { resequence: false }));
 });
 
 radioRoutes.post("/radio/generations/:id/reorder", async (c) => {
@@ -222,7 +222,7 @@ radioRoutes.post("/radio/generations/:id/tracks", async (c) => {
   }).parse(await c.req.json());
   const generation = insertManualGenerationTrack(c.req.param("id"), body);
   if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
-  return c.json(await finalizeRadioGeneration(generation.id), 201);
+  return c.json(await finalizeRadioGeneration(generation.id, { resequence: false }), 201);
 });
 
 radioRoutes.post("/radio/generations/:id/tracks/:trackId/pin", async (c) => {
