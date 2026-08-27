@@ -8,6 +8,7 @@ describe("Manager Radio OpenAPI", () => {
     const spec = getManagerRadioOpenApiSpec();
     const paths = Object.keys(spec.paths);
     expect(paths.every((path) => path.startsWith("/manager/v1/radio/"))).toBe(true);
+    expect(paths).toContain("/manager/v1/radio/stations/{id}/live-batch");
     expect(paths).toContain("/manager/v1/radio/generations/{id}/regenerate-tail");
     expect(paths).toContain("/manager/v1/radio/generations/{id}/import-external");
     expect(paths).toContain("/manager/v1/radio/generations/{id}/analyze");
