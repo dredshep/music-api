@@ -18,6 +18,7 @@ import { suggestionsUiRoute } from "./routes/suggestions-ui";
 import { recommendationRoutes } from "./routes/recommendations";
 import { radioRoutes } from "./routes/radio";
 import { radioSemanticRoutes } from "./routes/radio-semantic";
+import { radioExternalRoutes } from "./routes/radio-external";
 import { lyricsRoutes } from "./routes/lyrics";
 import { playerRoutes } from "./routes/player";
 import { openapiRoute } from "./routes/openapi";
@@ -77,6 +78,7 @@ app.use("/manager/v1/*", authenticatedRateLimit());
 app.use("/manager/v1/*", loggingMiddleware());
 app.route("/manager/v1", managerRoutes);
 app.route("/manager/v1", radioRoutes);
+app.route("/manager/v1", radioExternalRoutes);
 
 startCleanupTimer();
 startReconciler();
