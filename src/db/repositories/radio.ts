@@ -48,6 +48,7 @@ export const DEFAULT_RADIO_SETTINGS: RadioSettings = {
     seed_collection: 0.85,
     lastfm_recent: 0.95,
     lastfm_history: 0.8,
+    local_history: 0.7,
     lastfm_similar: 0.9,
     lastfm_artist: 0.85,
     lastfm_album: 0.85,
