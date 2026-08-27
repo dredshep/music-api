@@ -21,7 +21,7 @@ import {
   revertGenerationRevision,
   updateRadioStation,
 } from "../services/radio";
-import { hydrateNativeRadioSeeds } from "../services/radio-native-seeds";
+import { hydrateNativeRadioSeeds, refreshNativeRadioSeedSnapshots } from "../services/radio-native-seeds";
 import { queueRadioGenerationAnalysis } from "../services/audio-analysis";
 
 export const radioRoutes = new Hono();
@@ -138,9 +138,11 @@ radioRoutes.delete("/radio/stations/:id", (c) => {
 });
 
 radioRoutes.post("/radio/stations/:id/generate", async (c) => {
-  if (!presentStation(c.req.param("id"))) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
+  const stationId = c.req.param("id");
+  if (!presentStation(stationId)) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   const input = generateSchema.parse(await c.req.json().catch(() => ({}))) ?? {};
-  const generation = await generateStation(c.req.param("id"), input);
+  await refreshNativeRadioSeedSnapshots(stationId);
+  const generation = await generateStation(stationId, input);
   queueAnalysis(generation);
   return c.json(generation, 201);
 });
@@ -159,9 +161,12 @@ radioRoutes.post("/radio/generations/:id/clone", (c) => {
 });
 
 radioRoutes.post("/radio/generations/:id/regenerate-tail", async (c) => {
-  if (!presentGeneration(c.req.param("id"))) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
+  const generationId = c.req.param("id");
+  const existing = presentGeneration(generationId);
+  if (!existing) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
   const input = regenerateSchema.parse(await c.req.json());
-  const generation = await regenerateTail(c.req.param("id"), input.fromPosition, input.tasteProfile);
+  await refreshNativeRadioSeedSnapshots(existing.station_id);
+  const generation = await regenerateTail(generationId, input.fromPosition, input.tasteProfile);
   queueAnalysis(generation);
   return c.json(generation);
 });
