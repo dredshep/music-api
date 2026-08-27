@@ -12,10 +12,10 @@ describe("Radio provider identity", () => {
 
   test("all supplied-seed provider buckets have explicit configurable defaults", () => {
     for (const key of ["navidrome_library", "spotify_taste", "spotify_playlist", "collection_seed"]) {
-      expect(DEFAULT_RADIO_SETTINGS.providerWeights[key]).toBeNumber();
-      expect(DEFAULT_RADIO_SETTINGS.providerWeights[key]).toBeGreaterThan(0);
+      expect(typeof DEFAULT_RADIO_SETTINGS.providerWeights[key]).toBe("number");
+      expect(DEFAULT_RADIO_SETTINGS.providerWeights[key]!).toBeGreaterThan(0);
     }
-    expect(DEFAULT_RADIO_SETTINGS.providerWeights.spotify_taste)
+    expect(DEFAULT_RADIO_SETTINGS.providerWeights.spotify_taste!)
       .toBeGreaterThan(DEFAULT_RADIO_SETTINGS.providerWeights.navidrome_library!);
   });
 });
