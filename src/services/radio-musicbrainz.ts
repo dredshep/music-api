@@ -19,6 +19,8 @@ export type RadioMusicBrainzCandidate = {
   releaseYear: number | null;
 };
 
+export const MAX_MUSICBRAINZ_RADIO_QUERIES = 3;
+
 function quote(value: string) {
   return `"${value.replaceAll('"', '\\"')}"`;
 }
@@ -39,11 +41,25 @@ export function musicBrainzQueryForRadioSeed(seed: RadioMusicBrainzSeed): string
   return null;
 }
 
+export function planMusicBrainzRadioQueries(seeds: RadioMusicBrainzSeed[]) {
+  const seen = new Set<string>();
+  return seeds
+    .map((seed, index) => ({ seed, index, query: musicBrainzQueryForRadioSeed(seed) }))
+    .filter((row): row is { seed: RadioMusicBrainzSeed; index: number; query: string } => Boolean(row.query))
+    .sort((a, b) => b.seed.weight - a.seed.weight || a.index - b.index)
+    .filter((row) => {
+      if (seen.has(row.query)) return false;
+      seen.add(row.query);
+      return true;
+    })
+    .slice(0, MAX_MUSICBRAINZ_RADIO_QUERIES);
+}
+
 /**
  * MusicBrainz is metadata/relationship-oriented rather than a recommendation
  * service, so it is intentionally a low-weight independent candidate source.
- * One cached search per semantic seed is enough to add discography/tag evidence
- * without turning Radio generation into a MusicBrainz crawl.
+ * Queries are deduplicated and capped to three weighted seeds so the provider's
+ * strict rate limit cannot make a many-seed Radio several seconds slower.
  */
 export async function getMusicBrainzRadioCandidates(
   seeds: RadioMusicBrainzSeed[],
@@ -53,9 +69,7 @@ export async function getMusicBrainzRadioCandidates(
   const candidates: RadioMusicBrainzCandidate[] = [];
   const errors: string[] = [];
 
-  for (const seed of seeds.slice(0, 8)) {
-    const query = musicBrainzQueryForRadioSeed(seed);
-    if (!query) continue;
+  for (const { seed, query } of planMusicBrainzRadioQueries(seeds)) {
     try {
       const rows = await musicbrainz.searchRecordings(query, seed.seed_type === "artist" ? 35 : 20);
       for (const row of rows) {
