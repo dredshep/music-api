@@ -10,7 +10,7 @@ export type LiveRadioBatchInput = {
 };
 
 /**
- * Generate a bounded continuation batch without creating a saved Generation.
+ * Generate a bounded continuation batch without retaining a saved generation.
  *
  * We intentionally reuse the exact saved-generation ranking/finalization path,
  * then delete the temporary generation before returning. This keeps live Radio
@@ -35,7 +35,7 @@ export async function generateLiveRadioBatch(stationId: string, input: LiveRadio
       tasteProfile: input.tasteProfile,
     });
     temporaryGenerationId = generated.id;
-    const finalized = await finalizeRadioGeneration(generated.id);
+    const finalized = await finalizeRadioGeneration(generated.id, { queueAnalysis: false });
     if (!finalized) return null;
 
     const tracks = finalized.tracks
