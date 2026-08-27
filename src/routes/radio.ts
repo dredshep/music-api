@@ -35,6 +35,7 @@ const tasteTrackSchema = z.object({
   isrc: z.string().max(32).nullable().optional(),
   spotifyId: z.string().max(128).nullable().optional(),
   weight: z.number().min(0).max(10).optional(),
+  source: z.enum(["spotify", "local_history"]).optional(),
   releaseYear: z.number().int().min(1900).max(2200).nullable().optional(),
   popularity: z.number().min(0).max(1).nullable().optional(),
 });
