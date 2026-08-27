@@ -30,7 +30,7 @@ afterAll(() => {
   try { unlinkSync(dbPath); } catch {}
 });
 
-function stored(artist: string, title: string, position: number, route: number) {
+function stored(artist: string, title: string, position: number, route: number, input: { pinned?: boolean; manual?: boolean } = {}) {
   return {
     position,
     canonical_key: canonicalRadioTrackKey(artist, title),
@@ -44,8 +44,8 @@ function stored(artist: string, title: string, position: number, route: number) 
     musicbrainz_id: null,
     playback_source: null,
     availability_status: "unknown",
-    pinned: 0,
-    manual: 0,
+    pinned: input.pinned ? 1 : 0,
+    manual: input.manual ? 1 : 0,
     selection_score: 1,
     trajectory_position: route,
     metadata_json: JSON.stringify({ trajectoryCoordinateKind: "musical_route" }),
@@ -89,7 +89,7 @@ describe("explicit Gradient track waypoint guard", () => {
     expect(tracks.at(-1)!.trajectory_position).toBe(1);
   });
 
-  test("does not rewrite an explicit waypoint inside a locked regenerate prefix", () => {
+  test("does not rewrite a locked regenerate prefix and resumes the exact route after it", () => {
     const station = createStation({
       name: "Locked track path",
       type: "gradient",
@@ -111,9 +111,48 @@ describe("explicit Gradient track waypoint guard", () => {
       stored("B", "B track", 2, 1),
     ]);
     finishGeneration(generation.id, "ready", { gradient_route: { usable: true } });
-    const result = enforceExplicitGradientTrackWaypoints(generation.id, { fromPosition: 1 });
-    expect(result.skippedLocked).toBeGreaterThan(0);
-    expect(getGenerationTracks(generation.id)[0]!.title).toBe("Prefix");
+    enforceExplicitGradientTrackWaypoints(generation.id, { fromPosition: 1 });
+    const tracks = getGenerationTracks(generation.id);
+    expect(tracks[0]!.title).toBe("Prefix");
+    expect(tracks[0]!.artist).toBe("User kept");
+    expect(tracks.slice(1).map((track) => track.canonical_key)).toContain(canonicalRadioTrackKey("A", "A track"));
+  });
+
+  test("never shifts pinned or manual slots while enforcing missing exact waypoints", () => {
+    const station = createStation({
+      name: "Protected slots",
+      type: "gradient",
+      seeds: [
+        { type: "track", artist: "A", title: "A track", label: "A track", position: 0 },
+        { type: "track", artist: "B", title: "B track", label: "B track", position: 1 },
+      ],
+    });
+    const generation = createGeneration({
+      stationId: station.id,
+      requestedLength: 5,
+      generatorVersion: "test",
+      randomSeed: "protected",
+      settingsSnapshot: parseRadioSettings(station.settings_json),
+    });
+    replaceGenerationTracks(generation.id, [
+      stored("Generated", "Start", 0, 0.1),
+      stored("Pinned Artist", "Pinned", 1, 0.3, { pinned: true }),
+      stored("Generated", "Middle", 2, 0.5),
+      stored("Manual Artist", "Manual", 3, 0.7, { manual: true }),
+      stored("Generated", "End", 4, 0.9),
+    ]);
+    finishGeneration(generation.id, "ready", { gradient_route: { usable: true } });
+
+    const result = enforceExplicitGradientTrackWaypoints(generation.id);
+    expect(result.inserted).toBe(2);
+    const tracks = getGenerationTracks(generation.id);
+    expect(tracks).toHaveLength(5);
+    expect(tracks[1]!.title).toBe("Pinned");
+    expect(tracks[1]!.pinned).toBe(1);
+    expect(tracks[3]!.title).toBe("Manual");
+    expect(tracks[3]!.manual).toBe(1);
+    expect(tracks[0]!.canonical_key).toBe(canonicalRadioTrackKey("A", "A track"));
+    expect(tracks[4]!.canonical_key).toBe(canonicalRadioTrackKey("B", "B track"));
   });
 
   test("does not stamp a track waypoint onto a disconnected route leg", () => {
