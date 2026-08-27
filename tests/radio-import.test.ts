@@ -23,7 +23,7 @@ afterAll(() => {
 });
 
 describe("external Radio generation import", () => {
-  test("updates requested length to the exact imported playlist length", () => {
+  test("keeps exact playlist length and prefers resolved local playback", async () => {
     const station = createStation({
       name: "Spotify round trip",
       seeds: [{ type: "artist", artist: "A", label: "A" }],
@@ -37,18 +37,31 @@ describe("external Radio generation import", () => {
       settingsSnapshot: parseRadioSettings(station.settings_json),
     });
 
-    const imported = importExternalGeneration(generation.id, [
+    const imported = await importExternalGeneration(generation.id, [
       { artist: "A", title: "One", spotifyId: "sp1" },
       { artist: "B", title: "Two", spotifyId: "sp2" },
       { artist: "C", title: "Three", spotifyId: "sp3" },
-    ]);
+    ], async (tracks) => tracks.map((track, index) => index === 0
+      ? { ...track, navidromeId: "nd1", album: "Local Album" }
+      : track));
 
     expect(imported?.requested_length).toBe(3);
     expect(imported?.tracks).toHaveLength(3);
     expect(imported?.tracks.map((track) => track.spotify_id)).toEqual(["sp1", "sp2", "sp3"]);
+    expect(imported?.tracks[0]).toMatchObject({
+      navidrome_id: "nd1",
+      playback_source: "navidrome",
+      availability: "local",
+    });
+    expect(imported?.tracks[1]).toMatchObject({
+      navidrome_id: null,
+      playback_source: "spotify",
+      availability: "spotify",
+    });
     expect(imported?.diagnostics).toMatchObject({
       imported_external_playlist: true,
       imported_track_count: 3,
+      local_match_count: 1,
     });
   });
 });
