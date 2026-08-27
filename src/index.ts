@@ -17,6 +17,7 @@ import { suggestionRoutes } from "./routes/suggestions";
 import { suggestionsUiRoute } from "./routes/suggestions-ui";
 import { recommendationRoutes } from "./routes/recommendations";
 import { radioRoutes } from "./routes/radio";
+import { radioSemanticRoutes } from "./routes/radio-semantic";
 import { lyricsRoutes } from "./routes/lyrics";
 import { playerRoutes } from "./routes/player";
 import { openapiRoute } from "./routes/openapi";
@@ -29,7 +30,6 @@ import { warmLibraryDiskUsageCache } from "./services/library-storage";
 import { startReconciler } from "./services/download-reconciler";
 
 const config = loadConfig();
-
 initDatabase();
 
 const app = new Hono<{ Variables: AppVariables }>();
@@ -68,7 +68,7 @@ app.route("/v1", downloadFileControlRoutes);
 app.route("/v1", acquisitionRoutes);
 app.route("/v1", suggestionRoutes);
 app.route("/v1", recommendationRoutes);
-app.route("/v1", radioRoutes);
+app.route("/v1", radioSemanticRoutes);
 app.route("/v1", lyricsRoutes);
 app.route("/v1", playerRoutes);
 
