@@ -21,6 +21,8 @@ import {
   revertGenerationRevision,
   updateRadioStation,
 } from "../services/radio";
+import { hydrateNativeRadioSeeds } from "../services/radio-native-seeds";
+import { queueRadioGenerationAnalysis } from "../services/audio-analysis";
 
 export const radioRoutes = new Hono();
 
@@ -101,11 +103,18 @@ const feedbackSchema = z.object({
   strength: z.number().min(0.1).max(5).optional(),
 });
 
+function queueAnalysis(generation: ReturnType<typeof presentGeneration> | null | undefined) {
+  if (generation?.id) queueRadioGenerationAnalysis(generation.id);
+}
+
 radioRoutes.get("/radio/defaults", (c) => c.json({ settings: DEFAULT_RADIO_SETTINGS }));
 radioRoutes.get("/radio/stations", (c) => c.json({ stations: listRadioStations() }));
 
 radioRoutes.post("/radio/stations", async (c) => {
-  return c.json(await createRadio(createSchema.parse(await c.req.json())), 201);
+  const input = createSchema.parse(await c.req.json());
+  const result = await createRadio({ ...input, seeds: await hydrateNativeRadioSeeds(input.seeds) });
+  queueAnalysis(result.generation);
+  return c.json(result, 201);
 });
 
 radioRoutes.get("/radio/stations/:id", (c) => {
@@ -115,7 +124,10 @@ radioRoutes.get("/radio/stations/:id", (c) => {
 });
 
 radioRoutes.patch("/radio/stations/:id", async (c) => {
-  const station = updateRadioStation(c.req.param("id"), updateSchema.parse(await c.req.json()));
+  const patch = updateSchema.parse(await c.req.json());
+  const station = updateRadioStation(c.req.param("id"), patch.seeds
+    ? { ...patch, seeds: await hydrateNativeRadioSeeds(patch.seeds) }
+    : patch);
   if (!station) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   return c.json(station);
 });
@@ -128,7 +140,9 @@ radioRoutes.delete("/radio/stations/:id", (c) => {
 radioRoutes.post("/radio/stations/:id/generate", async (c) => {
   if (!presentStation(c.req.param("id"))) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   const input = generateSchema.parse(await c.req.json().catch(() => ({}))) ?? {};
-  return c.json(await generateStation(c.req.param("id"), input), 201);
+  const generation = await generateStation(c.req.param("id"), input);
+  queueAnalysis(generation);
+  return c.json(generation, 201);
 });
 
 radioRoutes.get("/radio/generations/:id", (c) => {
@@ -140,13 +154,16 @@ radioRoutes.get("/radio/generations/:id", (c) => {
 radioRoutes.post("/radio/generations/:id/clone", (c) => {
   const generation = cloneGeneration(c.req.param("id"));
   if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
+  queueAnalysis(generation);
   return c.json(generation, 201);
 });
 
 radioRoutes.post("/radio/generations/:id/regenerate-tail", async (c) => {
   if (!presentGeneration(c.req.param("id"))) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
   const input = regenerateSchema.parse(await c.req.json());
-  return c.json(await regenerateTail(c.req.param("id"), input.fromPosition, input.tasteProfile));
+  const generation = await regenerateTail(c.req.param("id"), input.fromPosition, input.tasteProfile);
+  queueAnalysis(generation);
+  return c.json(generation);
 });
 
 radioRoutes.post("/radio/generations/:id/resolve", async (c) => {
@@ -170,6 +187,7 @@ radioRoutes.get("/radio/generations/:id/revisions", (c) => {
 radioRoutes.post("/radio/generations/:id/revisions/:revisionId/revert", (c) => {
   const generation = revertGenerationRevision(c.req.param("id"), c.req.param("revisionId"));
   if (!generation) throw new AppError("RADIO_REVISION_NOT_FOUND", "Radio generation revision not found", 404);
+  queueAnalysis(generation);
   return c.json(generation);
 });
 
@@ -193,6 +211,7 @@ radioRoutes.post("/radio/generations/:id/tracks", async (c) => {
   }).parse(await c.req.json());
   const generation = insertManualGenerationTrack(c.req.param("id"), body);
   if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
+  queueAnalysis(generation);
   return c.json(generation, 201);
 });
 
