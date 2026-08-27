@@ -133,8 +133,8 @@ function markUnpositionedWaypoint(track: StoredCopy) {
  *
  * Prefix, pinned and manual slots are stronger user locks. Missing exact-waypoint
  * tracks replace the nearest generated/unlocked slot instead of inserting rows
- * and shifting pins. Existing unlocked waypoint tracks are swapped into place so
- * every protected position remains byte-for-byte at the same playlist index.
+ * and shifting pins. Existing protected tracks remain byte-for-byte untouched;
+ * existing editable waypoint tracks may be stamped and moved into place.
  */
 export function enforceExplicitGradientTrackWaypoints(
   generationId: string,
@@ -170,15 +170,15 @@ export function enforceExplicitGradientTrackWaypoints(
     const sourceIndex = output.findIndex((track) => track.canonical_key === key);
 
     if (sourceIndex >= 0) {
-      if (coordinateSupported) stampWaypoint(output[sourceIndex]!, seed.artist!, routePosition);
-      else markUnpositionedWaypoint(output[sourceIndex]!);
-      updated++;
       if (isProtected(output[sourceIndex]!, sourceIndex, lockedPrefix)) {
-        // Respect the user's lock even when it means the exact seed recording is
-        // not physically located at its ideal route slot.
+        // User locks are stronger than both physical waypoint placement and our
+        // route metadata normalization. Do not mutate the protected row at all.
         if (sourceIndex !== idealIndex) skippedLocked++;
         continue;
       }
+      if (coordinateSupported) stampWaypoint(output[sourceIndex]!, seed.artist!, routePosition);
+      else markUnpositionedWaypoint(output[sourceIndex]!);
+      updated++;
       const targetIndex = nearestReplaceableIndex(output, idealIndex, lockedPrefix, waypointKeys, key);
       if (targetIndex < 0) {
         skippedLocked++;
