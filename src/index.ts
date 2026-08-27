@@ -20,6 +20,8 @@ import { radioRoutes } from "./routes/radio";
 import { radioSemanticRoutes } from "./routes/radio-semantic";
 import { radioExternalRoutes } from "./routes/radio-external";
 import { radioAnalysisRoutes } from "./routes/radio-analysis";
+import { radioLiveManagerRoutes } from "./routes/radio-live-manager";
+import { radioLiveSemanticRoutes } from "./routes/radio-live-semantic";
 import { lyricsRoutes } from "./routes/lyrics";
 import { playerRoutes } from "./routes/player";
 import { openapiRoute } from "./routes/openapi";
@@ -73,6 +75,7 @@ app.route("/v1", acquisitionRoutes);
 app.route("/v1", suggestionRoutes);
 app.route("/v1", recommendationRoutes);
 app.route("/v1", radioSemanticRoutes);
+app.route("/v1", radioLiveSemanticRoutes);
 app.route("/v1", lyricsRoutes);
 app.route("/v1", playerRoutes);
 
@@ -83,6 +86,7 @@ app.route("/manager/v1", managerRoutes);
 app.route("/manager/v1", radioRoutes);
 app.route("/manager/v1", radioExternalRoutes);
 app.route("/manager/v1", radioAnalysisRoutes);
+app.route("/manager/v1", radioLiveManagerRoutes);
 
 startCleanupTimer();
 startReconciler();
