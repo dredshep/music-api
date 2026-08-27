@@ -23,6 +23,7 @@ import {
 } from "../services/radio";
 import { hydrateNativeRadioSeeds, refreshNativeRadioSeedSnapshots } from "../services/radio-native-seeds";
 import { finalizeRadioGeneration } from "../services/radio-finalize";
+import { syncRadioGenerationLengthToTracks } from "../services/radio-generation-metadata";
 
 export const radioRoutes = new Hono();
 
@@ -196,7 +197,9 @@ radioRoutes.get("/radio/generations/:id/revisions", (c) => {
 radioRoutes.post("/radio/generations/:id/revisions/:revisionId/revert", async (c) => {
   const generation = revertGenerationRevision(c.req.param("id"), c.req.param("revisionId"));
   if (!generation) throw new AppError("RADIO_REVISION_NOT_FOUND", "Radio generation revision not found", 404);
-  return c.json(await finalizeRadioGeneration(generation.id));
+  const normalized = syncRadioGenerationLengthToTracks(generation.id);
+  if (!normalized) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found after revision restore", 404);
+  return c.json(await finalizeRadioGeneration(normalized.id));
 });
 
 radioRoutes.post("/radio/generations/:id/reorder", async (c) => {
