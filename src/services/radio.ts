@@ -7,6 +7,8 @@ import { buildNegativeRadioFeedbackPenalties } from "./radio-negative-feedback";
 import { normalizeRadioPopularity } from "./radio-popularity";
 import { buildLastFmTasteMap } from "./radio-lastfm-taste";
 import { radioGenreAffinity } from "./radio-genre-affinity";
+import { getMusicBrainzRadioCandidates } from "./radio-musicbrainz";
+import { buildRadioHistoryPenalties, type RadioHistoryPenalties } from "./radio-repeat-history";
 import { normalizeForComparison } from "../domain/normalization";
 import { getDb } from "../db/database";
 import {
@@ -45,6 +47,7 @@ export interface TasteTrack {
   spotifyId?: string | null;
   navidromeId?: string | null;
   weight?: number;
+  source?: "spotify" | "local_history";
   releaseYear?: number | null;
   popularity?: number | null;
 }
@@ -76,6 +79,13 @@ interface Candidate {
   selectionScore: number;
   metadata: Record<string, unknown>;
 }
+
+type TasteSignals = {
+  recent: number;
+  historical: number;
+  spotify: number;
+  local: number;
+};
 
 /** Common cross-provider identity; provider IDs remain aliases/evidence. */
 export function canonicalRadioTrackKey(artist: string, title: string): string {
@@ -294,6 +304,31 @@ async function collectListenBrainzCandidates(map: Map<string, Candidate>, errors
   }
 }
 
+async function collectMusicBrainzCandidates(
+  seeds: ReturnType<typeof getSeeds>,
+  map: Map<string, Candidate>,
+  errors: string[],
+  enabled: boolean,
+) {
+  const result = await getMusicBrainzRadioCandidates(seeds, enabled);
+  errors.push(...result.errors);
+  for (const track of result.candidates) {
+    upsertCandidate(map, {
+      artist: track.artist,
+      title: track.title,
+      mbid: track.recordingMbid,
+      provider: "musicbrainz",
+      providerScore: track.score,
+      seedId: track.seedId,
+      seedScore: track.seedWeight * track.score * 0.25,
+      metadata: {
+        musicbrainzScore: track.score,
+        releaseYear: track.releaseYear ?? undefined,
+      },
+    });
+  }
+}
+
 async function collectFeedbackExpansionCandidates(
   stationId: string,
   map: Map<string, Candidate>,
@@ -322,14 +357,15 @@ async function collectFeedbackExpansionCandidates(
 
 async function buildTasteMaps(tasteProfile: TasteTrack[] = []) {
   const lastfmTaste = await buildLastFmTasteMap();
-  const map = new Map<string, { recent: number; historical: number; spotify: number }>();
+  const map = new Map<string, TasteSignals>();
   for (const [key, row] of lastfmTaste) {
-    map.set(key, { recent: row.recent, historical: row.historical, spotify: 0 });
+    map.set(key, { recent: row.recent, historical: row.historical, spotify: 0, local: 0 });
   }
   for (const track of tasteProfile) {
     const key = canonicalRadioTrackKey(track.artist, track.title);
-    const row = map.get(key) ?? { recent: 0, historical: 0, spotify: 0 };
-    row.spotify = Math.max(row.spotify, track.weight ?? 1);
+    const row = map.get(key) ?? { recent: 0, historical: 0, spotify: 0, local: 0 };
+    if (track.source === "local_history") row.local = Math.max(row.local, track.weight ?? 1);
+    else row.spotify = Math.max(row.spotify, track.weight ?? 1);
     map.set(key, row);
   }
   return map;
@@ -439,28 +475,15 @@ function feedbackAdjustment(candidate: Candidate, feedback: ReturnType<typeof li
   return { banned: false, score };
 }
 
-function recentStationTrackKeys(stationId: string, maxTracks: number): Set<string> {
-  if (maxTracks <= 0) return new Set();
-  const keys = new Set<string>();
-  let seen = 0;
-  for (const generation of listGenerations(stationId)) {
-    for (const track of getGenerationTracks(generation.id)) {
-      keys.add(track.canonical_key);
-      if (++seen >= maxTracks) return keys;
-    }
-  }
-  return keys;
-}
-
 function scoreCandidates(
   candidates: Candidate[],
   settings: RadioSettings,
   seeds: ReturnType<typeof getSeeds>,
-  tasteMap: Map<string, { recent: number; historical: number; spotify: number }>,
+  tasteMap: Map<string, TasteSignals>,
   feedback: ReturnType<typeof listFeedback>,
   negativeNeighborhood: Map<string, number>,
   randomSeed: string,
-  recentKeys: Set<string>,
+  history: RadioHistoryPenalties,
 ): Candidate[] {
   const seedArtists = new Set(seeds.map((s) => normalizeForComparison(s.artist ?? "")).filter(Boolean));
   const currentYear = new Date().getUTCFullYear();
@@ -472,11 +495,11 @@ function scoreCandidates(
       continue;
     }
 
-    const taste = tasteMap.get(candidate.key) ?? { recent: 0, historical: 0, spotify: 0 };
+    const taste = tasteMap.get(candidate.key) ?? { recent: 0, historical: 0, spotify: 0, local: 0 };
     const provider = Object.entries(candidate.providerScores)
       .reduce((sum, [name, value]) => sum + value * (settings.providerWeights[name] ?? 0.55), 0);
     const seedAffinity = Object.values(candidate.seedScores).reduce((a, b) => a + b, 0);
-    const familiar = Math.max(candidate.familiarity, taste.spotify, taste.recent, taste.historical * 0.8);
+    const familiar = Math.max(candidate.familiarity, taste.spotify, taste.local, taste.recent, taste.historical * 0.8);
     candidate.familiarity = familiar;
 
     const familiarityPreference = (settings.familiarity - 0.5) * 2;
@@ -493,6 +516,7 @@ function scoreCandidates(
     const sameArtist = seedArtists.has(normalizeForComparison(candidate.artist)) ? settings.sameArtistBias : 0;
     const tasteScore =
       taste.spotify * (settings.providerWeights.spotify_taste ?? 1) +
+      taste.local * (settings.providerWeights.local_history ?? 0.7) +
       taste.recent * (settings.providerWeights.lastfm_recent ?? 0.95) +
       taste.historical * (settings.providerWeights.lastfm_history ?? 0.8);
 
@@ -502,14 +526,15 @@ function scoreCandidates(
     const recency = releaseYear ? Math.max(0, Math.min(1, 1 - (currentYear - releaseYear) / 30)) : 0.5;
     const releaseAgeScore = (recency - 0.5) * 2 * settings.releaseAgeBias;
     const genreScore = radioGenreAffinity(candidate.seedScores, seeds) * settings.genreSimilarity * 0.25;
-    const cooldownPenalty = recentKeys.has(candidate.key) ? settings.repeatStrength * 0.65 : 0;
+    const historyTrackPenalty = (history.tracks.get(candidate.key) ?? 0) * settings.repeatStrength * 0.65;
+    const historyArtistPenalty = (history.artists.get(normalizeForComparison(candidate.artist)) ?? 0) * settings.repeatStrength * 0.35;
     const negativeFeedbackPenalty = negativeNeighborhood.get(candidate.key) ?? 0;
     const surprise = seededUnit(randomSeed, candidate.key) * settings.surprise;
 
     candidate.selectionScore =
       provider + seedAffinity * 1.4 + tasteScore + familiarityScore + knownScore + ownedScore +
       sameArtist + popularityScore + releaseAgeScore + genreScore + f.score + surprise -
-      cooldownPenalty - negativeFeedbackPenalty;
+      historyTrackPenalty - historyArtistPenalty - negativeFeedbackPenalty;
   }
 
   return candidates.filter((c) => c.selectionScore > -100).sort((a, b) => b.selectionScore - a.selectionScore);
@@ -606,6 +631,7 @@ async function generateCandidates(
   const map = new Map<string, Candidate>();
   for (const seed of seeds) await collectSeedCandidates(seed, map, errors);
   await collectListenBrainzCandidates(map, errors);
+  await collectMusicBrainzCandidates(seeds, map, errors, (settings.providerWeights.musicbrainz ?? 0) > 0);
   await collectFeedbackExpansionCandidates(
     stationId,
     map,
@@ -624,6 +650,8 @@ async function generateCandidates(
       existing.navidromeId ||= track.navidromeId ?? null;
       existing.isrc ||= track.isrc ?? null;
       existing.familiarity = Math.max(existing.familiarity, track.weight ?? 1);
+      const tasteProvider = track.source === "local_history" ? "local_history" : "spotify_taste";
+      existing.providerScores[tasteProvider] = Math.max(existing.providerScores[tasteProvider] ?? 0, track.weight ?? 1);
       if (existing.navidromeId) {
         existing.availability = "local";
         existing.playbackSource = "navidrome";
@@ -637,9 +665,9 @@ async function generateCandidates(
   await resolveAvailability(candidates);
   loadAudioAnalysis(candidates);
   const feedback = listFeedback(stationId);
-  const recentKeys = recentStationTrackKeys(stationId, settings.trackCooldown);
+  const history = buildRadioHistoryPenalties(stationId, settings.trackCooldown);
   return {
-    scored: scoreCandidates(candidates, settings, seeds, tasteMap, feedback, negative.penalties, randomSeed, recentKeys),
+    scored: scoreCandidates(candidates, settings, seeds, tasteMap, feedback, negative.penalties, randomSeed, history),
     seeds,
     errors,
   };
@@ -662,7 +690,11 @@ function toStoredTrack(candidate: Candidate, trajectory: number | null): Omit<Ra
     manual: 0,
     selection_score: candidate.selectionScore,
     trajectory_position: trajectory,
-    metadata_json: JSON.stringify(candidate.metadata),
+    metadata_json: JSON.stringify({
+      ...candidate.metadata,
+      providerScores: candidate.providerScores,
+      seedScores: candidate.seedScores,
+    }),
   };
 }
 
@@ -685,6 +717,16 @@ function storedTrackCopy(track: RadioTrackRow) {
     trajectory_position: track.trajectory_position,
     metadata_json: track.metadata_json,
   };
+}
+
+function providerCounts(sequence: Candidate[]) {
+  const counts: Record<string, number> = {};
+  for (const candidate of sequence) {
+    for (const [provider, score] of Object.entries(candidate.providerScores)) {
+      if (score > 0) counts[provider] = (counts[provider] ?? 0) + 1;
+    }
+  }
+  return counts;
 }
 
 export async function createRadio(input: CreateRadioInput) {
@@ -786,7 +828,7 @@ export async function generateStation(
   const generation = createGeneration({
     stationId,
     requestedLength: length,
-    generatorVersion: "radio-v2",
+    generatorVersion: "radio-v3",
     randomSeed,
     settingsSnapshot: { ...settings, length },
   });
@@ -803,6 +845,7 @@ export async function generateStation(
       candidate_count: scored.length,
       selected_count: sequence.length,
       unavailable_count: sequence.filter((c) => c.availability === "unavailable").length,
+      provider_counts: providerCounts(sequence),
       provider_errors: errors,
       duration_ms: Math.round(performance.now() - started),
     });
@@ -861,6 +904,7 @@ export async function regenerateTail(generationId: string, fromPosition: number,
   replaceGenerationTracks(generationId, output);
   finishGeneration(generationId, errors.length ? "partial" : "ready", {
     regenerated_from: fromPosition,
+    provider_counts: providerCounts(replacement),
     provider_errors: errors,
   });
   return presentGeneration(generationId)!;
@@ -930,6 +974,7 @@ export function revertGenerationRevision(generationId: string, revisionId: strin
   snapshotGeneration(generationId, `before_revert:${revisionId}`);
   const tracks = JSON.parse(row.tracks_json) as RadioTrackRow[];
   replaceGenerationTracks(generationId, tracks.map(storedTrackCopy));
+  getDb().query("UPDATE radio_generations SET requested_length=? WHERE id=?").run(tracks.length, generationId);
   finishGeneration(generationId, "ready", { reverted_to_revision: revisionId });
   return presentGeneration(generationId);
 }
@@ -984,9 +1029,10 @@ export function insertManualGenerationTrack(
     manual: 1,
     selection_score: 0,
     trajectory_position: null,
-    metadata_json: JSON.stringify({ manuallyInserted: true }),
+    metadata_json: JSON.stringify({ manuallyInserted: true, providerScores: { manual: 1 } }),
   });
   replaceGenerationTracks(generationId, existing);
+  getDb().query("UPDATE radio_generations SET requested_length=? WHERE id=?").run(existing.length, generationId);
   return presentGeneration(generationId);
 }
 
