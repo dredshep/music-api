@@ -1,4 +1,5 @@
 import { canonicalRadioTrackKey, presentGeneration } from "./radio";
+import { getDb } from "../db/database";
 import {
   finishGeneration,
   getGeneration,
@@ -44,6 +45,7 @@ export function importExternalGeneration(generationId: string, tracks: ExternalR
     metadata_json: JSON.stringify({ importedFromExternalPlaylist: true }),
   }));
   replaceGenerationTracks(generationId, rows);
+  getDb().query("UPDATE radio_generations SET requested_length=? WHERE id=?").run(tracks.length, generationId);
   finishGeneration(generationId, "ready", {
     imported_external_playlist: true,
     imported_track_count: tracks.length,
