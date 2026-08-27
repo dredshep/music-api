@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import * as lastfm from "./lastfm";
 import * as listenbrainz from "./listenbrainz";
 import * as navidrome from "./navidrome";
+import { expandPositiveRadioFeedback } from "./radio-feedback-expansion";
+import { normalizeRadioPopularity } from "./radio-popularity";
 import { normalizeForComparison } from "../domain/normalization";
 import { getDb } from "../db/database";
 import {
@@ -183,8 +185,7 @@ async function collectSeedCandidates(
     seedScore: weight * Math.max(0.05, score),
     metadata: {
       lastfmUrl: track.url,
-      playcount: track.playcount,
-      popularity: Math.max(0, Math.min(1, score)),
+      lastfmPlaycount: track.playcount > 0 ? track.playcount : undefined,
     },
   });
 
@@ -291,6 +292,32 @@ async function collectListenBrainzCandidates(map: Map<string, Candidate>, errors
     }
   } catch (error) {
     errors.push(`ListenBrainz: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function collectFeedbackExpansionCandidates(
+  stationId: string,
+  map: Map<string, Candidate>,
+  errors: string[],
+  enabled: boolean,
+) {
+  if (!enabled) return;
+  const expansion = await expandPositiveRadioFeedback(stationId);
+  errors.push(...expansion.errors);
+  for (const track of expansion.candidates) {
+    upsertCandidate(map, {
+      artist: track.artist,
+      title: track.title,
+      mbid: track.mbid,
+      provider: "internal_feedback",
+      providerScore: Math.max(0.05, Math.min(1, track.score * track.strength)),
+      seedId: "__feedback__",
+      seedScore: 0,
+      metadata: {
+        feedbackSourceArtist: track.sourceArtist,
+        feedbackSourceTitle: track.sourceTitle,
+      },
+    });
   }
 }
 
@@ -593,6 +620,12 @@ async function generateCandidates(
   const map = new Map<string, Candidate>();
   for (const seed of seeds) await collectSeedCandidates(seed, map, errors);
   await collectListenBrainzCandidates(map, errors);
+  await collectFeedbackExpansionCandidates(
+    stationId,
+    map,
+    errors,
+    (settings.providerWeights.internal_feedback ?? 0) > 0,
+  );
 
   const tasteMap = await buildTasteMaps(tasteProfile);
   for (const track of tasteProfile ?? []) {
@@ -612,7 +645,7 @@ async function generateCandidates(
     }
   }
 
-  const candidates = [...map.values()];
+  const candidates = normalizeRadioPopularity([...map.values()]);
   await resolveAvailability(candidates);
   loadAudioAnalysis(candidates);
   const feedback = listFeedback(stationId);
