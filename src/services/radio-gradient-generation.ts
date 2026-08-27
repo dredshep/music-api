@@ -19,6 +19,10 @@ import {
   type TasteTrack,
 } from "./radio";
 import {
+  summarizeGradientCandidateRegions,
+  summarizeGradientStage,
+} from "./radio-gradient-observability";
+import {
   gradientRouteDiagnostics,
   gradientRouteSupportsPosition,
   planGradientRoute,
@@ -52,6 +56,14 @@ function clamp(value: number, min: number, max: number) {
 function parseMetadata(raw: string | null): Record<string, unknown> {
   try { return raw ? JSON.parse(raw) as Record<string, unknown> : {}; }
   catch { return {}; }
+}
+
+function object(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function elapsedMs(startedAt: number) {
+  return Number((performance.now() - startedAt).toFixed(2));
 }
 
 function numericMetadata(metadata: Record<string, unknown>, key: string) {
@@ -308,10 +320,23 @@ function selectRouteSequence(
   return output;
 }
 
+function updateGradientTiming(generationId: string, patch: Record<string, number>) {
+  const generation = getGeneration(generationId);
+  if (!generation) return;
+  const diagnostics = generation.diagnostics_json ? JSON.parse(generation.diagnostics_json) as Record<string, unknown> : {};
+  const timing = object(diagnostics.gradient_pipeline_timing);
+  getDb().query("UPDATE radio_generations SET diagnostics_json=? WHERE id=?")
+    .run(JSON.stringify({
+      ...diagnostics,
+      gradient_pipeline_timing: { ...timing, ...patch },
+    }), generationId);
+}
+
 async function reshapeGradientGeneration(
   generationId: string,
   options: { preserveBefore?: number; preservePinned?: boolean } = {},
 ) {
+  const reshapeStartedAt = performance.now();
   const generation = getGeneration(generationId);
   if (!generation) return null;
   const station = getStation(generation.station_id);
@@ -320,21 +345,33 @@ async function reshapeGradientGeneration(
   if (settings.gradientAlgorithm === "blend") return presentGeneration(generationId);
 
   const seeds = getSeeds(station.id);
+  const routeStartedAt = performance.now();
   const plan = await planGradientRoute(seeds, settings);
+  const routeSearchMs = elapsedMs(routeStartedAt);
   const existing = getGenerationTracks(generationId);
   const previousDiagnostics = generation.diagnostics_json ? JSON.parse(generation.diagnostics_json) as Record<string, unknown> : {};
+  const previousTiming = object(previousDiagnostics.gradient_pipeline_timing);
   if (!plan.usable) {
     finishGeneration(generationId, generation.status === "failed" ? "failed" : "partial", {
       ...previousDiagnostics,
       gradient_route: gradientRouteDiagnostics(plan),
       gradient_route_warning: "No connected musical route was discovered; legacy ordering retained and its percentages must not be interpreted as musical coordinates.",
+      gradient_pipeline_timing: {
+        ...previousTiming,
+        route_search_ms: routeSearchMs,
+        route_materialization_ms: 0,
+        route_selection_ms: 0,
+        reshape_total_ms: elapsedMs(reshapeStartedAt),
+      },
     });
     return presentGeneration(generationId);
   }
 
   const pool = new Map<string, PoolTrack>();
   for (const track of existingPool(existing, plan)) mergePoolTrack(pool, track);
+  const materializationStartedAt = performance.now();
   const routePool = await buildGradientRouteTrackPool(plan, generation.requested_length);
+  const routeMaterializationMs = elapsedMs(materializationStartedAt);
   for (const track of routePool.tracks) {
     const metadata = mergeProviderScore({
       gradientRoutePosition: track.routePosition,
@@ -370,6 +407,7 @@ async function reshapeGradientGeneration(
     }
   }
 
+  const selectionStartedAt = performance.now();
   const sequence = selectRouteSequence(
     [...pool.values()],
     plan,
@@ -379,6 +417,7 @@ async function reshapeGradientGeneration(
     locked,
   );
   replaceGenerationTracks(generationId, sequence);
+  const routeSelectionMs = elapsedMs(selectionStartedAt);
   getDb().query("UPDATE radio_generations SET generator_version=? WHERE id=?")
     .run(`radio-v4-gradient-${settings.gradientAlgorithm}`, generationId);
   const positioned = sequence.filter((track) => track.trajectory_position != null).length;
@@ -386,6 +425,7 @@ async function reshapeGradientGeneration(
     if (index === 0 || track.trajectory_position == null || sequence[index - 1]!.trajectory_position == null) return count;
     return count + (track.trajectory_position! < sequence[index - 1]!.trajectory_position! - 0.04 ? 1 : 0);
   }, 0);
+  const routeSelectedTracks = getGenerationTracks(generationId);
   finishGeneration(generationId, sequence.length >= Math.min(generation.requested_length, 3)
     ? ((generation.status === "partial" || routePool.errors.length) ? "partial" : "ready")
     : "partial", {
@@ -393,10 +433,19 @@ async function reshapeGradientGeneration(
     selected_count: sequence.length,
     gradient_route: gradientRouteDiagnostics(plan),
     gradient_route_candidate_count: routePool.tracks.length,
+    gradient_route_candidate_regions: summarizeGradientCandidateRegions(routePool.tracks),
     gradient_route_positioned_count: positioned,
     gradient_route_positioned_ratio: sequence.length ? Number((positioned / sequence.length).toFixed(4)) : 0,
     gradient_route_backtracks: backtracks,
     gradient_route_errors: routePool.errors,
+    gradient_stage_route_selected: summarizeGradientStage(routeSelectedTracks),
+    gradient_pipeline_timing: {
+      ...previousTiming,
+      route_search_ms: routeSearchMs,
+      route_materialization_ms: routeMaterializationMs,
+      route_selection_ms: routeSelectionMs,
+      reshape_total_ms: elapsedMs(reshapeStartedAt),
+    },
   });
   return presentGeneration(generationId);
 }
@@ -405,11 +454,19 @@ export async function generateRadioStationWithGradient(
   stationId: string,
   input: { length?: number; tasteProfile?: TasteTrack[] } = {},
 ) {
+  const operationStartedAt = performance.now();
   const station = getStation(stationId);
   if (!station) throw new Error("Radio station not found");
+  const baseStartedAt = performance.now();
   const generated = await generateStation(stationId, input);
+  const baseGenerationMs = elapsedMs(baseStartedAt);
   if (station.type !== "gradient") return generated;
-  return await reshapeGradientGeneration(generated.id) ?? generated;
+  const reshaped = await reshapeGradientGeneration(generated.id) ?? generated;
+  updateGradientTiming(generated.id, {
+    base_generation_ms: baseGenerationMs,
+    pre_finalize_total_ms: elapsedMs(operationStartedAt),
+  });
+  return presentGeneration(generated.id) ?? reshaped;
 }
 
 export async function regenerateRadioTailWithGradient(
@@ -417,11 +474,19 @@ export async function regenerateRadioTailWithGradient(
   fromPosition: number,
   tasteProfile?: TasteTrack[],
 ) {
+  const operationStartedAt = performance.now();
   const generation = getGeneration(generationId);
   if (!generation) throw new Error("Radio generation not found");
   const station = getStation(generation.station_id);
   if (!station) throw new Error("Radio station not found");
+  const baseStartedAt = performance.now();
   const regenerated = await regenerateTail(generationId, fromPosition, tasteProfile);
+  const baseRegenerateMs = elapsedMs(baseStartedAt);
   if (station.type !== "gradient") return regenerated;
-  return await reshapeGradientGeneration(generationId, { preserveBefore: fromPosition, preservePinned: true }) ?? regenerated;
+  const reshaped = await reshapeGradientGeneration(generationId, { preserveBefore: fromPosition, preservePinned: true }) ?? regenerated;
+  updateGradientTiming(generationId, {
+    base_regenerate_ms: baseRegenerateMs,
+    pre_finalize_total_ms: elapsedMs(operationStartedAt),
+  });
+  return presentGeneration(generationId) ?? reshaped;
 }
