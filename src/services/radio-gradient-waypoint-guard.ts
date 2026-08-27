@@ -142,16 +142,17 @@ export function enforceExplicitGradientTrackWaypoints(
 ) {
   const generation = getGeneration(generationId);
   const support = generation ? routeSupport(generation.diagnostics_json) : null;
-  if (!generation || !support) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
+  if (!generation || !support) return { applied: false, inserted: 0, moved: 0, updated: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
   const tracks = getGenerationTracks(generationId);
-  if (!tracks.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
+  if (!tracks.length) return { applied: false, inserted: 0, moved: 0, updated: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
   const seeds = getSeeds(generation.station_id).filter((seed) => seed.seed_type === "track" && seed.artist && seed.title);
-  if (!seeds.length) return { applied: false, inserted: 0, moved: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
+  if (!seeds.length) return { applied: false, inserted: 0, moved: 0, updated: 0, skippedLocked: 0, skippedUnsupported: 0, unpositioned: 0 };
 
   const output = tracks.map(copy);
   const lockedPrefix = Math.max(0, options.fromPosition ?? 0);
   let inserted = 0;
   let moved = 0;
+  let updated = 0;
   let skippedLocked = 0;
   let unpositioned = 0;
   const desired = seeds.map((seed, index) => ({
@@ -166,11 +167,12 @@ export function enforceExplicitGradientTrackWaypoints(
 
     const key = canonicalRadioTrackKey(seed.artist!, seed.title!);
     const idealIndex = Math.max(0, Math.min(output.length - 1, Math.round(routePosition * Math.max(0, output.length - 1))));
-    let sourceIndex = output.findIndex((track) => track.canonical_key === key);
+    const sourceIndex = output.findIndex((track) => track.canonical_key === key);
 
     if (sourceIndex >= 0) {
       if (coordinateSupported) stampWaypoint(output[sourceIndex]!, seed.artist!, routePosition);
       else markUnpositionedWaypoint(output[sourceIndex]!);
+      updated++;
       if (isProtected(output[sourceIndex]!, sourceIndex, lockedPrefix)) {
         // Respect the user's lock even when it means the exact seed recording is
         // not physically located at its ideal route slot.
@@ -227,9 +229,9 @@ export function enforceExplicitGradientTrackWaypoints(
     inserted++;
   }
 
-  if (!inserted && !moved) return { applied: true, inserted: 0, moved: 0, skippedLocked, skippedUnsupported: 0, unpositioned };
+  if (!inserted && !moved && !updated) return { applied: true, inserted: 0, moved: 0, updated: 0, skippedLocked, skippedUnsupported: 0, unpositioned };
   replaceGenerationTracks(generationId, output);
-  return { applied: true, inserted, moved, skippedLocked, skippedUnsupported: 0, unpositioned };
+  return { applied: true, inserted, moved, updated, skippedLocked, skippedUnsupported: 0, unpositioned };
 }
 
 export function isSameGradientWaypointTrack(track: RadioTrackRow, artist: string, title: string) {
