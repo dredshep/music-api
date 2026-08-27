@@ -19,12 +19,12 @@ export function summarizeRadioAvailability(tracks: Array<{ availability: string 
  *
  * New/generated material may be DJ-resequenced using already-cached analysis.
  * Explicit user edits, clones, revision restores and external imports must retain
- * their exact order, so callers can disable resequencing while still receiving
- * final local resolution, fresh diagnostics and background analysis scheduling.
+ * their exact order. Ephemeral callers may also suppress background analysis so
+ * no jobs are queued against a generation that is about to be deleted.
  */
 export async function finalizeRadioGeneration(
   generationId: string,
-  options: { fromPosition?: number; resequence?: boolean } = {},
+  options: { fromPosition?: number; resequence?: boolean; queueAnalysis?: boolean } = {},
 ) {
   const resolved = await resolveRadioGenerationLocally(generationId);
   if (!resolved) return null;
@@ -45,6 +45,6 @@ export async function finalizeRadioGeneration(
   getDb().query("UPDATE radio_generations SET diagnostics_json=? WHERE id=?")
     .run(JSON.stringify(diagnostics), generationId);
 
-  queueRadioGenerationAnalysis(generationId);
+  if (options.queueAnalysis !== false) queueRadioGenerationAnalysis(generationId);
   return presentGeneration(generationId);
 }
