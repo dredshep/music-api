@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { z } from "zod";
 import { AppError } from "../middleware/errors";
 import { importExternalGeneration } from "../services/radio-import";
+import { finalizeRadioGeneration } from "../services/radio-finalize";
 
 export const radioExternalRoutes = new Hono();
 
@@ -19,5 +20,5 @@ radioExternalRoutes.post("/radio/generations/:id/import-external", async (c) => 
   const { tracks } = z.object({ tracks: z.array(trackSchema).max(500) }).parse(await c.req.json());
   const generation = await importExternalGeneration(c.req.param("id"), tracks);
   if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
-  return c.json(generation);
+  return c.json(await finalizeRadioGeneration(generation.id));
 });
