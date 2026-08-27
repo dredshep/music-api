@@ -3,7 +3,10 @@ import * as lastfm from "./lastfm";
 import * as listenbrainz from "./listenbrainz";
 import * as navidrome from "./navidrome";
 import { expandPositiveRadioFeedback } from "./radio-feedback-expansion";
+import { buildNegativeRadioFeedbackPenalties } from "./radio-negative-feedback";
 import { normalizeRadioPopularity } from "./radio-popularity";
+import { buildLastFmTasteMap } from "./radio-lastfm-taste";
+import { radioGenreAffinity } from "./radio-genre-affinity";
 import { normalizeForComparison } from "../domain/normalization";
 import { getDb } from "../db/database";
 import {
@@ -74,11 +77,7 @@ interface Candidate {
   metadata: Record<string, unknown>;
 }
 
-/**
- * Cross-provider identity deliberately uses normalized artist/title as the common
- * denominator. ISRC/MBID/Spotify/Navidrome IDs are retained as aliases/evidence,
- * but no single provider ID is allowed to prevent the same recording from merging.
- */
+/** Common cross-provider identity; provider IDs remain aliases/evidence. */
 export function canonicalRadioTrackKey(artist: string, title: string): string {
   return `text:${normalizeForComparison(artist)}|${normalizeForComparison(title)}`;
 }
@@ -223,7 +222,7 @@ async function collectSeedCandidates(
       for (const track of tracks.slice(0, 5)) {
         try {
           (await lastfm.getSimilarTracks(track.artist, track.name, 12)).forEach((t) => addLastFm(t, "lastfm_similar"));
-        } catch { /* partial */ }
+        } catch { /* provider-level partial failure */ }
       }
       return;
     }
@@ -263,7 +262,7 @@ async function collectSeedCandidates(
       for (const track of supplied.slice(0, 16)) {
         try {
           (await lastfm.getSimilarTracks(track.artist, track.title, 8)).forEach((t) => addLastFm(t, "lastfm_similar"));
-        } catch { /* partial */ }
+        } catch { /* provider-level partial failure */ }
       }
     }
   } catch (error) {
@@ -322,22 +321,15 @@ async function collectFeedbackExpansionCandidates(
 }
 
 async function buildTasteMaps(tasteProfile: TasteTrack[] = []) {
-  const recent = await lastfm.getUserTopTracks("1month", 150).catch(() => []);
-  const historical = await lastfm.getUserTopTracks("overall", 250).catch(() => []);
+  const lastfmTaste = await buildLastFmTasteMap();
   const map = new Map<string, { recent: number; historical: number; spotify: number }>();
-  for (const t of historical) {
-    map.set(canonicalRadioTrackKey(t.artist, t.name), { recent: 0, historical: t.match, spotify: 0 });
+  for (const [key, row] of lastfmTaste) {
+    map.set(key, { recent: row.recent, historical: row.historical, spotify: 0 });
   }
-  for (const t of recent) {
-    const key = canonicalRadioTrackKey(t.artist, t.name);
+  for (const track of tasteProfile) {
+    const key = canonicalRadioTrackKey(track.artist, track.title);
     const row = map.get(key) ?? { recent: 0, historical: 0, spotify: 0 };
-    row.recent = t.match;
-    map.set(key, row);
-  }
-  for (const t of tasteProfile) {
-    const key = canonicalRadioTrackKey(t.artist, t.title);
-    const row = map.get(key) ?? { recent: 0, historical: 0, spotify: 0 };
-    row.spotify = t.weight ?? 1;
+    row.spotify = Math.max(row.spotify, track.weight ?? 1);
     map.set(key, row);
   }
   return map;
@@ -384,8 +376,7 @@ async function resolveAvailability(candidates: Candidate[]): Promise<void> {
 }
 
 function loadAudioAnalysis(candidates: Candidate[]): void {
-  const db = getDb();
-  const stmt = db.query<{
+  const stmt = getDb().query<{
     bpm: number | null;
     musical_key: string | null;
     mode: string | null;
@@ -467,6 +458,7 @@ function scoreCandidates(
   seeds: ReturnType<typeof getSeeds>,
   tasteMap: Map<string, { recent: number; historical: number; spotify: number }>,
   feedback: ReturnType<typeof listFeedback>,
+  negativeNeighborhood: Map<string, number>,
   randomSeed: string,
   recentKeys: Set<string>,
 ): Candidate[] {
@@ -509,19 +501,21 @@ function scoreCandidates(
     const releaseYear = typeof candidate.metadata.releaseYear === "number" ? candidate.metadata.releaseYear : null;
     const recency = releaseYear ? Math.max(0, Math.min(1, 1 - (currentYear - releaseYear) / 30)) : 0.5;
     const releaseAgeScore = (recency - 0.5) * 2 * settings.releaseAgeBias;
-    const genreAffinity = Math.min(1, Math.max(0, ...Object.values(candidate.seedScores)));
-    const genreScore = genreAffinity * settings.genreSimilarity * 0.25;
+    const genreScore = radioGenreAffinity(candidate.seedScores, seeds) * settings.genreSimilarity * 0.25;
     const cooldownPenalty = recentKeys.has(candidate.key) ? settings.repeatStrength * 0.65 : 0;
+    const negativeFeedbackPenalty = negativeNeighborhood.get(candidate.key) ?? 0;
     const surprise = seededUnit(randomSeed, candidate.key) * settings.surprise;
 
     candidate.selectionScore =
       provider + seedAffinity * 1.4 + tasteScore + familiarityScore + knownScore + ownedScore +
-      sameArtist + popularityScore + releaseAgeScore + genreScore + f.score + surprise - cooldownPenalty;
+      sameArtist + popularityScore + releaseAgeScore + genreScore + f.score + surprise -
+      cooldownPenalty - negativeFeedbackPenalty;
   }
 
   return candidates.filter((c) => c.selectionScore > -100).sort((a, b) => b.selectionScore - a.selectionScore);
 }
 
+/** Coarse selection-time flow; final DJ ordering uses the richer cached-feature sequencer. */
 function transitionScore(a: Candidate | null, b: Candidate, settings: RadioSettings): number {
   if (!a) return 0;
   let score = 0;
@@ -531,18 +525,10 @@ function transitionScore(a: Candidate | null, b: Candidate, settings: RadioSetti
 
   const aMeta = a.metadata as { bpm?: number; energy?: number; key?: string; loudness?: number };
   const bMeta = b.metadata as { bpm?: number; energy?: number; key?: string; loudness?: number };
-  if (aMeta.bpm && bMeta.bpm) {
-    score += Math.max(0, 1 - Math.abs(aMeta.bpm - bMeta.bpm) / 60) * (settings.djWeights.tempo ?? 0);
-  }
-  if (aMeta.energy != null && bMeta.energy != null) {
-    score += Math.max(0, 1 - Math.abs(aMeta.energy - bMeta.energy)) * (settings.djWeights.energy ?? 0);
-  }
-  if (aMeta.key && bMeta.key) {
-    score += (aMeta.key === bMeta.key ? 1 : 0) * (settings.djWeights.key ?? 0);
-  }
-  if (aMeta.loudness != null && bMeta.loudness != null) {
-    score += Math.max(0, 1 - Math.abs(aMeta.loudness - bMeta.loudness) / 12) * (settings.djWeights.timbre ?? 0) * 0.5;
-  }
+  if (aMeta.bpm && bMeta.bpm) score += Math.max(0, 1 - Math.abs(aMeta.bpm - bMeta.bpm) / 60) * (settings.djWeights.tempo ?? 0);
+  if (aMeta.energy != null && bMeta.energy != null) score += Math.max(0, 1 - Math.abs(aMeta.energy - bMeta.energy)) * (settings.djWeights.energy ?? 0);
+  if (aMeta.key && bMeta.key) score += (aMeta.key === bMeta.key ? 1 : 0) * (settings.djWeights.key ?? 0);
+  if (aMeta.loudness != null && bMeta.loudness != null) score += Math.max(0, 1 - Math.abs(aMeta.loudness - bMeta.loudness) / 12) * (settings.djWeights.timbre ?? 0) * 0.5;
   return score * settings.djFlow;
 }
 
@@ -626,6 +612,8 @@ async function generateCandidates(
     errors,
     (settings.providerWeights.internal_feedback ?? 0) > 0,
   );
+  const negative = await buildNegativeRadioFeedbackPenalties(stationId);
+  errors.push(...negative.errors);
 
   const tasteMap = await buildTasteMaps(tasteProfile);
   for (const track of tasteProfile ?? []) {
@@ -651,7 +639,7 @@ async function generateCandidates(
   const feedback = listFeedback(stationId);
   const recentKeys = recentStationTrackKeys(stationId, settings.trackCooldown);
   return {
-    scored: scoreCandidates(candidates, settings, seeds, tasteMap, feedback, randomSeed, recentKeys),
+    scored: scoreCandidates(candidates, settings, seeds, tasteMap, feedback, negative.penalties, randomSeed, recentKeys),
     seeds,
     errors,
   };
@@ -824,7 +812,6 @@ export async function generateStation(
       duration_ms: Math.round(performance.now() - started),
     });
   }
-
   return presentGeneration(generation.id)!;
 }
 
@@ -882,10 +869,7 @@ export async function regenerateTail(generationId: string, fromPosition: number,
 export function updateRadioStation(stationId: string, patch: Parameters<typeof updateStation>[1]) {
   return updateStation(stationId, patch) ? presentStation(stationId) : null;
 }
-
-export function removeRadioStation(stationId: string) {
-  return deleteStation(stationId);
-}
+export function removeRadioStation(stationId: string) { return deleteStation(stationId); }
 
 export function recordRadioFeedback(input: {
   scope: "station" | "global";
@@ -894,15 +878,12 @@ export function recordRadioFeedback(input: {
   entityKey: string;
   action: RadioFeedbackAction;
   strength?: number;
-}) {
-  return addFeedback(input);
-}
+}) { return addFeedback(input); }
 
 export function pinGenerationTrack(generationId: string, trackId: string, pinned: boolean) {
   snapshotGeneration(generationId, pinned ? "pin" : "unpin");
   return updateTrackPin(generationId, trackId, pinned);
 }
-
 export function removeGenerationTrack(generationId: string, trackId: string) {
   snapshotGeneration(generationId, "remove_track");
   return deleteGenerationTrack(generationId, trackId);
@@ -918,8 +899,7 @@ export function resolveGenerationTracks(
     durationMs?: number | null;
   }>,
 ) {
-  const db = getDb();
-  const stmt = db.query(`UPDATE radio_generation_tracks
+  const stmt = getDb().query(`UPDATE radio_generation_tracks
     SET spotify_id=COALESCE(?,spotify_id),
         isrc=COALESCE(?,isrc),
         album=COALESCE(?,album),
@@ -927,31 +907,19 @@ export function resolveGenerationTracks(
         playback_source=CASE WHEN navidrome_id IS NOT NULL THEN 'navidrome' WHEN COALESCE(?,spotify_id) IS NOT NULL THEN 'spotify' ELSE playback_source END,
         availability_status=CASE WHEN navidrome_id IS NOT NULL THEN 'local' WHEN COALESCE(?,spotify_id) IS NOT NULL THEN 'spotify' ELSE availability_status END
     WHERE generation_id=? AND id=?`);
-  db.transaction(() => {
+  getDb().transaction(() => {
     for (const row of resolutions) {
-      stmt.run(
-        row.spotifyId ?? null,
-        row.isrc ?? null,
-        row.album ?? null,
-        row.durationMs ?? null,
-        row.spotifyId ?? null,
-        row.spotifyId ?? null,
-        generationId,
-        row.trackId,
-      );
+      stmt.run(row.spotifyId ?? null, row.isrc ?? null, row.album ?? null, row.durationMs ?? null,
+        row.spotifyId ?? null, row.spotifyId ?? null, generationId, row.trackId);
     }
   })();
   return presentGeneration(generationId);
 }
 
 export function listGenerationRevisions(generationId: string) {
-  return getDb().query<{
-    id: string;
-    revision: number;
-    reason: string;
-    created_at: string;
-  }, [string]>(`SELECT id,revision,reason,created_at FROM radio_generation_revisions
-      WHERE generation_id=? ORDER BY revision DESC`).all(generationId);
+  return getDb().query<{ id: string; revision: number; reason: string; created_at: string }, [string]>(
+    `SELECT id,revision,reason,created_at FROM radio_generation_revisions WHERE generation_id=? ORDER BY revision DESC`,
+  ).all(generationId);
 }
 
 export function revertGenerationRevision(generationId: string, revisionId: string) {
