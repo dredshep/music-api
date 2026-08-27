@@ -115,4 +115,46 @@ describe("explicit Gradient track waypoint guard", () => {
     expect(result.skippedLocked).toBeGreaterThan(0);
     expect(getGenerationTracks(generation.id)[0]!.title).toBe("Prefix");
   });
+
+  test("does not stamp a track waypoint onto a disconnected route leg", () => {
+    const station = createStation({
+      name: "Partial path",
+      type: "gradient",
+      seeds: [
+        { type: "track", artist: "A", title: "A track", label: "A track", position: 0 },
+        { type: "track", artist: "B", title: "B track", label: "B track", position: 0.5 },
+        { type: "track", artist: "C", title: "C track", label: "C track", position: 1 },
+      ],
+    });
+    const generation = createGeneration({
+      stationId: station.id,
+      requestedLength: 5,
+      generatorVersion: "test",
+      randomSeed: "partial",
+      settingsSnapshot: parseRadioSettings(station.settings_json),
+    });
+    replaceGenerationTracks(generation.id, [
+      stored("Bridge 1", "One", 0, 0.05),
+      stored("Bridge 2", "Two", 1, 0.25),
+      stored("Bridge 3", "Three", 2, 0.5),
+      stored("Fallback 1", "Four", 3, 0.7),
+      stored("Fallback 2", "Five", 4, 0.9),
+    ]);
+    finishGeneration(generation.id, "partial", {
+      gradient_route: {
+        usable: true,
+        segments: [
+          { connected: true, from_position: 0, to_position: 0.5 },
+          { connected: false, from_position: 0.5, to_position: 1 },
+        ],
+      },
+    });
+
+    const result = enforceExplicitGradientTrackWaypoints(generation.id);
+    expect(result.skippedUnsupported).toBe(1);
+    const keys = getGenerationTracks(generation.id).map((track) => track.canonical_key);
+    expect(keys).toContain(canonicalRadioTrackKey("A", "A track"));
+    expect(keys).toContain(canonicalRadioTrackKey("B", "B track"));
+    expect(keys).not.toContain(canonicalRadioTrackKey("C", "C track"));
+  });
 });
