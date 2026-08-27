@@ -19,7 +19,7 @@ interface AnalysisRow {
   outro_json: string | null;
 }
 
-interface TrackFeatures {
+export interface TrackFeatures {
   bpm?: number;
   key?: string;
   mode?: string;
@@ -84,7 +84,7 @@ const KEY_INDEX: Record<string, number> = {
   B: 11, Cb: 11,
 };
 
-function keyCompatibility(a: TrackFeatures, b: TrackFeatures): number | null {
+export function keyCompatibility(a: TrackFeatures, b: TrackFeatures): number | null {
   if (!a.key || !b.key) return null;
   const ai = KEY_INDEX[a.key];
   const bi = KEY_INDEX[b.key];
@@ -93,18 +93,14 @@ function keyCompatibility(a: TrackFeatures, b: TrackFeatures): number | null {
   const sameMode = Boolean(a.mode && b.mode && a.mode === b.mode);
   if (delta === 0 && sameMode) return 1;
   if (delta === 0) return 0.72;
-  // Relative major/minor: C major ↔ A minor is +/-3 semitones.
   if (!sameMode && (delta === 3 || delta === 9)) return 0.9;
-  // Fifth/fourth relations are harmonically useful even without a full Camelot map.
   if (delta === 5 || delta === 7) return sameMode ? 0.82 : 0.7;
-  // Neighbouring pitch classes are less ideal but still better than unrelated keys.
   if (delta === 1 || delta === 11 || delta === 2 || delta === 10) return 0.42;
   return 0.25;
 }
 
-function tempoCompatibility(a?: number, b?: number): number | null {
+export function tempoCompatibility(a?: number, b?: number): number | null {
   if (!a || !b) return null;
-  // Allow half/double-time relationships, common in DJ transitions.
   const diffs = [Math.abs(a - b), Math.abs(a * 2 - b), Math.abs(a - b * 2)];
   const diff = Math.min(...diffs);
   return Math.max(0, 1 - diff / 45);
@@ -115,7 +111,7 @@ function scalarSimilarity(a: number | undefined, b: number | undefined, range = 
   return Math.max(0, 1 - Math.abs(a - b) / range);
 }
 
-function timbreSimilarity(a?: Record<string, number>, b?: Record<string, number>): number | null {
+export function timbreSimilarity(a?: Record<string, number>, b?: Record<string, number>): number | null {
   if (!a || !b) return null;
   const dimensions: Array<[string, number]> = [
     ["spectral_centroid_mean", 3500],
@@ -130,7 +126,7 @@ function timbreSimilarity(a?: Record<string, number>, b?: Record<string, number>
   return scores.length ? scores.reduce((sum, value) => sum + value, 0) / scores.length : null;
 }
 
-function introOutroCompatibility(outro?: Record<string, number>, intro?: Record<string, number>): number | null {
+export function introOutroCompatibility(outro?: Record<string, number>, intro?: Record<string, number>): number | null {
   if (!outro || !intro) return null;
   if (outro.dbfs != null && intro.dbfs != null) {
     return Math.max(0, 1 - Math.abs(outro.dbfs - intro.dbfs) / 24);
@@ -184,8 +180,25 @@ export function radioTransitionScore(
   return result * settings.djFlow;
 }
 
+/**
+ * Gradient generations already encode their musical path in trajectory_position.
+ * DJ flow may improve local hand-offs, but must never turn an A→B journey into a
+ * globally reordered playlist. Allow only a small neighbourhood around the
+ * original trajectory target and heavily penalize displacement inside it.
+ */
+function trajectoryScore(track: RadioTrackRow, absolutePosition: number, totalTracks: number): number {
+  if (track.trajectory_position == null || totalTracks <= 1) return 0;
+  const target = absolutePosition / (totalTracks - 1);
+  const distance = Math.abs(track.trajectory_position - target);
+  const maxLocalMove = Math.max(0.08, 2 / (totalTracks - 1));
+  if (distance > maxLocalMove) return -Infinity;
+  return -distance * 3;
+}
+
 function segmentOrder(
   segment: RadioTrackRow[],
+  segmentStart: number,
+  totalTracks: number,
   previous: RadioTrackRow | null,
   nextLocked: RadioTrackRow | null,
   settings: RadioSettings,
@@ -199,14 +212,15 @@ function segmentOrder(
   while (remaining.length) {
     let bestIndex = 0;
     let bestScore = -Infinity;
+    const absolutePosition = segmentStart + ordered.length;
     for (let i = 0; i < remaining.length; i++) {
       const candidate = remaining[i]!;
-      let score = radioTransitionScore(prev, candidate, settings, features);
-      // Near the end, prefer candidates that also hand off well to the next pinned track.
+      const trajectory = trajectoryScore(candidate, absolutePosition, totalTracks);
+      if (trajectory === -Infinity) continue;
+      let score = radioTransitionScore(prev, candidate, settings, features) + trajectory;
       if (remaining.length <= 3 && nextLocked) {
         score += radioTransitionScore(candidate, nextLocked, settings, features) * 0.35;
       }
-      // Stable deterministic tie-break: preserve a little of the generator's prior order.
       score -= candidate.position * 1e-6;
       if (score > bestScore) {
         bestScore = score;
@@ -218,19 +232,25 @@ function segmentOrder(
     prev = chosen!;
   }
 
-  // Cheap local-improvement pass over adjacent swaps.
   for (let pass = 0; pass < 2; pass++) {
     for (let i = 0; i < ordered.length - 1; i++) {
+      const absoluteA = segmentStart + i;
+      const absoluteB = absoluteA + 1;
       const leftContext = i === 0 ? previous : ordered[i - 1]!;
       const a = ordered[i]!;
       const b = ordered[i + 1]!;
       const rightContext = i + 2 < ordered.length ? ordered[i + 2]! : nextLocked;
+      const beforeTrajectory = trajectoryScore(a, absoluteA, totalTracks) + trajectoryScore(b, absoluteB, totalTracks);
+      const afterTrajectory = trajectoryScore(b, absoluteA, totalTracks) + trajectoryScore(a, absoluteB, totalTracks);
+      if (afterTrajectory === -Infinity) continue;
       const before = radioTransitionScore(leftContext, a, settings, features)
         + radioTransitionScore(a, b, settings, features)
-        + (rightContext ? radioTransitionScore(b, rightContext, settings, features) : 0);
+        + (rightContext ? radioTransitionScore(b, rightContext, settings, features) : 0)
+        + beforeTrajectory;
       const after = radioTransitionScore(leftContext, b, settings, features)
         + radioTransitionScore(b, a, settings, features)
-        + (rightContext ? radioTransitionScore(a, rightContext, settings, features) : 0);
+        + (rightContext ? radioTransitionScore(a, rightContext, settings, features) : 0)
+        + afterTrajectory;
       if (after > before + 1e-6) [ordered[i], ordered[i + 1]] = [b, a];
     }
   }
@@ -240,7 +260,9 @@ function segmentOrder(
 
 /**
  * Reorder only generated/unpinned positions. Prefix locks, pinned tracks and
- * manually inserted tracks remain exactly where the user put them.
+ * manually inserted tracks remain exactly where the user put them. Existing
+ * cached analysis is used immediately; fresh DSP is queued after finalization
+ * and affects future generations rather than silently mutating this saved one.
  */
 export function resequenceRadioGeneration(
   generationId: string,
@@ -276,14 +298,13 @@ export function resequenceRadioGeneration(
     const segment = tracks.filter((track) => track.position >= start && track.position < cursor);
     const previous = finalOrder.at(-1) ?? null;
     const nextLocked = cursor < tracks.length ? byPosition.get(cursor) ?? null : null;
-    finalOrder.push(...segmentOrder(segment, previous, nextLocked, settings, features));
+    finalOrder.push(...segmentOrder(segment, start, tracks.length, previous, nextLocked, settings, features));
   }
 
   if (finalOrder.every((track, index) => track.id === tracks[index]!.id)) return tracks;
 
   const db = getDb();
   db.transaction(() => {
-    // Move positions outside the UNIQUE(generation_id,position) range first.
     db.query("UPDATE radio_generation_tracks SET position=position+100000 WHERE generation_id=?")
       .run(generationId);
     const stmt = db.query("UPDATE radio_generation_tracks SET position=? WHERE generation_id=? AND id=?");
