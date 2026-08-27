@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { DEFAULT_RADIO_SETTINGS, type RadioSeedRow, type RadioSettings } from "../src/db/repositories/radio";
 import {
   discoverGradientArtistPath,
+  discoverGradientArtistPathBetweenRegions,
+  gradientSeedAnchorArtists,
   planGradientRoute,
   type GradientGraphProvider,
 } from "../src/services/radio-gradient-route";
@@ -26,6 +28,30 @@ function seed(id: string, artist: string, position: number): RadioSeedRow {
     weight: 1,
     position,
     metadata_json: null,
+    created_at: "2026-01-01T00:00:00.000Z",
+  };
+}
+
+function broadSeed(
+  id: string,
+  type: "library" | "liked" | "playlist" | "collection",
+  label: string,
+  position: number,
+  artists: Array<[string, number]>,
+): RadioSeedRow {
+  return {
+    id,
+    station_id: "station",
+    seed_type: type,
+    entity_id: null,
+    artist: null,
+    title: null,
+    label,
+    weight: 1,
+    position,
+    metadata_json: JSON.stringify({
+      tracks: artists.map(([artist, weight], index) => ({ artist, title: `Track ${index + 1}`, weight })),
+    }),
     created_at: "2026-01-01T00:00:00.000Z",
   };
 }
@@ -55,6 +81,59 @@ describe("Gradient musical route planner", () => {
       "X->Y",
       "Y->B",
     ]);
+  });
+
+  test("discovers one bounded route between multi-anchor musical regions", async () => {
+    const graph = provider({
+      A1: [],
+      A2: [["X", 0.9]],
+      X: [["B2", 0.88]],
+      B1: [],
+      B2: [["X", 0.88]],
+    });
+    const discovered = await discoverGradientArtistPathBetweenRegions(
+      ["A1", "A2"],
+      ["B1", "B2"],
+      "geodesic",
+      graph,
+    );
+    expect(discovered.path).not.toBeNull();
+    expect(discovered.fromArtist).toBe("A2");
+    expect(discovered.toArtist).toBe("B2");
+    expect(discovered.path!.edges.map((edge) => `${edge.from}->${edge.to}`)).toEqual([
+      "A2->X",
+      "X->B2",
+    ]);
+    expect(discovered.queryCount).toBeLessThanOrEqual(40);
+  });
+
+  test("broad seeds expose several representative artists instead of one arbitrary track", async () => {
+    const anchors = await gradientSeedAnchorArtists(broadSeed("library", "library", "My library", 0, [
+      ["A", 1],
+      ["B", 3],
+      ["A", 1],
+      ["C", 2],
+      ["D", 0.5],
+      ["E", 0.1],
+    ]));
+    expect(anchors).toEqual(["B", "A", "C", "D"]);
+  });
+
+  test("a broad waypoint can route through a non-primary representative artist", async () => {
+    const graph = provider({
+      Primary: [],
+      Bridgeable: [["X", 0.9]],
+      X: [["B", 0.9]],
+      B: [["X", 0.9]],
+    });
+    const plan = await planGradientRoute([
+      broadSeed("library", "library", "My library", 0, [["Primary", 3], ["Bridgeable", 2]]),
+      seed("b", "B", 1),
+    ], settings("geodesic"), graph);
+    expect(plan.usable).toBe(true);
+    expect(plan.segments[0]!.fromAnchors).toEqual(["Primary", "Bridgeable"]);
+    expect(plan.segments[0]!.fromArtist).toBe("Bridgeable");
+    expect(plan.nodes[0]!.artist).toBe("Bridgeable");
   });
 
   test("assigns route coordinates from cumulative musical edge cost, not playlist slot", async () => {
