@@ -215,6 +215,15 @@ export async function getSong(id: string): Promise<LibrarySong> {
   return mapSong(result.song);
 }
 
+/** Sample real local-library songs through the Subsonic API. */
+export async function getRandomSongs(size = 120): Promise<LibrarySong[]> {
+  const boundedSize = Math.max(1, Math.min(500, Math.floor(size)));
+  const result = await subsonicFetch<{
+    randomSongs: { song?: SubsonicSong | SubsonicSong[] };
+  }>("getRandomSongs", { size: String(boundedSize) });
+  return asArray(result.randomSongs?.song).map(mapSong);
+}
+
 export async function getAlbumList2(params: {
   type: "frequent" | "recent" | "newest" | "highest" | "random" | "alphabeticalByName" | "alphabeticalByArtist";
   size?: number;
