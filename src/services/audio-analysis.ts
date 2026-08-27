@@ -1,7 +1,6 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { stat } from "node:fs/promises";
 import path from "node:path";
-import os from "node:os";
 import { promisify } from "node:util";
 import { getConfig } from "../config";
 import { getDb } from "../db/database";
@@ -10,44 +9,33 @@ import * as navidrome from "./navidrome";
 import { log } from "../middleware/logging";
 
 const execFileAsync = promisify(execFile);
-const ANALYSIS_VERSION = 1;
+const ANALYSIS_VERSION = 2;
 const pending = new Map<string, { canonicalKey: string; navidromeId: string }>();
 let workerRunning = false;
 
-function numberAt(root: unknown, paths: string[]): number | null {
-  for (const dotted of paths) {
-    let value: unknown = root;
-    for (const part of dotted.split(".")) {
-      if (!value || typeof value !== "object") { value = undefined; break; }
-      value = (value as Record<string, unknown>)[part];
-    }
-    if (typeof value === "number" && Number.isFinite(value)) return value;
-  }
-  return null;
+type AnalyzerOutput = {
+  bpm?: number | null;
+  key?: string | null;
+  mode?: string | null;
+  loudness?: number | null;
+  energy?: number | null;
+  timbre?: unknown;
+  rhythm?: unknown;
+  intro?: unknown;
+  outro?: unknown;
+  analysis?: unknown;
+};
+
+function finite(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function stringAt(root: unknown, paths: string[]): string | null {
-  for (const dotted of paths) {
-    let value: unknown = root;
-    for (const part of dotted.split(".")) {
-      if (!value || typeof value !== "object") { value = undefined; break; }
-      value = (value as Record<string, unknown>)[part];
-    }
-    if (typeof value === "string" && value.trim()) return value;
-  }
-  return null;
+function text(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null;
 }
 
-function jsonAt(root: unknown, paths: string[]): string | null {
-  for (const dotted of paths) {
-    let value: unknown = root;
-    for (const part of dotted.split(".")) {
-      if (!value || typeof value !== "object") { value = undefined; break; }
-      value = (value as Record<string, unknown>)[part];
-    }
-    if (value != null) return JSON.stringify(value);
-  }
-  return null;
+function json(value: unknown): string | null {
+  return value == null ? null : JSON.stringify(value);
 }
 
 function upsertAnalysis(input: {
@@ -114,27 +102,37 @@ async function analyzeOne(canonicalKey: string, navidromeId: string) {
     return;
   }
 
-  const fileStat = await stat(filePath);
+  let fileStat;
+  try {
+    fileStat = await stat(filePath);
+  } catch (error) {
+    upsertAnalysis({
+      canonicalKey,
+      fingerprint: null,
+      status: "unavailable",
+      error: `Audio file is not mounted in music-api: ${error instanceof Error ? error.message : String(error)}`.slice(0, 1000),
+    });
+    return;
+  }
+
   const fingerprint = `${fileStat.size}:${Math.floor(fileStat.mtimeMs)}`;
   const cached = getDb().query<{ status: string; source_fingerprint: string | null }, [string, number]>(
     "SELECT status,source_fingerprint FROM track_audio_analysis WHERE canonical_key=? AND analysis_version=?",
   ).get(canonicalKey, ANALYSIS_VERSION);
   if (cached?.status === "ready" && cached.source_fingerprint === fingerprint) return;
 
-  const tmp = await mkdtemp(path.join(os.tmpdir(), "music-radio-analysis-"));
-  const output = path.join(tmp, "analysis.json");
   try {
-    await execFileAsync("essentia_streaming_extractor_music", [filePath, output], {
+    const analyzer = path.resolve(process.cwd(), "scripts/analyze-audio.py");
+    const { stdout } = await execFileAsync("python3", [analyzer, filePath], {
       timeout: 120_000,
-      maxBuffer: 2 * 1024 * 1024,
+      maxBuffer: 1024 * 1024,
     });
-    const parsed = JSON.parse(await readFile(output, "utf8")) as Record<string, unknown>;
-    const bpm = numberAt(parsed, ["rhythm.bpm", "rhythm.bpm_histogram_first_peak_bpm"]);
-    const key = stringAt(parsed, ["tonal.key_key", "tonal.key_edma.key", "tonal.chords_key"]);
-    const mode = stringAt(parsed, ["tonal.key_scale", "tonal.key_edma.scale", "tonal.chords_scale"]);
-    const loudness = numberAt(parsed, ["lowlevel.loudness_ebu128.integrated", "lowlevel.average_loudness", "lowlevel.loudness"]);
-    const energyRaw = numberAt(parsed, ["rhythm.danceability", "lowlevel.dynamic_complexity", "lowlevel.spectral_energy.mean"]);
-    const energy = energyRaw == null ? null : Math.max(0, Math.min(1, energyRaw > 1 ? energyRaw / 10 : energyRaw));
+    const parsed = JSON.parse(stdout) as AnalyzerOutput;
+    const bpm = finite(parsed.bpm);
+    const key = text(parsed.key);
+    const mode = text(parsed.mode);
+    const loudness = finite(parsed.loudness);
+    const energy = finite(parsed.energy);
 
     upsertAnalysis({
       canonicalKey,
@@ -145,21 +143,28 @@ async function analyzeOne(canonicalKey: string, navidromeId: string) {
       mode,
       loudness,
       energy,
-      timbre: jsonAt(parsed, ["lowlevel.mfcc.mean", "lowlevel.spectral_centroid.mean", "lowlevel"]),
-      rhythm: jsonAt(parsed, ["rhythm"]),
-      intro: jsonAt(parsed, ["segmentation", "metadata.audio_properties"]),
-      outro: jsonAt(parsed, ["segmentation", "metadata.audio_properties"]),
+      timbre: json(parsed.timbre),
+      rhythm: json({ ...(parsed.rhythm && typeof parsed.rhythm === "object" ? parsed.rhythm as Record<string, unknown> : {}), analysis: parsed.analysis }),
+      intro: json(parsed.intro),
+      outro: json(parsed.outro),
     });
-    log("info", "radio_audio_analysis_ready", { canonical_key: canonicalKey, navidrome_id: navidromeId, bpm, key });
+    log("info", "radio_audio_analysis_ready", {
+      canonical_key: canonicalKey,
+      navidrome_id: navidromeId,
+      bpm,
+      key,
+      engine: "aubio+numpy",
+    });
   } catch (error) {
     const code = (error as NodeJS.ErrnoException)?.code;
-    const message = code === "ENOENT"
-      ? "essentia_streaming_extractor_music is not installed"
-      : error instanceof Error ? error.message : String(error);
-    upsertAnalysis({ canonicalKey, fingerprint, status: code === "ENOENT" ? "unavailable" : "failed", error: message.slice(0, 1000) });
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === "string" ? (error as { stderr: string }).stderr.trim() : "";
+    const raw = stderr || (error instanceof Error ? error.message : String(error));
+    const unavailable = code === "ENOENT" || /No module named ['\"]?(aubio|numpy)/i.test(raw);
+    const message = unavailable
+      ? `Bundled Radio audio analyzer dependencies are unavailable: ${raw}`
+      : raw;
+    upsertAnalysis({ canonicalKey, fingerprint, status: unavailable ? "unavailable" : "failed", error: message.slice(0, 1000) });
     log("warn", "radio_audio_analysis_failed", { canonical_key: canonicalKey, error: message });
-  } finally {
-    await rm(tmp, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -171,7 +176,10 @@ async function runWorker() {
       const [key, job] = pending.entries().next().value as [string, { canonicalKey: string; navidromeId: string }];
       pending.delete(key);
       await analyzeOne(job.canonicalKey, job.navidromeId).catch((error) => {
-        log("warn", "radio_audio_analysis_worker_error", { canonical_key: job.canonicalKey, error: error instanceof Error ? error.message : String(error) });
+        log("warn", "radio_audio_analysis_worker_error", {
+          canonical_key: job.canonicalKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
       });
     }
   } finally {
@@ -185,9 +193,19 @@ export function queueRadioGenerationAnalysis(generationId: string) {
     pending.set(track.canonical_key, { canonicalKey: track.canonical_key, navidromeId: track.navidrome_id! });
   }
   void runWorker();
-  return { queued: tracks.length, pending: pending.size, analyzer: "essentia_streaming_extractor_music", analysis_version: ANALYSIS_VERSION };
+  return {
+    queued: tracks.length,
+    pending: pending.size,
+    analyzer: "aubio+numpy",
+    analysis_version: ANALYSIS_VERSION,
+  };
 }
 
 export function getAudioAnalysisQueueStatus() {
-  return { running: workerRunning, pending: pending.size, analysis_version: ANALYSIS_VERSION };
+  return {
+    running: workerRunning,
+    pending: pending.size,
+    analyzer: "aubio+numpy",
+    analysis_version: ANALYSIS_VERSION,
+  };
 }
