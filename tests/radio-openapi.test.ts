@@ -24,4 +24,21 @@ describe("Radio OpenAPI", () => {
     expect(paths.has("/v1/radio/generations/{id}")).toBe(true);
     expect(paths.has("/v1/radio/feedback")).toBe(true);
   });
+
+  test("does not leak manager-only mutation and workstation routes", () => {
+    const paths = Object.keys(getRadioOpenApiSpec().paths);
+    const forbiddenFragments = [
+      "/clone",
+      "/reorder",
+      "/revisions",
+      "/regenerate-tail",
+      "/import-external",
+      "/resolve",
+      "/analyze",
+      "/tracks/",
+    ];
+    for (const fragment of forbiddenFragments) {
+      expect(paths.some((path) => path.includes(fragment))).toBe(false);
+    }
+  });
 });
