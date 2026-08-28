@@ -1,0 +1,77 @@
+name: Apply final Gradient budget fix
+
+on:
+  push:
+    branches:
+      - fix/gradient-recording-fallback-correctness
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/gradient-recording-fallback-correctness
+          fetch-depth: 0
+
+      - name: Apply budget guard and diagnostics patch
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('src/services/radio-gradient-recording-path.ts')
+          s = path.read_text()
+          old = 'import type { GradientRouteBudget } from "./radio-gradient-budget";'
+          new = 'import { isBudgetExhausted, type GradientRouteBudget } from "./radio-gradient-budget";'
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''  const neighborCache = new Map<string, GradientRecordingNeighbor[]>();\n  const fetchNeighbors = async (rec: GradientRecording) => {\n    const cached = neighborCache.get(rec.key);\n    if (cached) return cached;\n    if (budget) budget.compressionQueries += 1;\n    const result = await provider.neighbors(rec, 48).catch(() => [] as GradientRecordingNeighbor[]);\n    neighborCache.set(rec.key, result);\n    return result;\n  };'''
+          new = '''  const neighborCache = new Map<string, GradientRecordingNeighbor[]>();\n  let compressionBudgetExhausted = false;\n  const fetchNeighbors = async (rec: GradientRecording) => {\n    const cached = neighborCache.get(rec.key);\n    if (cached) return cached;\n    if (budget && isBudgetExhausted(budget)) {\n      compressionBudgetExhausted = true;\n      return [] as GradientRecordingNeighbor[];\n    }\n    if (budget) budget.compressionQueries += 1;\n    const result = await provider.neighbors(rec, 48).catch(() => [] as GradientRecordingNeighbor[]);\n    neighborCache.set(rec.key, result);\n    return result;\n  };'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          old = '''      const prevNeighbors = await fetchNeighbors(prev);\n      const match = prevNeighbors.find((n) => gradientRecordingKey(n.artist, n.title) === next.key);'''
+          new = '''      const prevNeighbors = await fetchNeighbors(prev);\n      if (compressionBudgetExhausted) {\n        return {\n          path: { ...original, recordings, edges, cost: edges.reduce((sum, e) => sum + gradientRecordingEdgeCost(e.similarity, e.confidence), 0) },\n          removedCount,\n          compressed: false,\n          partialReason: "global_budget_exhausted",\n        };\n      }\n      const match = prevNeighbors.find((n) => gradientRecordingKey(n.artist, n.title) === next.key);'''
+          assert old in s
+          s = s.replace(old, new, 1)
+          path.write_text(s)
+
+          gen = Path('src/services/radio-gradient-recording-generation.ts')
+          s = gen.read_text()
+          old = '''    chained_recording_queries: plan.budget.chainedRecordingQueries,\n    densification_queries: plan.budget.densificationQueries,\n    recording_neighbor_expansions: plan.budget.recordingNeighborExpansions,'''
+          new = '''    chained_recording_queries: plan.budget.chainedRecordingQueries,\n    densification_queries: plan.budget.densificationQueries,\n    compression_queries: plan.budget.compressionQueries,\n    recording_neighbor_expansions: plan.budget.recordingNeighborExpansions,'''
+          assert old in s
+          s = s.replace(old, new, 1)
+          gen.write_text(s)
+
+          test = Path('tests/radio-gradient-recording-path.test.ts')
+          s = test.read_text()
+          old = '''} from "../src/services/radio-gradient-recording-path";\n\nfunction provider'''
+          new = '''} from "../src/services/radio-gradient-recording-path";\nimport { budgetTotalUsed, createRouteBudget } from "../src/services/radio-gradient-budget";\n\nfunction provider'''
+          assert old in s
+          s = s.replace(old, new, 1)
+
+          anchor = '''  test("path already at requested length is unchanged", async () => {'''
+          addition = '''  test("compression never calls the provider past the shared query ceiling", async () => {\n    const artists = ["A", "B", "C", "D", "E"];\n    const path = makePath(artists);\n    let providerCalls = 0;\n    const p: GradientRecordingNeighborProvider = {\n      async neighbors(recording) {\n        providerCalls++;\n        return artists\n          .filter((a) => key(a, `${a}-song`) !== recording.key)\n          .map((a) => ({ ...gradientRecording(a, `${a}-song`), similarity: 0.5, confidence: 0.9, provider: "synthetic" }));\n      },\n    };\n    const budget = createRouteBudget(2, 60_000);\n    budget.initialRecordingQueries = 1;\n\n    const result = await compressGradientRecordingPath(path, 2, p, undefined, budget);\n\n    expect(providerCalls).toBe(1);\n    expect(budgetTotalUsed(budget)).toBe(2);\n    expect(budgetTotalUsed(budget)).toBeLessThanOrEqual(budget.maxQueries);\n    expect(result.compressed).toBe(false);\n    expect(result.partialReason).toBe("global_budget_exhausted");\n  });\n\n'''
+          assert anchor in s
+          s = s.replace(anchor, addition + anchor, 1)
+          test.write_text(s)
+
+          wf = Path('.github/workflows/apply-final-gradient-budget-fix.yml')
+          wf.unlink()
+          PY
+
+      - name: Commit patch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Enforce Gradient compression budget ceiling"
+          git push origin HEAD:fix/gradient-recording-fallback-correctness
