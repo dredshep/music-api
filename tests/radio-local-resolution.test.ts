@@ -8,7 +8,7 @@ import {
   parseRadioSettings,
   replaceGenerationTracks,
 } from "../src/db/repositories/radio";
-import { resolveRadioGenerationLocally } from "../src/services/radio-local-resolution";
+import { localRadioSearchQueries, resolveRadioGenerationLocally } from "../src/services/radio-local-resolution";
 
 const dbPath = `/tmp/music-api-radio-local-resolution-${Date.now()}.sqlite`;
 
@@ -88,6 +88,72 @@ describe("final Radio local resolution", () => {
       availability: "local",
       album: "Local Album",
       duration_ms: 245250,
+    });
+  });
+
+  test("retries a joined credit with the primary artist and accepts provider credit formatting", async () => {
+    expect(localRadioSearchQueries("Grimes featuring HANA", "We Appreciate Power")).toEqual([
+      "Grimes featuring HANA We Appreciate Power",
+      "Grimes We Appreciate Power",
+    ]);
+
+    const station = createStation({
+      name: "Joined resolver",
+      seeds: [{ type: "artist", artist: "Grimes", label: "Grimes" }],
+      settings: { length: 1 },
+    });
+    const generation = createGeneration({
+      stationId: station.id,
+      requestedLength: 1,
+      generatorVersion: "test",
+      randomSeed: "joined-resolver",
+      settingsSnapshot: parseRadioSettings(station.settings_json),
+    });
+    replaceGenerationTracks(generation.id, [{
+      canonical_key: "text:grimes featuring hana|we appreciate power",
+      artist: "Grimes featuring HANA",
+      title: "We Appreciate Power",
+      album: null,
+      duration_ms: null,
+      isrc: null,
+      spotify_id: null,
+      navidrome_id: null,
+      musicbrainz_id: null,
+      playback_source: null,
+      availability_status: "unknown",
+      pinned: 0,
+      manual: 0,
+      selection_score: 1,
+      trajectory_position: null,
+      metadata_json: null,
+    }]);
+
+    const seen: string[] = [];
+    const resolved = await resolveRadioGenerationLocally(generation.id, async (query) => {
+      seen.push(query);
+      return {
+        artists: [],
+        albums: [],
+        songs: query.startsWith("Grimes We Appreciate Power") ? [{
+          id: "nav-grimes-hana",
+          title: "We Appreciate Power",
+          artist: "Grimes, HANA",
+          album: "We Appreciate Power",
+          albumId: "album-grimes",
+          artistId: "artist-grimes",
+          duration: 231,
+        }] : [],
+      };
+    });
+
+    expect(seen).toEqual([
+      "Grimes featuring HANA We Appreciate Power",
+      "Grimes We Appreciate Power",
+    ]);
+    expect(resolved?.tracks[0]).toMatchObject({
+      navidrome_id: "nav-grimes-hana",
+      playback_source: "navidrome",
+      availability: "local",
     });
   });
 
