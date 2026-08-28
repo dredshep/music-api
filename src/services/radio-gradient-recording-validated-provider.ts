@@ -12,6 +12,7 @@ export interface GradientValidatedProviderDiagnostics extends GradientRecordingP
   acousticAssessments: number;
   acousticEvidenceEdges: number;
   acousticPenaltyEdges: number;
+  acousticValidationMs: number;
   catastrophicRejectedEdges: number;
   catastrophicReasons: Record<string, number>;
 }
@@ -35,6 +36,7 @@ export function createValidatedGradientRecordingProvider(): ValidatedGradientRec
   let acousticAssessments = 0;
   let acousticEvidenceEdges = 0;
   let acousticPenaltyEdges = 0;
+  let acousticValidationMs = 0;
   let catastrophicRejectedEdges = 0;
   const catastrophicReasons: Record<string, number> = {};
 
@@ -45,10 +47,13 @@ export function createValidatedGradientRecordingProvider(): ValidatedGradientRec
       for (const row of rows) {
         acousticAssessments++;
         let assessment;
+        const startedAt = performance.now();
         try {
           assessment = assessCachedAcousticTransition(source, row);
         } catch {
           assessment = null;
+        } finally {
+          acousticValidationMs += performance.now() - startedAt;
         }
         if (assessment?.evidenceCount) acousticEvidenceEdges++;
         if (assessment?.catastrophic) {
@@ -77,6 +82,7 @@ export function createValidatedGradientRecordingProvider(): ValidatedGradientRec
         acousticAssessments,
         acousticEvidenceEdges,
         acousticPenaltyEdges,
+        acousticValidationMs: Number(acousticValidationMs.toFixed(2)),
         catastrophicRejectedEdges,
         catastrophicReasons: { ...catastrophicReasons },
       };
