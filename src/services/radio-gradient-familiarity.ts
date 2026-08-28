@@ -1,7 +1,7 @@
 import { getDb } from "../db/database";
 import { normalizeForComparison } from "../domain/normalization";
-import { gradientRecordingKey, type GradientRecording } from "./radio-gradient-recording-path";
-import type { TasteTrack } from "./radio";
+import type { GradientRecording } from "./radio-gradient-recording-path";
+import { canonicalRadioTrackKey, type TasteTrack } from "./radio";
 
 interface HistoryRow {
   canonical_key: string;
@@ -18,6 +18,11 @@ function clamp(value: number, min: number, max: number) {
  * Coarse user familiarity evidence for discovery shaping. A saved Radio
  * appearance is weaker than explicit taste/history input; local ownership adds
  * only a small bump and is never treated as proof that the recording was heard.
+ *
+ * Recording-graph node keys are intentionally internal to that graph. All
+ * joins against the existing Radio/history/audio model use the established
+ * `canonicalRadioTrackKey()` identity so old generations and new routes share
+ * one exact-recording namespace.
  */
 export function buildGradientFamiliarityScorer(
   stationId: string,
@@ -28,7 +33,7 @@ export function buildGradientFamiliarityScorer(
 
   for (const track of tasteProfile) {
     const weight = clamp(track.weight ?? 1, 0, 1);
-    const key = gradientRecordingKey(track.artist, track.title);
+    const key = canonicalRadioTrackKey(track.artist, track.title);
     exact.set(key, Math.max(exact.get(key) ?? 0, weight));
     const artistKey = normalizeForComparison(track.artist);
     artist.set(artistKey, Math.max(artist.get(artistKey) ?? 0, weight * 0.72));
@@ -57,7 +62,7 @@ export function buildGradientFamiliarityScorer(
   }
 
   return (recording) => {
-    const exactValue = exact.get(recording.key);
+    const exactValue = exact.get(canonicalRadioTrackKey(recording.artist, recording.title));
     const artistValue = artist.get(normalizeForComparison(recording.artist));
     if (exactValue == null && artistValue == null) return 0;
     return clamp(Math.max(exactValue ?? 0, artistValue ?? 0), 0, 1);
