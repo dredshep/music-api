@@ -106,6 +106,18 @@ describe("Gradient Live route state", () => {
     expect(isValidGradientLiveRouteState("station", nonCompleteExhausted)).toBe(false);
   });
 
+  test("final endpoint status overrides planner endpoint status", () => {
+    const gen = generation(6, true);
+    const diag = gen.diagnostics as Record<string, unknown>;
+    diag.gradient_final_endpoint_status = { start_satisfied: false, end_satisfied: true };
+    const state = createGradientLiveRouteState("station", gen);
+    expect(state).toBeNull();
+
+    diag.gradient_final_endpoint_status = { start_satisfied: true, end_satisfied: true };
+    const state2 = createGradientLiveRouteState("station", gen);
+    expect(state2).not.toBeNull();
+  });
+
   test("only creates reusable state for a genuine non-fallback recording path", () => {
     expect(createGradientLiveRouteState("station", {
       ...generation(5),

@@ -13,6 +13,7 @@ export interface GradientRouteBudget {
   bridgeTrackLookups: number;
   chainedRecordingQueries: number;
   densificationQueries: number;
+  compressionQueries: number;
   cachedGraphNodesExpanded: number;
   cachedGraphEdgesExpanded: number;
   initialRecordingQueries: number;
@@ -31,6 +32,7 @@ export interface GradientRouteBudgetSnapshot {
   bridgeTrackLookups: number;
   chainedRecordingQueries: number;
   densificationQueries: number;
+  compressionQueries: number;
   cachedGraphNodesExpanded: number;
   cachedGraphEdgesExpanded: number;
   initialRecordingQueries: number;
@@ -46,6 +48,7 @@ export function createRouteBudget(maxQueries: number, deadlineMs: number): Gradi
     bridgeTrackLookups: 0,
     chainedRecordingQueries: 0,
     densificationQueries: 0,
+    compressionQueries: 0,
     cachedGraphNodesExpanded: 0,
     cachedGraphEdgesExpanded: 0,
     initialRecordingQueries: 0,
@@ -56,6 +59,7 @@ export function budgetTotalUsed(budget: GradientRouteBudget): number {
   return budget.initialRecordingQueries
     + budget.chainedRecordingQueries
     + budget.densificationQueries
+    + budget.compressionQueries
     + budget.artistBridgeCalls
     + budget.bridgeTrackLookups;
 }
@@ -89,6 +93,7 @@ export function snapshotBudget(budget: GradientRouteBudget): GradientRouteBudget
     bridgeTrackLookups: budget.bridgeTrackLookups,
     chainedRecordingQueries: budget.chainedRecordingQueries,
     densificationQueries: budget.densificationQueries,
+    compressionQueries: budget.compressionQueries,
     cachedGraphNodesExpanded: budget.cachedGraphNodesExpanded,
     cachedGraphEdgesExpanded: budget.cachedGraphEdgesExpanded,
     initialRecordingQueries: budget.initialRecordingQueries,

@@ -1,4 +1,5 @@
 import { normalizeForComparison } from "../domain/normalization";
+import type { GradientRouteBudget } from "./radio-gradient-budget";
 
 export interface GradientRecording {
   key: string;
@@ -698,6 +699,7 @@ export async function compressGradientRecordingPath(
   requestedLength: number,
   provider: GradientRecordingNeighborProvider,
   mandatoryKeys?: Set<string>,
+  budget?: GradientRouteBudget,
 ): Promise<GradientPathCompressionResult> {
   if (original.recordings.length <= requestedLength) {
     return { path: original, removedCount: 0, compressed: true, partialReason: null };
@@ -713,6 +715,7 @@ export async function compressGradientRecordingPath(
   const fetchNeighbors = async (rec: GradientRecording) => {
     const cached = neighborCache.get(rec.key);
     if (cached) return cached;
+    if (budget) budget.compressionQueries += 1;
     const result = await provider.neighbors(rec, 48).catch(() => [] as GradientRecordingNeighbor[]);
     neighborCache.set(rec.key, result);
     return result;

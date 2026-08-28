@@ -273,7 +273,12 @@ function requiredWaypointRecording(region: GradientSeedRecordingRegion) {
 
 function satisfiesRegion(recording: GradientRecording | undefined, region: GradientSeedRecordingRegion) {
   if (!recording) return false;
-  if (region.constraint === "exact_track") return recording.key === region.recordings[0]?.key;
+  if (region.constraint === "exact_track") {
+    const expected = region.recordings[0];
+    if (!expected || recording.key !== expected.key) return false;
+    if (expected.mbid && expected.mbid !== recording.mbid) return false;
+    return true;
+  }
   if (region.constraint === "artist") return Boolean(region.requestedArtist)
     && normalizeForComparison(recording.artist) === normalizeForComparison(region.requestedArtist!);
   return true;
@@ -326,7 +331,10 @@ async function findArtistBridge(
     const expandQueue = async (queue: Node[], visited: Map<string, Node>, other: Map<string, Node>) => {
       const batch = queue.splice(0, beamWidth);
       const results = await Promise.all(batch.map(async (node) => {
-        if (budget) budget.artistBridgeCalls += 1;
+        if (budget) {
+          if (isBudgetExhausted(budget)) return { node, similar: [] as Awaited<ReturnType<typeof lastfm.getSimilarArtists>> };
+          budget.artistBridgeCalls += 1;
+        }
         try {
           return { node, similar: await lastfm.getSimilarArtists(node.artist, 30) };
         } catch { return { node, similar: [] as Awaited<ReturnType<typeof lastfm.getSimilarArtists>> }; }
@@ -590,15 +598,13 @@ export async function planGradientRecordingRoute(input: {
     queryCount += raw.queryCount;
     const targetNodes = (allocation[index] ?? 1) + 1;
     const densificationStartedAt = performance.now();
-    const densifyBudget = Math.min(scenic ? 128 : 96, budgetRemaining(budget));
-
     let pathForDensification = raw;
     let compressionPartial: string | null = null;
     if (raw.recordings.length > targetNodes) {
       const mandatoryKeys = new Set<string>();
       if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
       if (right.constraint !== "region") for (const r of right.recordings) mandatoryKeys.add(r.key);
-      const compressed = await compressGradientRecordingPath(raw, targetNodes, provider, mandatoryKeys);
+      const compressed = await compressGradientRecordingPath(raw, targetNodes, provider, mandatoryKeys, budget);
       pathForDensification = compressed.path;
       if (!compressed.compressed) compressionPartial = compressed.partialReason;
     }
@@ -620,6 +626,7 @@ export async function planGradientRecordingRoute(input: {
       budget.densificationQueries += refined.queryCount;
     }
 
+    const densifyBudget = Math.min(scenic ? 128 : 96, budgetRemaining(budget));
     const dense = await densifyGradientRecordingPathWithSubpathFallback(pathForDensification, targetNodes, provider, {
       maxQueries: densifyBudget,
       neighborLimit: scenic ? 56 : 48,

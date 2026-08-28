@@ -98,7 +98,9 @@ export function createGradientLiveRouteState(stationId: string, generation: {
   const positioned = generation.tracks.filter((track) => authoritativeGradientLiveRoutePosition(track) != null);
   if (!isRecordingPath || fallback || positioned.length < 2) return null;
 
-  const endpointStatus = routeObject?.endpoint_status as Record<string, unknown> | null | undefined;
+  const finalEp = generation.diagnostics?.gradient_final_endpoint_status as Record<string, unknown> | null | undefined;
+  const plannerEp = routeObject?.endpoint_status as Record<string, unknown> | null | undefined;
+  const endpointStatus = finalEp ?? plannerEp;
   const routeComplete = routeObject?.complete === true
     && endpointStatus?.start_satisfied === true
     && endpointStatus?.end_satisfied === true;
