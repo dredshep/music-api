@@ -6,7 +6,8 @@ const seedCommon = {
   entityId: { type: ["string", "null"] },
   label: { type: "string" },
   weight: { type: "number", minimum: 0.01 },
-  position: { type: ["number", "null"], minimum: 0, maximum: 1, description: "User waypoint position normalized from 0 (start) to 1 (end). Generated track coordinates are discovered from the musical route and are not playlist-index percentages." },
+  position: { type: ["number", "null"], minimum: 0, maximum: 1, description: "User waypoint position normalized from 0 (start) to 1 (end). Generated track coordinates are discovered from the recording route and are not playlist-index percentages." },
+  metadata: { type: ["object", "null"], additionalProperties: true, description: "Optional stable identity/provider metadata. Exact track seeds may include recordingMbid/musicbrainzId/mbid so the requested recording identity survives route planning." },
 } as const;
 
 const seed = {
@@ -66,21 +67,21 @@ const radioSettings = {
     gradientAlgorithm: {
       type: "string",
       enum: ["geodesic", "scenic", "blend"],
-      description: "Gradient route strategy. geodesic finds a compact path through locally related musical regions; scenic explores a wider/longer path; blend is the legacy endpoint interpolation baseline.",
+      description: "Gradient route strategy. geodesic finds a compact bounded path through recording similarity; scenic spends a wider search/densification budget; blend is the legacy endpoint interpolation baseline.",
       default: "geodesic",
     },
     gradientRouteStrength: {
       type: "number",
       minimum: 0,
       maximum: 8,
-      description: "How strongly generated tracks must follow the discovered musical route rather than generic Radio ranking.",
+      description: "Legacy/compatibility setting retained in station recipes. Recording-path geodesic/scenic generations use the discovered path itself rather than mixing it into generic candidate ranking.",
       default: 2.4,
     },
     gradientRouteWidth: {
       type: "number",
       minimum: 0.05,
       maximum: 0.6,
-      description: "Allowed local width around each discovered route coordinate. Smaller values enforce a tighter path.",
+      description: "Legacy/compatibility route-width setting retained in station recipes.",
       default: 0.22,
     },
   },
@@ -90,8 +91,8 @@ const spec = {
   openapi: "3.1.0",
   info: {
     title: "Music Radio API",
-    version: "1.2.0",
-    description: "Semantic API for finite saved Radio plus cursor-aware bounded live continuation. Gradient Radio can discover graph-based musical routes whose intermediate regions need no direct endpoint similarity. Saved generations never silently mutate or auto-extend.",
+    version: "1.3.0",
+    description: "Semantic API for finite saved Radio plus coherent bounded live continuation. Gradient geodesic/scenic discovers recording-level A→B paths, assigns only authoritative musical-route coordinates, and labels ordinary Radio fallback explicitly when no valid path exists. Saved generations never silently mutate or auto-extend.",
   },
   servers: [{ url: "https://music-api.besto.me" }],
   security: [{ bearerAuth: [] }],
@@ -108,7 +109,7 @@ const spec = {
       post: {
         operationId: "createRadio",
         summary: "Create a finite saved radio",
-        description: "Create a station from self-sufficient track, artist, album, genre, or local-library seeds. For type=gradient, geodesic/scenic route discovery walks locally related musical regions between adjacent waypoints instead of merely mixing endpoint recommendation lists.",
+        description: "Create a station from self-sufficient track, artist, album, genre, or local-library seeds. For type=gradient, geodesic/scenic searches recursively through recording-level neighbors between waypoints rather than mixing endpoint recommendation lists. Exact track metadata may carry a recording MBID.",
         requestBody: {
           required: true,
           content: { "application/json": { schema: {
@@ -138,7 +139,7 @@ const spec = {
       post: {
         operationId: "generateRadioVersion",
         summary: "Generate another saved version",
-        description: "Generate a new finite child playlist without replacing any previous generation. Gradient stations reuse their selected route algorithm and persist route diagnostics with the generation.",
+        description: "Generate a new finite child playlist without replacing previous generations. Successful geodesic/scenic Gradient generations persist the actual recording path, graph edges, cache/search diagnostics, bottleneck and familiarity data.",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         requestBody: { content: { "application/json": { schema: { type: "object", properties: { length: { type: "integer", minimum: 1, maximum: 200 } } } } } },
         responses: { "201": { description: "New saved generation" } },
@@ -147,25 +148,26 @@ const spec = {
     "/v1/radio/stations/{id}/live-batch": {
       post: {
         operationId: "continueLiveRadio",
-        summary: "Generate a bounded live continuation",
-        description: "Return an ephemeral continuation batch without adding it to saved-generation history. For Gradient stations pass each response next_cursor back as routeCursor so later batches continue forward through the musical route and wrap only after reaching its end.",
+        summary: "Generate or continue a bounded live route",
+        description: "A successful recording-level Gradient first batch returns route_state containing the bounded finalized route. Return that state unchanged as routeState on later refills so every batch consumes the same A→B path. The route terminates at B with route_completed=true; it does not silently wrap to A. routeCursor remains for legacy/partial/fallback continuation.",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         requestBody: { content: { "application/json": { schema: {
           type: "object",
           properties: {
             count: { type: "integer", minimum: 4, maximum: 30 },
             excludeKeys: { type: "array", maxItems: 5000, items: { type: "string" } },
-            routeCursor: { type: ["number", "null"], minimum: 0, maximum: 1, description: "Normalized musical-route continuation coordinate from the previous next_cursor. Use 0 or omit for the first batch." },
+            routeCursor: { type: ["number", "null"], minimum: 0, maximum: 1, description: "Legacy/partial/fallback route cursor. Successful recording-path sessions should return the previous route_state instead." },
+            routeState: { type: ["object", "null"], additionalProperties: true, description: "Opaque bounded recording-path state returned as route_state by the prior batch." },
           },
         } } } },
-        responses: { "200": { description: "Ephemeral continuation with route_cursor, next_cursor and route_wrapped for Gradient sessions" } },
+        responses: { "200": { description: "Ephemeral continuation including route_state and route_completed for coherent recording-path sessions" } },
       },
     },
     "/v1/radio/generations/{id}": {
       get: {
         operationId: "getRadioGeneration",
         summary: "Get an exact saved radio playlist",
-        description: "Gradient generation diagnostics include the discovered route. Track trajectory_position is a musical route coordinate only for graph-routed generations; legacy blend tracks do not claim a musical coordinate.",
+        description: "Gradient diagnostics expose the discovered recording route, providers/cache/search metrics and route state. trajectory_position is a musical coordinate only when metadata marks trajectoryCoordinateKind=musical_route; fallback/unsupported tracks remain unpositioned.",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         responses: { "200": { description: "Exact persisted track sequence, availability and route diagnostics" } },
       },
