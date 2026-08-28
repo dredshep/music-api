@@ -2,8 +2,8 @@ import type { GradientAlgorithm, RadioSeedRow, RadioSettings } from "../db/repos
 import { normalizeForComparison } from "../domain/normalization";
 import * as lastfm from "./lastfm";
 import { densifyGradientRecordingPathWithSubpathFallback } from "./radio-gradient-densify-subpath";
+import { discoverValidatedCachedRecordingPath } from "./radio-gradient-cached-path";
 import {
-  discoverCachedRecordingPath,
   discoverGradientRecordingPath,
   gradientRecording,
   type GradientDensificationOperation,
@@ -348,7 +348,6 @@ async function findArtistBridge(
         cursor = node.parent;
       }
       path.push(...fwdPath, ...bwdPath);
-      // Remove the endpoint artists themselves
       const filtered = path.filter((a) => {
         const n = normalizeForComparison(a);
         return n !== startNorm && n !== endNorm;
@@ -442,12 +441,9 @@ export async function planGradientRecordingRoute(input: {
     const pathStartedAt = performance.now();
     let raw = await discoverGradientRecordingPath(fromCandidates, toCandidates, provider, pathSearchOptions);
 
-    // When the online provider search fails, try an offline BFS over the
-    // entire cached recording similarity graph. This catches multi-hop
-    // paths that span more hops than the live search budget allows.
     if (!raw) {
       try {
-        const cachedPath = discoverCachedRecordingPath(fromCandidates, toCandidates);
+        const cachedPath = discoverValidatedCachedRecordingPath(fromCandidates, toCandidates);
         if (cachedPath) {
           log("info", "gradient_cached_path_found", {
             from: left.label,
@@ -476,13 +472,9 @@ export async function planGradientRecordingRoute(input: {
       }
     }
 
-    // When both online and cached searches fail, discover artist-level
-    // bridge artists via Last.fm similarity and chain shorter recording-
-    // level hops through them.
     if (!raw && left.requestedArtist && right.requestedArtist) {
       const bridgeArtists = await findArtistBridge(left.requestedArtist, right.requestedArtist, 8, 12);
       if (bridgeArtists.length) {
-        // Build a chain of recording-level hops: A → bridge1 → bridge2 → ... → B
         const chainRegions: GradientRecording[][] = [fromCandidates];
         for (const bridgeArtist of bridgeArtists) {
           try {
@@ -495,7 +487,6 @@ export async function planGradientRecordingRoute(input: {
         }
         chainRegions.push(toCandidates);
 
-        // Try recording-level search between each adjacent pair in the chain
         const chainRecordings: GradientRecording[] = [];
         const chainEdges: GradientRecordingPathEdge[] = [];
         let chainQueryCount = 0;
