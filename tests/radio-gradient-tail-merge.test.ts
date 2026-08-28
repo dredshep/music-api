@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { RadioTrackRow } from "../src/db/repositories/radio";
 import {
+  assessGradientMergedEndpoints,
   mergeGradientPlannedTail,
   reprojectGradientLockedTrack,
   type StoredGradientTrack,
@@ -116,5 +117,26 @@ describe("Gradient tail merge", () => {
     expect(merged.map((row) => row.canonical_key)).toEqual(["A", "Manual", "X", "Y"]);
     expect(merged[1]!.trajectory_position).toBeNull();
     expect(JSON.parse(merged[1]!.metadata_json!).gradientLockedOffRoute).toBe(true);
+  });
+
+  test("reports an endpoint lock conflict when a user lock displaces hard B", () => {
+    const merged = [planned("A", 0), planned("X", 0.5), planned("Pinned outro", 0.8)];
+    const status = assessGradientMergedEndpoints(
+      merged,
+      { constraint: "artist", requestedArtist: "A", exactCanonicalKey: null },
+      { constraint: "artist", requestedArtist: "B", exactCanonicalKey: null },
+    );
+    expect(status.startSatisfied).toBe(true);
+    expect(status.endSatisfied).toBe(false);
+    expect(status.conflict).toBe(true);
+  });
+
+  test("broad region endpoints do not become hard endpoint constraints", () => {
+    const status = assessGradientMergedEndpoints(
+      [planned("Whatever", 0), planned("Elsewhere", 1)],
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null },
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null },
+    );
+    expect(status.satisfied).toBe(true);
   });
 });
