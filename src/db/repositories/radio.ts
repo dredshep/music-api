@@ -4,6 +4,7 @@ import { getDb } from "../database";
 export type RadioStationType = "standard" | "gradient";
 export type RadioSeedType = "track" | "artist" | "album" | "genre" | "playlist" | "liked" | "library" | "collection";
 export type RadioFeedbackAction = "more_like" | "less_like" | "ban_station" | "rank_down_global" | "ban_track_global" | "ban_artist_global";
+export type GradientAlgorithm = "blend" | "geodesic" | "scenic";
 
 export interface RadioSettings {
   length: number;
@@ -20,6 +21,9 @@ export interface RadioSettings {
   repeatStrength: number;
   surprise: number;
   djFlow: number;
+  gradientAlgorithm: GradientAlgorithm;
+  gradientRouteStrength: number;
+  gradientRouteWidth: number;
   providerWeights: Record<string, number>;
   djWeights: Record<string, number>;
 }
@@ -39,6 +43,9 @@ export const DEFAULT_RADIO_SETTINGS: RadioSettings = {
   repeatStrength: 0.8,
   surprise: 0.15,
   djFlow: 0.65,
+  gradientAlgorithm: "geodesic",
+  gradientRouteStrength: 2.4,
+  gradientRouteWidth: 0.22,
   providerWeights: {
     seed: 1.05,
     spotify_taste: 1,
@@ -53,6 +60,7 @@ export const DEFAULT_RADIO_SETTINGS: RadioSettings = {
     lastfm_artist: 0.85,
     lastfm_album: 0.85,
     lastfm_tag: 0.85,
+    gradient_route: 1.05,
     listenbrainz: 0.35,
     musicbrainz: 0.25,
     internal_feedback: 0.8,

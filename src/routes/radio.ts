@@ -5,7 +5,6 @@ import {
   cloneGeneration,
   createRadio,
   DEFAULT_RADIO_SETTINGS,
-  generateStation,
   insertManualGenerationTrack,
   listGenerationRevisions,
   listRadioStations,
@@ -13,7 +12,6 @@ import {
   presentGeneration,
   presentStation,
   recordRadioFeedback,
-  regenerateTail,
   removeGenerationTrack,
   removeRadioStation,
   reorderGenerationTracks,
@@ -21,6 +19,10 @@ import {
   revertGenerationRevision,
   updateRadioStation,
 } from "../services/radio";
+import {
+  generateRadioStationWithGradient,
+  regenerateRadioTailWithGradient,
+} from "../services/radio-gradient-generation";
 import { hydrateNativeRadioSeeds, refreshNativeRadioSeedSnapshots } from "../services/radio-native-seeds";
 import { finalizeRadioGeneration } from "../services/radio-finalize";
 import { syncRadioGenerationLengthToTracks } from "../services/radio-generation-metadata";
@@ -66,6 +68,9 @@ const partialSettingsSchema = z.object({
   repeatStrength: z.number().min(0).max(2).optional(),
   surprise: z.number().min(0).max(1).optional(),
   djFlow: z.number().min(0).max(1).optional(),
+  gradientAlgorithm: z.enum(["blend", "geodesic", "scenic"]).optional(),
+  gradientRouteStrength: z.number().min(0).max(8).optional(),
+  gradientRouteWidth: z.number().min(0.05).max(0.6).optional(),
   providerWeights: z.record(z.number().min(0).max(5)).optional(),
   djWeights: z.record(z.number().min(0).max(5)).optional(),
 });
@@ -118,8 +123,14 @@ radioRoutes.get("/radio/stations", (c) => c.json({ stations: listRadioStations()
 
 radioRoutes.post("/radio/stations", async (c) => {
   const input = createSchema.parse(await c.req.json());
-  const result = await createRadio({ ...input, seeds: await hydrateNativeRadioSeeds(input.seeds) });
-  if (result.generation) result.generation = await finalizeRadioGeneration(result.generation.id);
+  const hydrated = await hydrateNativeRadioSeeds(input.seeds);
+  const result = await createRadio({ ...input, seeds: hydrated, generate: false });
+  if (input.generate !== false) {
+    const stationId = result.station?.id;
+    if (!stationId) throw new AppError("RADIO_CREATE_FAILED", "Radio station was not created", 500);
+    const generation = await generateRadioStationWithGradient(stationId, { tasteProfile: input.tasteProfile });
+    result.generation = await finalizeRadioGeneration(generation.id);
+  }
   return c.json(result, 201);
 });
 
@@ -151,7 +162,7 @@ radioRoutes.post("/radio/stations/:id/generate", async (c) => {
   if (!presentStation(stationId)) throw new AppError("RADIO_NOT_FOUND", "Radio station not found", 404);
   const input = generateSchema.parse(await c.req.json().catch(() => ({}))) ?? {};
   await refreshNativeRadioSeedSnapshots(stationId);
-  const generation = await generateStation(stationId, input);
+  const generation = await generateRadioStationWithGradient(stationId, input);
   return c.json(await finalizeRadioGeneration(generation.id), 201);
 });
 
@@ -173,7 +184,7 @@ radioRoutes.post("/radio/generations/:id/regenerate-tail", async (c) => {
   if (!existing) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);
   const input = regenerateSchema.parse(await c.req.json());
   await refreshNativeRadioSeedSnapshots(existing.station_id);
-  const generation = await regenerateTail(generationId, input.fromPosition, input.tasteProfile);
+  const generation = await regenerateRadioTailWithGradient(generationId, input.fromPosition, input.tasteProfile);
   return c.json(await finalizeRadioGeneration(generation.id, { fromPosition: input.fromPosition }));
 });
 

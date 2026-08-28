@@ -50,6 +50,10 @@ function metadataObject(track: RadioTrackRow): Record<string, unknown> {
   catch { return {}; }
 }
 
+function isGradientWaypoint(track: RadioTrackRow) {
+  return metadataObject(track).gradientWaypoint === true;
+}
+
 function loadFeatures(track: RadioTrackRow): TrackFeatures {
   const row = getDb().query<AnalysisRow, [string]>(`SELECT bpm,musical_key,mode,loudness,energy,timbre_json,intro_json,outro_json
       FROM track_audio_analysis
@@ -259,10 +263,11 @@ function segmentOrder(
 }
 
 /**
- * Reorder only generated/unpinned positions. Prefix locks, pinned tracks and
- * manually inserted tracks remain exactly where the user put them. Existing
- * cached analysis is used immediately; fresh DSP is queued after finalization
- * and affects future generations rather than silently mutating this saved one.
+ * Reorder only generated/unpinned positions. Prefix locks, pinned tracks,
+ * manually inserted tracks, and exact Gradient waypoint tracks remain exactly
+ * where they were placed. Existing cached analysis is used immediately; fresh
+ * DSP is queued after finalization and affects future generations rather than
+ * silently mutating this saved one.
  */
 export function resequenceRadioGeneration(
   generationId: string,
@@ -279,7 +284,7 @@ export function resequenceRadioGeneration(
   const features = new Map(tracks.map((track) => [track.id, loadFeatures(track)]));
   const locked = new Set<number>();
   for (const track of tracks) {
-    if (track.position < fromPosition || track.pinned || track.manual) locked.add(track.position);
+    if (track.position < fromPosition || track.pinned || track.manual || isGradientWaypoint(track)) locked.add(track.position);
   }
 
   const byPosition = new Map(tracks.map((track) => [track.position, track]));
