@@ -5,6 +5,7 @@ import {
   parseRadioSettings,
   type RadioTrackRow,
 } from "../db/repositories/radio";
+import { scoreCachedTransitionOrder } from "./radio-transition-order";
 
 function metadata(track: RadioTrackRow): Record<string, unknown> {
   try { return track.metadata_json ? JSON.parse(track.metadata_json) as Record<string, unknown> : {}; }
@@ -56,13 +57,20 @@ export function repairGradientRouteSegmentOrder(segment: RadioTrackRow[]): Radio
   return output;
 }
 
+function orderTrace(tracks: RadioTrackRow[]) {
+  return tracks.map((track) => ({
+    canonical_key: track.canonical_key,
+    artist: track.artist,
+    title: track.title,
+    route_position: musicalRoutePosition(track),
+  }));
+}
+
 /**
  * Final safety pass after DJ resequencing. It never moves a regenerate prefix,
- * pinned track, manual edit, or exact Gradient track waypoint. Inside each
- * remaining contiguous segment it removes meaningful route-coordinate
- * inversions while preserving unknown-coordinate slots. This keeps audio/DJ
- * optimization subordinate to the global A→B musical route without undoing an
- * exact recording the user placed as a waypoint.
+ * pinned track, manual edit, or hard Gradient waypoint. With recording-level
+ * coordinates this should normally be a no-op; frequent movement is treated as
+ * evidence that an earlier stage is producing an invalid route.
  */
 export function enforceGradientRouteOrder(
   generationId: string,
@@ -76,14 +84,25 @@ export function enforceGradientRouteOrder(
     moved: 0,
     backtracksBefore: 0,
     backtracksAfter: 0,
+    orderBefore: [],
+    orderAfter: [],
+    transitionBefore: null,
+    transitionAfter: null,
+    transitionScoreDelta: null,
   };
 
   const tracks = getGenerationTracks(generationId);
+  const transitionBefore = scoreCachedTransitionOrder(tracks);
   if (tracks.length < 2 || !tracks.some((track) => musicalRoutePosition(track) != null)) return {
     applied: false,
     moved: 0,
     backtracksBefore: countGradientRouteBacktracks(tracks),
     backtracksAfter: countGradientRouteBacktracks(tracks),
+    orderBefore: orderTrace(tracks),
+    orderAfter: orderTrace(tracks),
+    transitionBefore,
+    transitionAfter: transitionBefore,
+    transitionScoreDelta: transitionBefore.score == null ? null : 0,
   };
 
   const fromPosition = Math.max(0, options.fromPosition ?? 0);
@@ -117,10 +136,19 @@ export function enforceGradientRouteOrder(
     })();
   }
   const repaired = moved ? getGenerationTracks(generationId) : tracks;
+  const transitionAfter = scoreCachedTransitionOrder(repaired);
+  const transitionScoreDelta = transitionBefore.score == null || transitionAfter.score == null
+    ? null
+    : transitionAfter.score - transitionBefore.score;
   return {
     applied: true,
     moved,
     backtracksBefore,
     backtracksAfter: countGradientRouteBacktracks(repaired),
+    orderBefore: orderTrace(tracks),
+    orderAfter: orderTrace(repaired),
+    transitionBefore,
+    transitionAfter,
+    transitionScoreDelta,
   };
 }
