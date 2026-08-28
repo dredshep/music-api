@@ -215,12 +215,14 @@ async function compressFixedLengthBalanced(
   const removed: GradientRecording[] = [];
   let queryCount = 0;
 
+  const biNeighbors = provider.bidirectionalNeighbors?.bind(provider);
   const neighbors = async (recording: GradientRecording) => {
     const cached = cache.get(recording.key);
     if (cached) return cached;
     if (queryCount >= maxQueries) return null;
     queryCount++;
-    const rows = await provider.neighbors(recording, Math.max(24, Math.min(64, options.neighborLimit ?? 48)))
+    const limit = Math.max(24, Math.min(64, options.neighborLimit ?? 48));
+    const rows = await (biNeighbors?.(recording, limit) ?? provider.neighbors(recording, limit))
       .catch(() => [] as GradientRecordingNeighbor[]);
     cache.set(recording.key, rows);
     return rows;
@@ -235,14 +237,20 @@ async function compressFixedLengthBalanced(
     }
 
     let best: { index: number; edge: GradientRecordingPathEdge; score: number } | null = null;
+    const compressionCandidates: Array<{ index: number; current: string; prev: string; next: string; matchFound: boolean; matchSim?: number }> = [];
     for (let index = 1; index < recordings.length - 1; index++) {
       const current = recordings[index]!;
       if (protectedSet.has(current.key)) continue;
       const prev = recordings[index - 1]!;
       const next = recordings[index + 1]!;
       const rows = await neighbors(prev);
-      if (rows == null) return null;
-      const match = rows.find((row) => row.key === next.key);
+      if (rows == null) {
+        console.log(JSON.stringify({ level: "debug", event: "compression_budget_exhausted", index, prev: prev.key }));
+        return null;
+      }
+      const match = rows.find((row) => row.key === next.key)
+        ?? provider.lookupEdge?.(prev.key, next.key) ?? null;
+      compressionCandidates.push({ index, current: current.key, prev: prev.key, next: next.key, matchFound: !!match, matchSim: match?.similarity });
       if (!match || match.similarity < 0.08) continue;
 
       const skipEdge: GradientRecordingPathEdge = {
@@ -263,7 +271,10 @@ async function compressFixedLengthBalanced(
       if (!best || score < best.score) best = { index, edge: skipEdge, score };
     }
 
-    if (!best) return null;
+    if (!best) {
+      console.log(JSON.stringify({ level: "debug", event: "compression_no_candidate", candidates: compressionCandidates }));
+      return null;
+    }
     const [removedRecording] = recordings.splice(best.index, 1);
     edges.splice(best.index - 1, 2, best.edge);
     if (removedRecording) removed.push(removedRecording);
@@ -398,10 +409,15 @@ async function repairFixedLengthSpacing(
     const worst = worstGap(current);
     if (!worst || worst.share <= threshold) break;
     const gap = makeGapPath(current, worst.index);
+    const gapLeft = current.recordings[worst.index]!;
+    const gapRight = current.recordings[worst.index + 1]!;
+    console.log(JSON.stringify({ level: "debug", event: "spacing_repair_attempt", attempt, worstIndex: worst.index, worstShare: worst.share, threshold, gapLeft: `${gapLeft.artist} — ${gapLeft.title}`, gapRight: `${gapRight.artist} — ${gapRight.title}`, budgetRemaining: maxQueries - queryCount }));
     let bridgePath: GradientRecordingPath | null = null;
     let bridgeOperations: GradientDensificationOperation[] = [];
     let insertedKeys = new Set<string>();
+    let bridgeMethod: string | null = null;
 
+    const routeKeys = new Set(current.recordings.map((row) => row.key));
     const singleBudget = Math.min(12, maxQueries - queryCount);
     if (singleBudget > 0) {
       const single = await densifyGradientRecordingPath(gap, 3, provider, {
@@ -411,10 +427,16 @@ async function repairFixedLengthSpacing(
         familiarityWeight: 0,
       });
       queryCount += single.queryCount;
-      if (single.path.recordings.length > 2) {
+      const singleInserted = single.path.recordings.slice(1, -1);
+      const hasDuplicate = singleInserted.some((row) => routeKeys.has(row.key));
+      if (single.path.recordings.length > 2 && !hasDuplicate) {
         bridgePath = single.path;
         bridgeOperations = single.operations;
-        insertedKeys = new Set(single.path.recordings.slice(1, -1).map((row) => row.key));
+        insertedKeys = new Set(singleInserted.map((row) => row.key));
+        bridgeMethod = "single";
+        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_bridge_found", method: "single", queries: single.queryCount, inserted: singleInserted.map((r) => `${r.artist} — ${r.title}`) }));
+      } else {
+        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_single_failed", queries: single.queryCount, duplicate: hasDuplicate }));
       }
     }
 
@@ -422,7 +444,9 @@ async function repairFixedLengthSpacing(
       const twoBudget = Math.min(18, maxQueries - queryCount);
       const found = await findTwoInteriorBridge(gap, provider, { ...options, familiarity: undefined }, twoBudget);
       queryCount += found.queries;
-      if (found.bridge) {
+      if (found.bridge && !routeKeys.has(found.bridge.c.key) && !routeKeys.has(found.bridge.d.key)) {
+        bridgeMethod = "two_interior";
+        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_bridge_found", method: "two_interior", queries: found.queries, c: `${found.bridge.c.artist} — ${found.bridge.c.title}`, d: `${found.bridge.d.artist} — ${found.bridge.d.title}`, bottleneck: found.bridge.bottleneck }));
         const left = gap.recordings[0]!;
         const right = gap.recordings[1]!;
         const newEdges = bridgeEdges(left, right, found.bridge);
@@ -462,19 +486,27 @@ async function repairFixedLengthSpacing(
     }
 
     if (!bridgePath && maxQueries - queryCount > 16) {
-      // Keep a reserve for validating the removals needed to restore the exact
-      // requested track count after inserting a longer alternate subpath.
       const alternateBudget = Math.min(36, maxQueries - queryCount - 16);
+      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_alternate_attempt", budget: alternateBudget, queryCountSoFar: queryCount }));
       const alternate = await findAlternateGapPath(gap, current, provider, options, alternateBudget);
       queryCount += alternate.queryCount;
       if (alternate.path) {
         bridgePath = alternate.path;
         bridgeOperations = alternatePathOperations(alternate.path);
         insertedKeys = new Set(alternate.path.recordings.slice(1, -1).map((row) => row.key));
+        bridgeMethod = "alternate_path";
+        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_bridge_found", method: "alternate_path", queries: alternate.queryCount, pathLength: alternate.path.recordings.length, inserted: alternate.path.recordings.slice(1, -1).map((r) => `${r.artist} — ${r.title}`) }));
+      } else {
+        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_alternate_failed", queries: alternate.queryCount }));
       }
+    } else if (!bridgePath) {
+      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_alternate_skipped", budgetRemaining: maxQueries - queryCount, reason: maxQueries - queryCount <= 16 ? "insufficient_budget" : "bridge_already_found" }));
     }
 
-    if (!bridgePath || !insertedKeys.size) break;
+    if (!bridgePath || !insertedKeys.size) {
+      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_no_bridge", queryCount }));
+      break;
+    }
 
     const recordings = [...current.recordings];
     const edges = [...current.edges];
@@ -486,6 +518,8 @@ async function repairFixedLengthSpacing(
       edges,
       queryCount: current.queryCount + queryCount,
     });
+
+    console.log(JSON.stringify({ level: "debug", event: "spacing_repair_expanding", bridgeMethod, expandedLength: expanded.recordings.length, expandedTracks: expanded.recordings.map((r) => `${r.artist} — ${r.title}`), insertedKeys: [...insertedKeys], protectedKeys: [...insertedKeys, gap.recordings[0]!.key, gap.recordings[1]!.key] }));
 
     const compression = await compressFixedLengthBalanced(
       expanded,
@@ -499,10 +533,14 @@ async function repairFixedLengthSpacing(
         gap.recordings[1]!.key,
       ]),
     );
-    if (!compression) break;
+    if (!compression) {
+      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_compression_failed", budgetRemaining: maxQueries - queryCount }));
+      break;
+    }
     queryCount += compression.queryCount;
 
     const after = gradientMaxEdgeShare(compression.path);
+    console.log(JSON.stringify({ level: "debug", event: "spacing_repair_result", bridgeMethod, worstShareBefore: worst.share, worstShareAfter: after, threshold, accepted: after < worst.share - 0.01, compressionQueries: compression.queryCount, removedTracks: compression.removed.map((r) => `${r.artist} — ${r.title}`), finalTracks: compression.path.recordings.map((r) => `${r.artist} — ${r.title}`) }));
     if (after >= worst.share - 0.01) break;
 
     // Translate the gap-local operation index back to the full route so

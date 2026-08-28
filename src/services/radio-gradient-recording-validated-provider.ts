@@ -40,41 +40,52 @@ export function createValidatedGradientRecordingProvider(): ValidatedGradientRec
   let catastrophicRejectedEdges = 0;
   const catastrophicReasons: Record<string, number> = {};
 
+  const validateRows = async (source: GradientRecording, rows: GradientRecordingNeighbor[], limit: number) => {
+    const accepted: GradientRecordingNeighbor[] = [];
+    for (const row of rows) {
+      acousticAssessments++;
+      let assessment;
+      const startedAt = performance.now();
+      try {
+        assessment = assessCachedAcousticTransition(source, row);
+      } catch {
+        assessment = null;
+      } finally {
+        acousticValidationMs += performance.now() - startedAt;
+      }
+      if (assessment?.evidenceCount) acousticEvidenceEdges++;
+      if (assessment?.catastrophic) {
+        catastrophicRejectedEdges++;
+        for (const reason of assessment.reasons) catastrophicReasons[reason] = (catastrophicReasons[reason] ?? 0) + 1;
+        continue;
+      }
+
+      let confidence = row.confidence ?? 0.75;
+      if (assessment && assessment.evidenceCount >= 3 && assessment.score != null) {
+        if (assessment.score < 0.35) {
+          confidence *= clamp(assessment.score / 0.35, 0.35, 1);
+          acousticPenaltyEdges++;
+        } else if (assessment.score >= 0.72) {
+          confidence = clamp(confidence + 0.06, 0.05, 1);
+        }
+      }
+      accepted.push({ ...row, confidence });
+      if (accepted.length >= limit) break;
+    }
+    return accepted;
+  };
+
   return {
     async neighbors(source, limit) {
       const rows = await base.neighbors(source, Math.max(limit * 2, limit));
-      const accepted: GradientRecordingNeighbor[] = [];
-      for (const row of rows) {
-        acousticAssessments++;
-        let assessment;
-        const startedAt = performance.now();
-        try {
-          assessment = assessCachedAcousticTransition(source, row);
-        } catch {
-          assessment = null;
-        } finally {
-          acousticValidationMs += performance.now() - startedAt;
-        }
-        if (assessment?.evidenceCount) acousticEvidenceEdges++;
-        if (assessment?.catastrophic) {
-          catastrophicRejectedEdges++;
-          for (const reason of assessment.reasons) catastrophicReasons[reason] = (catastrophicReasons[reason] ?? 0) + 1;
-          continue;
-        }
-
-        let confidence = row.confidence ?? 0.75;
-        if (assessment && assessment.evidenceCount >= 3 && assessment.score != null) {
-          if (assessment.score < 0.35) {
-            confidence *= clamp(assessment.score / 0.35, 0.35, 1);
-            acousticPenaltyEdges++;
-          } else if (assessment.score >= 0.72) {
-            confidence = clamp(confidence + 0.06, 0.05, 1);
-          }
-        }
-        accepted.push({ ...row, confidence });
-        if (accepted.length >= limit) break;
-      }
-      return accepted;
+      return validateRows(source, rows, limit);
+    },
+    async bidirectionalNeighbors(source, limit) {
+      const rows = await base.bidirectionalNeighbors(source, Math.max(limit * 2, limit));
+      return validateRows(source, rows, limit);
+    },
+    lookupEdge(sourceKey, targetKey) {
+      return base.lookupEdge(sourceKey, targetKey);
     },
     diagnostics() {
       return {

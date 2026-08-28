@@ -46,6 +46,8 @@ export interface GradientRecordingProviderDiagnostics {
 }
 
 export interface CachedGradientRecordingProvider extends GradientRecordingNeighborProvider {
+  bidirectionalNeighbors(source: GradientRecording, limit: number): Promise<GradientRecordingNeighbor[]>;
+  lookupEdge(sourceKey: string, targetKey: string): GradientRecordingNeighbor | null;
   diagnostics(): GradientRecordingProviderDiagnostics;
 }
 
@@ -121,15 +123,32 @@ function isFresh(row: FetchRow | null) {
   return age < (row.status === "ready" ? READY_TTL_MS : FAILED_TTL_MS);
 }
 
-function cachedEdges(sourceKey: string, limit: number): GradientRecordingNeighbor[] {
-  const rows = getDb().query<CachedEdgeRow, [string, number]>(`SELECT
-      n.canonical_key,n.artist,n.title,n.recording_mbid,
-      e.provider,e.similarity,e.confidence
-    FROM recording_similarity_edges e
-    JOIN recording_similarity_nodes n ON n.canonical_key=e.target_key
-    WHERE e.source_key=?
-    ORDER BY (e.similarity*e.confidence) DESC,e.similarity DESC
-    LIMIT ?`).all(sourceKey, Math.max(limit * 4, limit));
+function cachedEdges(sourceKey: string, limit: number, bidirectional = false): GradientRecordingNeighbor[] {
+  const fetchLimit = Math.max(limit * 4, limit);
+  const rows = bidirectional
+    ? getDb().query<CachedEdgeRow, [string, string, string, number]>(`
+      SELECT canonical_key,artist,title,recording_mbid,provider,similarity,confidence FROM (
+        SELECT n.canonical_key,n.artist,n.title,n.recording_mbid,
+          e.provider,e.similarity,e.confidence
+        FROM recording_similarity_edges e
+        JOIN recording_similarity_nodes n ON n.canonical_key=e.target_key
+        WHERE e.source_key=?
+      UNION ALL
+        SELECT n.canonical_key,n.artist,n.title,n.recording_mbid,
+          e.provider,e.similarity,e.confidence
+        FROM recording_similarity_edges e
+        JOIN recording_similarity_nodes n ON n.canonical_key=e.source_key
+        WHERE e.target_key=? AND e.source_key!=?
+      ) ORDER BY (similarity*confidence) DESC,similarity DESC
+      LIMIT ?`).all(sourceKey, sourceKey, sourceKey, fetchLimit)
+    : getDb().query<CachedEdgeRow, [string, number]>(`SELECT
+        n.canonical_key,n.artist,n.title,n.recording_mbid,
+        e.provider,e.similarity,e.confidence
+      FROM recording_similarity_edges e
+      JOIN recording_similarity_nodes n ON n.canonical_key=e.target_key
+      WHERE e.source_key=?
+      ORDER BY (e.similarity*e.confidence) DESC,e.similarity DESC
+      LIMIT ?`).all(sourceKey, fetchLimit);
 
   const merged = new Map<string, GradientRecordingNeighbor>();
   const providers = new Map<string, Set<string>>();
@@ -161,6 +180,38 @@ function cachedEdges(sourceKey: string, limit: number): GradientRecordingNeighbo
   return [...merged.values()]
     .sort((a, b) => b.similarity * (b.confidence ?? 0.75) - a.similarity * (a.confidence ?? 0.75))
     .slice(0, limit);
+}
+
+interface DirectEdgeRow {
+  similarity: number;
+  confidence: number;
+  provider: string;
+}
+
+function lookupDirectEdge(sourceKey: string, targetKey: string): GradientRecordingNeighbor | null {
+  const rows = getDb().query<DirectEdgeRow & { canonical_key: string; artist: string; title: string; recording_mbid: string | null }, [string, string, string, string]>(`
+    SELECT canonical_key, artist, title, recording_mbid, similarity, confidence, provider FROM (
+      SELECT n.canonical_key, n.artist, n.title, n.recording_mbid, e.similarity, e.confidence, e.provider
+      FROM recording_similarity_edges e
+      JOIN recording_similarity_nodes n ON n.canonical_key = e.target_key
+      WHERE e.source_key = ? AND e.target_key = ?
+    UNION ALL
+      SELECT n.canonical_key, n.artist, n.title, n.recording_mbid, e.similarity, e.confidence, e.provider
+      FROM recording_similarity_edges e
+      JOIN recording_similarity_nodes n ON n.canonical_key = e.source_key
+      WHERE e.target_key = ? AND e.source_key = ?
+    ) ORDER BY (similarity * confidence) DESC
+    LIMIT 1`).get(sourceKey, targetKey, sourceKey, targetKey);
+  if (!rows) return null;
+  return {
+    key: rows.canonical_key,
+    artist: rows.artist,
+    title: rows.title,
+    mbid: rows.recording_mbid,
+    similarity: clamp(rows.similarity, 0.01, 1),
+    confidence: clamp(rows.confidence, 0.05, 1),
+    provider: rows.provider,
+  };
 }
 
 async function fetchLastFm(source: GradientRecording, limit: number) {
@@ -229,21 +280,33 @@ export function createCachedGradientRecordingProvider(): CachedGradientRecording
     }
   };
 
+  const ensureProviders = async (source: GradientRecording, limit: number) => {
+    rememberNode(source);
+    if (gradientSimilEnabled()) maybeQueueGradientSimilIndex();
+    await Promise.all([
+      ensureProvider(source, "lastfm_track", () => fetchLastFm(source, limit)),
+      source.mbid
+        ? ensureProvider(source, "listenbrainz_similar", () => fetchListenBrainz(source, limit))
+        : Promise.resolve(),
+      gradientSimilEnabled()
+        ? ensureProvider(source, "local_effnet", () => searchGradientSimilNeighbors(source, limit))
+        : Promise.resolve(),
+    ]);
+  };
+
   return {
     async neighbors(source, limit) {
       stats.neighborLookups++;
-      rememberNode(source);
-      if (gradientSimilEnabled()) maybeQueueGradientSimilIndex();
-      await Promise.all([
-        ensureProvider(source, "lastfm_track", () => fetchLastFm(source, limit)),
-        source.mbid
-          ? ensureProvider(source, "listenbrainz_similar", () => fetchListenBrainz(source, limit))
-          : Promise.resolve(),
-        gradientSimilEnabled()
-          ? ensureProvider(source, "local_effnet", () => searchGradientSimilNeighbors(source, limit))
-          : Promise.resolve(),
-      ]);
+      await ensureProviders(source, limit);
       return cachedEdges(source.key, limit);
+    },
+    async bidirectionalNeighbors(source, limit) {
+      stats.neighborLookups++;
+      await ensureProviders(source, limit);
+      return cachedEdges(source.key, limit, true);
+    },
+    lookupEdge(sourceKey, targetKey) {
+      return lookupDirectEdge(sourceKey, targetKey);
     },
     diagnostics() {
       return {
