@@ -144,8 +144,8 @@ function bridgeEdges(
 /**
  * Normal densification prefers a single bottleneck-safe common neighbor. If it
  * exhausts that option, probe a few weak gaps for a bounded C→D connector and
- * then resume normal densification. This avoids false `no_bridge` results caused
- * by requiring one recording to be a one-hop neighbor of both sides.
+ * then resume normal densification. `maxQueries` is a hard total budget across
+ * all three phases rather than a separate allowance for each phase.
  */
 export async function densifyGradientRecordingPathWithSubpathFallback(
   original: GradientRecordingPath,
@@ -153,17 +153,29 @@ export async function densifyGradientRecordingPathWithSubpathFallback(
   provider: GradientRecordingNeighborProvider,
   options: GradientDensifyOptions = {},
 ): Promise<GradientDensificationResult> {
-  const first = await densifyGradientRecordingPath(original, requestedLength, provider, options);
+  const totalBudget = Math.max(0, options.maxQueries ?? 96);
+  const first = await densifyGradientRecordingPath(original, requestedLength, provider, {
+    ...options,
+    maxQueries: totalBudget,
+  });
   if (first.path.recordings.length >= requestedLength || first.stoppedReason !== "no_bridge") return first;
   if (requestedLength - first.path.recordings.length < 2) return first;
 
-  const fallbackBudget = Math.max(0, Math.min(28, Math.floor((options.maxQueries ?? 96) / 3)));
+  let remainingBudget = Math.max(0, totalBudget - first.queryCount);
+  const fallbackBudget = Math.min(28, Math.floor(totalBudget / 3), remainingBudget);
+  if (fallbackBudget < 3) {
+    return { ...first, stoppedReason: remainingBudget === 0 ? "query_budget" : first.stoppedReason };
+  }
+
   const found = await findTwoInteriorBridge(first.path, provider, options, fallbackBudget);
+  remainingBudget = Math.max(0, remainingBudget - found.queries);
+  const consumed = first.queryCount + found.queries;
   if (!found.bridge) {
     return {
       ...first,
-      queryCount: first.queryCount + found.queries,
+      queryCount: consumed,
       path: { ...first.path, queryCount: first.path.queryCount + found.queries },
+      stoppedReason: remainingBudget === 0 ? "query_budget" : "no_bridge",
     };
   }
 
@@ -213,18 +225,28 @@ export async function densifyGradientRecordingPathWithSubpathFallback(
       path: insertedPath,
       positioned: positionGradientRecordingPath(insertedPath),
       operations,
-      queryCount: first.queryCount + found.queries,
+      queryCount: consumed,
       stoppedReason: "requested_length",
+    };
+  }
+
+  if (remainingBudget === 0) {
+    return {
+      path: insertedPath,
+      positioned: positionGradientRecordingPath(insertedPath),
+      operations,
+      queryCount: consumed,
+      stoppedReason: "query_budget",
     };
   }
 
   const second = await densifyGradientRecordingPath(insertedPath, requestedLength, provider, {
     ...options,
-    maxQueries: Math.max(0, (options.maxQueries ?? 96) - found.queries),
+    maxQueries: remainingBudget,
   });
   return {
     ...second,
     operations: [...operations, ...second.operations],
-    queryCount: first.queryCount + found.queries + second.queryCount,
+    queryCount: consumed + second.queryCount,
   };
 }
