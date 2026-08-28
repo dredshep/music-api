@@ -298,9 +298,15 @@ function enforceFallbackHardWaypoints(generationId: string, plan: GradientRecord
     const requested = fallbackWaypointForRegion(plan, region);
     if (!requested) continue;
     const desired = seedTargetIndex(region, output.length);
-    const existing = output.findIndex((track) => region.constraint === "exact_track"
-      ? track.canonical_key === canonicalRadioTrackKey(requested.artist, requested.title)
-      : normalizeForComparison(track.artist) === normalizeForComparison(region.requestedArtist ?? requested.artist));
+    const requestedKey = canonicalRadioTrackKey(requested.artist, requested.title);
+    const existing = output.findIndex((track) => {
+      if (region.constraint === "exact_track") {
+        if (track.canonical_key !== requestedKey) return false;
+        if (requested.mbid && requested.mbid !== track.musicbrainz_id) return false;
+        return true;
+      }
+      return normalizeForComparison(track.artist) === normalizeForComparison(region.requestedArtist ?? requested.artist);
+    });
     const source = existing >= 0 ? output[existing]! : {
       canonical_key: canonicalRadioTrackKey(requested.artist, requested.title),
       artist: requested.artist,
@@ -344,7 +350,7 @@ function finishRecordingGeneration(
   extra: Record<string, unknown> = {},
 ) {
   const selected = getGenerationTracks(generationId);
-  const lengthComplete = storedCount >= plan.requestedLength;
+  const lengthComplete = storedCount === plan.requestedLength;
   const plannedEndpointComplete = plan.endpointStatus.startSatisfied && plan.endpointStatus.endSatisfied;
   const finalEndpointComplete = actualEndpoints?.satisfied ?? plannedEndpointComplete;
   const endpointComplete = plannedEndpointComplete && finalEndpointComplete;

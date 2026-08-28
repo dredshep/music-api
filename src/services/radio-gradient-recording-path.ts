@@ -690,15 +690,15 @@ export interface GradientPathCompressionResult {
 
 /**
  * Safely compress a path to the requested length by removing interior nodes
- * only when the previous and next retained recordings have a validated edge
- * in the existing edge set. Endpoints and waypoints are never removed.
+ * only when the previous and next retained recordings have a real validated
+ * edge from the provider. Endpoints and waypoints are never removed.
  */
-export function compressGradientRecordingPath(
+export async function compressGradientRecordingPath(
   original: GradientRecordingPath,
   requestedLength: number,
   provider: GradientRecordingNeighborProvider,
   mandatoryKeys?: Set<string>,
-): GradientPathCompressionResult {
+): Promise<GradientPathCompressionResult> {
   if (original.recordings.length <= requestedLength) {
     return { path: original, removedCount: 0, compressed: true, partialReason: null };
   }
@@ -709,48 +709,54 @@ export function compressGradientRecordingPath(
   mandatory.add(recordings.at(-1)!.key);
   let removedCount = 0;
 
+  const neighborCache = new Map<string, GradientRecordingNeighbor[]>();
+  const fetchNeighbors = async (rec: GradientRecording) => {
+    const cached = neighborCache.get(rec.key);
+    if (cached) return cached;
+    const result = await provider.neighbors(rec, 48).catch(() => [] as GradientRecordingNeighbor[]);
+    neighborCache.set(rec.key, result);
+    return result;
+  };
+
   while (recordings.length > requestedLength) {
-    let bestIndex = -1;
-    let bestCostIncrease = Infinity;
+    type Candidate = { index: number; edge: GradientRecordingPathEdge; costIncrease: number };
+    let best: Candidate | null = null;
 
     for (let i = 1; i < recordings.length - 1; i++) {
       if (mandatory.has(recordings[i]!.key)) continue;
-      const leftEdge = edges[i - 1];
-      const rightEdge = edges[i];
-      if (!leftEdge || !rightEdge) continue;
-      const skipSimilarity = Math.min(leftEdge.similarity, rightEdge.similarity);
-      const skipConfidence = Math.min(leftEdge.confidence, rightEdge.confidence);
-      if (skipSimilarity < 0.08) continue;
-      const currentCost = gradientRecordingEdgeCost(leftEdge.similarity, leftEdge.confidence)
-        + gradientRecordingEdgeCost(rightEdge.similarity, rightEdge.confidence);
-      const newCost = gradientRecordingEdgeCost(skipSimilarity, skipConfidence);
+      const prev = recordings[i - 1]!;
+      const next = recordings[i + 1]!;
+
+      const prevNeighbors = await fetchNeighbors(prev);
+      const match = prevNeighbors.find((n) => gradientRecordingKey(n.artist, n.title) === next.key);
+      if (!match || match.similarity < 0.08) continue;
+
+      const skipEdge: GradientRecordingPathEdge = {
+        from: prev, to: next,
+        similarity: match.similarity,
+        confidence: match.confidence ?? 0.8,
+        provider: match.provider ?? "recording_similarity",
+      };
+      const currentCost = gradientRecordingEdgeCost(edges[i - 1]!.similarity, edges[i - 1]!.confidence)
+        + gradientRecordingEdgeCost(edges[i]!.similarity, edges[i]!.confidence);
+      const newCost = gradientRecordingEdgeCost(skipEdge.similarity, skipEdge.confidence);
       const costIncrease = newCost - currentCost;
-      if (costIncrease < bestCostIncrease) {
-        bestCostIncrease = costIncrease;
-        bestIndex = i;
+      if (!best || costIncrease < best.costIncrease) {
+        best = { index: i, edge: skipEdge, costIncrease };
       }
     }
 
-    if (bestIndex < 0) {
+    if (!best) {
       return {
         path: { ...original, recordings, edges, cost: edges.reduce((sum, e) => sum + gradientRecordingEdgeCost(e.similarity, e.confidence), 0) },
         removedCount,
         compressed: false,
-        partialReason: "no_safe_removable_node",
+        partialReason: "no_validated_skip_edge",
       };
     }
 
-    const leftEdge = edges[bestIndex - 1]!;
-    const rightEdge = edges[bestIndex]!;
-    const bridgeEdge: GradientRecordingPathEdge = {
-      from: recordings[bestIndex - 1]!,
-      to: recordings[bestIndex + 1]!,
-      similarity: Math.min(leftEdge.similarity, rightEdge.similarity),
-      confidence: Math.min(leftEdge.confidence, rightEdge.confidence),
-      provider: leftEdge.similarity <= rightEdge.similarity ? leftEdge.provider : rightEdge.provider,
-    };
-    recordings.splice(bestIndex, 1);
-    edges.splice(bestIndex - 1, 2, bridgeEdge);
+    recordings.splice(best.index, 1);
+    edges.splice(best.index - 1, 2, best.edge);
     removedCount++;
   }
 

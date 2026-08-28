@@ -63,6 +63,7 @@ export interface GradientRecordingRouteSegment {
   densificationOperations: GradientDensificationOperation[];
   densificationStoppedReason: string | null;
   fallbackReason: string | null;
+  compressionPartial: string | null;
 }
 
 export interface GradientRecordingRoutePlan {
@@ -305,6 +306,7 @@ async function findArtistBridge(
   endArtist: string,
   maxDepth = 5,
   beamWidth = 6,
+  budget?: GradientRouteBudget,
 ): Promise<string[]> {
   const startNorm = normalizeForComparison(startArtist);
   const endNorm = normalizeForComparison(endArtist);
@@ -319,9 +321,12 @@ async function findArtistBridge(
   backwardVisited.set(endNorm, backwardQueue[0]!);
 
   for (let iteration = 0; iteration < maxDepth; iteration++) {
+    if (budget && isBudgetExhausted(budget)) break;
+
     const expandQueue = async (queue: Node[], visited: Map<string, Node>, other: Map<string, Node>) => {
       const batch = queue.splice(0, beamWidth);
       const results = await Promise.all(batch.map(async (node) => {
+        if (budget) budget.artistBridgeCalls += 1;
         try {
           return { node, similar: await lastfm.getSimilarArtists(node.artist, 30) };
         } catch { return { node, similar: [] as Awaited<ReturnType<typeof lastfm.getSimilarArtists>> }; }
@@ -489,7 +494,7 @@ export async function planGradientRecordingRoute(input: {
       segments.push({
         ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
         frontierIntersection: null, pathSearchMs: 0, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
-        densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings",
+        densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings", compressionPartial: null,
       });
       previousWaypoint = null;
       continue;
@@ -499,7 +504,7 @@ export async function planGradientRecordingRoute(input: {
       segments.push({
         ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
         frontierIntersection: null, pathSearchMs: 0, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
-        densificationStoppedReason: null, fallbackReason: "global_budget_exhausted",
+        densificationStoppedReason: null, fallbackReason: "global_budget_exhausted", compressionPartial: null,
       });
       previousWaypoint = null;
       continue;
@@ -553,8 +558,7 @@ export async function planGradientRecordingRoute(input: {
     }
 
     if (!raw && !isBudgetExhausted(budget) && left.requestedArtist && right.requestedArtist) {
-      const bridgeArtists = await findArtistBridge(left.requestedArtist, right.requestedArtist, 8, 12);
-      budget.artistBridgeCalls += 1;
+      const bridgeArtists = await findArtistBridge(left.requestedArtist, right.requestedArtist, 8, 12, budget);
       if (bridgeArtists.length) {
         const chainRegions: GradientRecording[][] = [fromCandidates];
         for (const bridgeArtist of bridgeArtists) {
@@ -578,7 +582,7 @@ export async function planGradientRecordingRoute(input: {
       segments.push({
         ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
         frontierIntersection: null, pathSearchMs, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
-        densificationStoppedReason: null, fallbackReason: isBudgetExhausted(budget) ? "global_budget_exhausted" : "no_recording_path_found",
+        densificationStoppedReason: null, fallbackReason: isBudgetExhausted(budget) ? "global_budget_exhausted" : "no_recording_path_found", compressionPartial: null,
       });
       previousWaypoint = null;
       continue;
@@ -594,7 +598,7 @@ export async function planGradientRecordingRoute(input: {
       const mandatoryKeys = new Set<string>();
       if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
       if (right.constraint !== "region") for (const r of right.recordings) mandatoryKeys.add(r.key);
-      const compressed = compressGradientRecordingPath(raw, targetNodes, provider, mandatoryKeys);
+      const compressed = await compressGradientRecordingPath(raw, targetNodes, provider, mandatoryKeys);
       pathForDensification = compressed.path;
       if (!compressed.compressed) compressionPartial = compressed.partialReason;
     }
@@ -647,6 +651,7 @@ export async function planGradientRecordingRoute(input: {
       densificationOperations: dense.operations,
       densificationStoppedReason: dense.stoppedReason,
       fallbackReason: dense.path.recordings.length < targetNodes ? "densification_exhausted_before_target_length" : null,
+      compressionPartial,
     });
 
     previousWaypoint = dense.path.recordings.at(-1) ?? null;
@@ -707,12 +712,14 @@ export async function planGradientRecordingRoute(input: {
   const lastRegion = regions.at(-1);
   const first = output[0];
   const last = output.at(-1);
-  const state: GradientRecordingRoutePlan["state"] = allConnected ? "complete" : connectedCount ? "partial" : "no_route";
+  const anyCompressionFailure = segments.some((s) => s.compressionPartial != null);
+  const routeComplete = allConnected && !anyCompressionFailure;
+  const state: GradientRecordingRoutePlan["state"] = routeComplete ? "complete" : connectedCount ? "partial" : "no_route";
   return {
     algorithm,
     state,
     usable: connectedCount > 0,
-    complete: allConnected,
+    complete: routeComplete,
     requestedLength,
     regions,
     segments,

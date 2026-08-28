@@ -177,71 +177,90 @@ function makePath(artists: string[]): GradientRecordingPath {
 }
 
 describe("path compression", () => {
-  test("overlong path compresses safely to exact requested length", () => {
-    const path = makePath(["A", "B", "C", "D", "E", "F", "G"]);
-    const p = provider({});
-    const result = compressGradientRecordingPath(path, 4, p);
+  function connectedProvider(artists: string[]): GradientRecordingNeighborProvider {
+    const recs = artists.map((a) => gradientRecording(a, `${a}-song`));
+    return {
+      async neighbors(recording) {
+        return recs
+          .filter((r) => r.key !== recording.key)
+          .map((r) => ({ ...r, similarity: 0.5, confidence: 0.9, provider: "synthetic" }));
+      },
+    };
+  }
+
+  test("overlong path compresses safely to exact requested length", async () => {
+    const artists = ["A", "B", "C", "D", "E", "F", "G"];
+    const path = makePath(artists);
+    const p = connectedProvider(artists);
+    const result = await compressGradientRecordingPath(path, 4, p);
     expect(result.compressed).toBe(true);
     expect(result.path.recordings).toHaveLength(4);
     expect(result.removedCount).toBe(3);
   });
 
-  test("exact endpoints survive compression", () => {
-    const path = makePath(["Start", "M1", "M2", "M3", "End"]);
-    const p = provider({});
-    const result = compressGradientRecordingPath(path, 2, p);
+  test("exact endpoints survive compression", async () => {
+    const artists = ["Start", "M1", "M2", "M3", "End"];
+    const path = makePath(artists);
+    const p = connectedProvider(artists);
+    const result = await compressGradientRecordingPath(path, 2, p);
     expect(result.path.recordings[0]!.artist).toBe("Start");
     expect(result.path.recordings.at(-1)!.artist).toBe("End");
   });
 
-  test("mandatory waypoints survive compression", () => {
-    const path = makePath(["A", "B", "C", "D", "E"]);
-    const p = provider({});
+  test("mandatory waypoints survive compression", async () => {
+    const artists = ["A", "B", "C", "D", "E"];
+    const path = makePath(artists);
+    const p = connectedProvider(artists);
     const mandatory = new Set([gradientRecording("C", "C-song").key]);
-    const result = compressGradientRecordingPath(path, 3, p, mandatory);
+    const result = await compressGradientRecordingPath(path, 3, p, mandatory);
     expect(result.path.recordings).toHaveLength(3);
     expect(result.path.recordings.some((r) => r.artist === "C")).toBe(true);
     expect(result.path.recordings[0]!.artist).toBe("A");
     expect(result.path.recordings.at(-1)!.artist).toBe("E");
   });
 
-  test("no resulting adjacency lacks validated evidence", () => {
-    const path = makePath(["A", "B", "C", "D", "E"]);
-    const p = provider({});
-    const result = compressGradientRecordingPath(path, 3, p);
-    for (let i = 0; i < result.path.edges.length; i++) {
-      const edge = result.path.edges[i]!;
-      expect(edge.from.key).toBe(result.path.recordings[i]!.key);
-      expect(edge.to.key).toBe(result.path.recordings[i + 1]!.key);
-      expect(edge.similarity).toBeGreaterThan(0);
-      expect(edge.confidence).toBeGreaterThan(0);
+  test("every resulting skip edge comes from actual provider evidence", async () => {
+    const artists = ["A", "B", "C", "D", "E"];
+    const queriedKeys = new Set<string>();
+    const p: GradientRecordingNeighborProvider = {
+      async neighbors(recording) {
+        queriedKeys.add(recording.key);
+        const others = artists.filter((a) => key(a, `${a}-song`) !== recording.key);
+        return others.map((a) => ({
+          ...gradientRecording(a, `${a}-song`), similarity: 0.45, confidence: 0.85, provider: "validated",
+        }));
+      },
+    };
+    const path = makePath(artists);
+    const result = await compressGradientRecordingPath(path, 3, p);
+    expect(result.compressed).toBe(true);
+    expect(queriedKeys.size).toBeGreaterThan(0);
+    for (const edge of result.path.edges) {
+      const isOriginalConsecutive = artists.some((a, i) =>
+        i < artists.length - 1
+        && edge.from.key === key(a, `${a}-song`)
+        && edge.to.key === key(artists[i + 1]!, `${artists[i + 1]!}-song`),
+      );
+      if (!isOriginalConsecutive) {
+        expect(edge.similarity).toBe(0.45);
+        expect(edge.provider).toBe("validated");
+      }
     }
   });
 
-  test("impossible compression returns partial, not fake ready", () => {
-    const recordings = ["A", "B", "C", "D", "E"].map((a) => gradientRecording(a, `${a}-song`));
-    const edges: GradientRecordingPathEdge[] = [];
-    for (let i = 1; i < recordings.length; i++) {
-      edges.push({
-        from: recordings[i - 1]!, to: recordings[i]!,
-        similarity: 0.05, confidence: 0.9, provider: "test",
-      });
-    }
-    const path: GradientRecordingPath = {
-      recordings, edges, cost: 0, queryCount: 0, nodesVisited: 5,
-      forwardFrontierSize: 0, backwardFrontierSize: 0, intersection: null,
-    };
+  test("compression fails when provider has no skip edge", async () => {
+    const path = makePath(["A", "B", "C", "D", "E"]);
     const p = provider({});
-    const result = compressGradientRecordingPath(path, 2, p);
+    const result = await compressGradientRecordingPath(path, 2, p);
     expect(result.compressed).toBe(false);
-    expect(result.partialReason).toBe("no_safe_removable_node");
+    expect(result.partialReason).toBe("no_validated_skip_edge");
     expect(result.path.recordings.length).toBeGreaterThan(2);
   });
 
-  test("path already at requested length is unchanged", () => {
+  test("path already at requested length is unchanged", async () => {
     const path = makePath(["A", "B", "C"]);
     const p = provider({});
-    const result = compressGradientRecordingPath(path, 3, p);
+    const result = await compressGradientRecordingPath(path, 3, p);
     expect(result.compressed).toBe(true);
     expect(result.removedCount).toBe(0);
     expect(result.path.recordings).toHaveLength(3);

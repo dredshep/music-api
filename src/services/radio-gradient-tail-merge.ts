@@ -153,7 +153,7 @@ function endpointMatches(track: StoredGradientTrack | undefined, expectation: Gr
   if (!track) return false;
   if (expectation.constraint === "exact_track") {
     if (!expectation.exactCanonicalKey || track.canonical_key !== expectation.exactCanonicalKey) return false;
-    if (expectation.requestedMbid && track.musicbrainz_id && expectation.requestedMbid !== track.musicbrainz_id) return false;
+    if (expectation.requestedMbid && expectation.requestedMbid !== track.musicbrainz_id) return false;
     return true;
   }
   return Boolean(

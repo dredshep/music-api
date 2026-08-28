@@ -89,14 +89,21 @@ describe("Gradient Live route state", () => {
     expect(final.state.previous_key).toBe("text:artist-5|track-5");
   });
 
-  test("partial route does not falsely complete when array is exhausted", () => {
-    const initial = createGradientLiveRouteState("station", generation(4, false))!;
-    expect(initial).not.toBeNull();
-    expect(initial.route_complete).toBe(false);
-    const result = consumeGradientLiveRouteState(initial, 10, new Set());
-    expect(result.tracks).toHaveLength(4);
-    expect(result.completed).toBe(false);
-    expect(result.state.completed).toBe(false);
+  test("no reusable state is created for an incomplete route", () => {
+    const state = createGradientLiveRouteState("station", generation(4, false));
+    expect(state).toBeNull();
+  });
+
+  test("exhausted non-completed state is rejected by validation", () => {
+    const state = createGradientLiveRouteState("station", generation(4))!;
+    expect(state).not.toBeNull();
+    const result = consumeGradientLiveRouteState(state, 10, new Set());
+    expect(result.completed).toBe(true);
+    expect(result.state.next_index).toBe(4);
+    expect(isValidGradientLiveRouteState("station", result.state)).toBe(true);
+
+    const nonCompleteExhausted = { ...result.state, completed: false, route_complete: false };
+    expect(isValidGradientLiveRouteState("station", nonCompleteExhausted)).toBe(false);
   });
 
   test("only creates reusable state for a genuine non-fallback recording path", () => {
