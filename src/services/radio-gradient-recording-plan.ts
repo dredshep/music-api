@@ -34,6 +34,12 @@ export interface GradientRecordingRouteSegment {
   toPosition: number;
   connected: boolean;
   queryCount: number;
+  nodesVisited: number;
+  forwardFrontierSize: number;
+  backwardFrontierSize: number;
+  frontierIntersection: string | null;
+  pathSearchMs: number;
+  densificationMs: number;
   rawRecordings: GradientRecording[];
   recordings: Array<GradientRecording & { routePosition: number; routeConfidence: number }>;
   edges: GradientRecordingPathEdge[];
@@ -96,6 +102,10 @@ const DEFAULT_SOURCES: GradientSeedRecordingSources = {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function elapsedMs(startedAt: number) {
+  return Number((performance.now() - startedAt).toFixed(2));
 }
 
 function parseObject(raw: string | null): Record<string, unknown> {
@@ -322,13 +332,15 @@ export async function planGradientRecordingRoute(input: {
     };
     if (!fromCandidates.length || !toCandidates.length) {
       segments.push({
-        ...base, connected: false, queryCount: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
+        ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
+        frontierIntersection: null, pathSearchMs: 0, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
         densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings",
       });
       previousWaypoint = null;
       continue;
     }
 
+    const pathStartedAt = performance.now();
     const raw = await discoverGradientRecordingPath(fromCandidates, toCandidates, provider, {
       maxQueries: scenic ? 88 : 64,
       maxNodes: scenic ? 1800 : 1200,
@@ -337,9 +349,11 @@ export async function planGradientRecordingRoute(input: {
       neighborLimit: scenic ? 44 : 36,
       refineQueries: scenic ? 18 : 10,
     });
+    const pathSearchMs = elapsedMs(pathStartedAt);
     if (!raw) {
       segments.push({
-        ...base, connected: false, queryCount: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
+        ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
+        frontierIntersection: null, pathSearchMs, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
         densificationStoppedReason: null, fallbackReason: "no_recording_path_found",
       });
       previousWaypoint = null;
@@ -347,6 +361,7 @@ export async function planGradientRecordingRoute(input: {
     }
     queryCount += raw.queryCount;
     const targetNodes = (allocation[index] ?? 1) + 1;
+    const densificationStartedAt = performance.now();
     const dense = await densifyGradientRecordingPathWithSubpathFallback(raw, Math.max(raw.recordings.length, targetNodes), provider, {
       maxQueries: scenic ? 128 : 96,
       neighborLimit: scenic ? 56 : 48,
@@ -355,6 +370,7 @@ export async function planGradientRecordingRoute(input: {
       familiarity: input.familiarity,
       familiarityWeight: scenic ? 0.26 : 0.18,
     });
+    const densificationMs = elapsedMs(densificationStartedAt);
     queryCount += dense.queryCount;
     const scaled = dense.positioned.map((recording) => ({
       ...recording,
@@ -364,6 +380,12 @@ export async function planGradientRecordingRoute(input: {
       ...base,
       connected: true,
       queryCount: raw.queryCount + dense.queryCount,
+      nodesVisited: raw.nodesVisited,
+      forwardFrontierSize: raw.forwardFrontierSize,
+      backwardFrontierSize: raw.backwardFrontierSize,
+      frontierIntersection: raw.intersection,
+      pathSearchMs,
+      densificationMs,
       rawRecordings: raw.recordings,
       recordings: scaled,
       edges: dense.path.edges,
@@ -389,8 +411,6 @@ export async function planGradientRecordingRoute(input: {
   const connectedCount = segments.filter((segment) => segment.connected).length;
   const allConnected = connectedCount === segments.length && segments.length > 0;
 
-  // A partial route still exposes required exact/artist waypoints honestly, but
-  // they remain unpositioned if no connected segment established their place.
   if (!allConnected) {
     for (const region of regions) {
       if (region.constraint === "region") continue;
