@@ -8,7 +8,6 @@ import {
   getStation,
   parseRadioSettings,
   replaceGenerationTracks,
-  type RadioSeedRow,
   type RadioTrackRow,
 } from "../db/repositories/radio";
 import { normalizeForComparison } from "../domain/normalization";
@@ -32,7 +31,12 @@ import {
   createValidatedGradientRecordingProvider,
   type GradientValidatedProviderDiagnostics,
 } from "./radio-gradient-recording-validated-provider";
-import { mergeGradientPlannedTail } from "./radio-gradient-tail-merge";
+import {
+  assessGradientMergedEndpoints,
+  mergeGradientPlannedTail,
+  type GradientHardEndpointExpectation,
+  type StoredGradientTrack,
+} from "./radio-gradient-tail-merge";
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -169,7 +173,7 @@ function waypointRegion(plan: GradientRecordingRoutePlan, seedId: string | undef
 function storedRouteTracks(
   plan: GradientRecordingRoutePlan,
   familiarity: (recording: GradientRecording) => number | null,
-) {
+): StoredGradientTrack[] {
   return plan.recordings.map((row) => {
     const region = waypointRegion(plan, row.waypointSeedId);
     const routePosition = row.routePosition == null ? null : clamp(row.routePosition, 0, 1);
@@ -225,6 +229,25 @@ function fallbackWaypointForRegion(plan: GradientRecordingRoutePlan, region: Gra
     ?? (region.constraint === "exact_track" || region.constraint === "artist" ? region.recordings[0] ?? null : null);
 }
 
+function endpointExpectation(region: GradientSeedRecordingRegion | undefined): GradientHardEndpointExpectation {
+  if (!region) return { constraint: "region", requestedArtist: null, exactCanonicalKey: null };
+  return {
+    constraint: region.constraint,
+    requestedArtist: region.requestedArtist,
+    exactCanonicalKey: region.constraint === "exact_track" && region.requestedArtist && region.requestedTitle
+      ? canonicalRadioTrackKey(region.requestedArtist, region.requestedTitle)
+      : null,
+  };
+}
+
+function actualEndpointStatus(plan: GradientRecordingRoutePlan, tracks: StoredGradientTrack[]) {
+  return assessGradientMergedEndpoints(
+    tracks,
+    endpointExpectation(plan.regions[0]),
+    endpointExpectation(plan.regions.at(-1)),
+  );
+}
+
 /** Explicit fallback radio remains fallback, but hard user waypoints still mean what they say. */
 function enforceFallbackHardWaypoints(generationId: string, plan: GradientRecordingRoutePlan) {
   const current = getGenerationTracks(generationId);
@@ -277,11 +300,14 @@ function finishRecordingGeneration(
   providerDiagnostics: GradientValidatedProviderDiagnostics,
   routeSearchMs: number,
   storedCount: number,
+  actualEndpoints: ReturnType<typeof actualEndpointStatus> | null,
   extra: Record<string, unknown> = {},
 ) {
   const selected = getGenerationTracks(generationId);
   const lengthComplete = storedCount >= plan.requestedLength;
-  const endpointComplete = plan.endpointStatus.startSatisfied && plan.endpointStatus.endSatisfied;
+  const plannedEndpointComplete = plan.endpointStatus.startSatisfied && plan.endpointStatus.endSatisfied;
+  const finalEndpointComplete = actualEndpoints?.satisfied ?? plannedEndpointComplete;
+  const endpointComplete = plannedEndpointComplete && finalEndpointComplete;
   const status = plan.complete && lengthComplete && endpointComplete ? "ready" : "partial";
   finishGeneration(generationId, status, {
     gradient_route: routeDiagnostics(plan, providerDiagnostics),
@@ -293,6 +319,13 @@ function finishRecordingGeneration(
     gradient_route_length_complete: lengthComplete,
     gradient_route_requested_length: plan.requestedLength,
     gradient_route_actual_length: storedCount,
+    gradient_final_endpoint_status: actualEndpoints ? {
+      start_satisfied: actualEndpoints.startSatisfied,
+      end_satisfied: actualEndpoints.endSatisfied,
+      first_key: actualEndpoints.firstKey,
+      last_key: actualEndpoints.lastKey,
+    } : null,
+    gradient_endpoint_lock_conflict: Boolean(actualEndpoints?.conflict),
     gradient_stage_route_selected: summarizeGradientStage(selected),
     gradient_pipeline_timing: {
       route_search_ms: routeSearchMs,
@@ -365,6 +398,7 @@ export async function generateRadioStationWithRecordingGradient(
     providerDiagnostics,
     planned.routeSearchMs,
     stored.length,
+    actualEndpointStatus(planned.plan, stored),
     { gradient_fallback_radio: false },
   );
   return presentGeneration(generation.id)!;
@@ -405,13 +439,19 @@ export async function regenerateRadioTailWithRecordingGradient(
   replaceGenerationTracks(generationId, merged);
   getDb().query("UPDATE radio_generations SET generator_version=? WHERE id=?")
     .run(`radio-v5-gradient-recording-${settings.gradientAlgorithm}`, generationId);
+  const endpoints = actualEndpointStatus(planned.plan, merged);
   finishRecordingGeneration(
     generationId,
     planned.plan,
     providerDiagnostics,
     planned.routeSearchMs,
     merged.length,
-    { gradient_fallback_radio: false, gradient_regenerated_from: Math.max(0, fromPosition) },
+    endpoints,
+    {
+      gradient_fallback_radio: false,
+      gradient_regenerated_from: Math.max(0, fromPosition),
+      ...(endpoints.conflict ? { gradient_endpoint_lock_conflict_reason: "locked_track_prevented_hard_endpoint" } : {}),
+    },
   );
   return presentGeneration(generationId)!;
 }
