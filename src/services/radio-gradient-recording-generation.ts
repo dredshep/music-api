@@ -32,6 +32,7 @@ import {
   createValidatedGradientRecordingProvider,
   type GradientValidatedProviderDiagnostics,
 } from "./radio-gradient-recording-validated-provider";
+import { mergeGradientPlannedTail } from "./radio-gradient-tail-merge";
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -369,38 +370,6 @@ export async function generateRadioStationWithRecordingGradient(
   return presentGeneration(generation.id)!;
 }
 
-function lockedPositions(tracks: RadioTrackRow[], fromPosition: number) {
-  return new Map(tracks
-    .filter((track) => track.position < fromPosition || Boolean(track.pinned) || Boolean(track.manual))
-    .map((track) => [track.position, copyStored(track)]));
-}
-
-function mergePlannedTail(
-  existing: RadioTrackRow[],
-  planned: ReturnType<typeof storedRouteTracks>,
-  requestedLength: number,
-  fromPosition: number,
-) {
-  const locked = lockedPositions(existing, fromPosition);
-  const output: Array<ReturnType<typeof copyStored> | ReturnType<typeof storedRouteTracks>[number]> = [];
-  const used = new Set<string>();
-  let plannedCursor = 0;
-  for (let position = 0; position < requestedLength; position++) {
-    const fixed = locked.get(position);
-    if (fixed) {
-      output.push(fixed);
-      used.add(fixed.canonical_key);
-      continue;
-    }
-    while (plannedCursor < planned.length && used.has(planned[plannedCursor]!.canonical_key)) plannedCursor++;
-    const candidate = planned[plannedCursor++];
-    if (!candidate) continue;
-    output.push(candidate);
-    used.add(candidate.canonical_key);
-  }
-  return output;
-}
-
 export async function regenerateRadioTailWithRecordingGradient(
   generationId: string,
   fromPosition: number,
@@ -432,7 +401,7 @@ export async function regenerateRadioTailWithRecordingGradient(
   }
 
   const routeTracks = storedRouteTracks(planned.plan, planned.familiarity);
-  const merged = mergePlannedTail(existing, routeTracks, generation.requested_length, Math.max(0, fromPosition));
+  const merged = mergeGradientPlannedTail(existing, routeTracks, generation.requested_length, Math.max(0, fromPosition));
   replaceGenerationTracks(generationId, merged);
   getDb().query("UPDATE radio_generations SET generator_version=? WHERE id=?")
     .run(`radio-v5-gradient-recording-${settings.gradientAlgorithm}`, generationId);
