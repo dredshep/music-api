@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { createRouteBudget } from "../src/services/radio-gradient-budget";
+import {
+  densifyGradientRecordingPathWithSubpathFallback,
+  gradientMaxEdgeShare,
+} from "../src/services/radio-gradient-densify-subpath";
 import {
   gradientRecording,
   gradientRecordingEdgeCost,
@@ -7,10 +10,6 @@ import {
   type GradientRecordingNeighborProvider,
   type GradientRecordingPath,
 } from "../src/services/radio-gradient-recording-path";
-import {
-  gradientMaxEdgeShare,
-  repairGradientRecordingPathSpacing,
-} from "../src/services/radio-gradient-spacing-repair";
 
 function makePath(recordings: GradientRecording[], similarities: number[]): GradientRecordingPath {
   const edges = similarities.map((similarity, index) => ({
@@ -73,33 +72,30 @@ describe("Gradient fixed-length spacing repair", () => {
       // Poppy cluster using a real validated Girls in Bikinis -> Grimes edge.
       [p1.key]: [[grimes, 0.82]],
     });
-    const budget = createRouteBudget(80, 60_000);
-    const result = await repairGradientRecordingPathSpacing(original, 10, graph, {
-      budget,
+    const result = await densifyGradientRecordingPathWithSubpathFallback(original, 10, graph, {
+      maxQueries: 80,
       endpointArtists: ["Poppy", "Taake"],
     });
 
     expect(result.path.recordings).toHaveLength(10);
     expect(result.path.recordings.map((row) => row.title)).toContain("Bridge Song");
     expect(result.path.recordings.map((row) => row.title)).not.toContain("Chic Chick");
-    expect(result.operations).toHaveLength(1);
-    expect(result.operations[0]!.inserted).toEqual([{ artist: "Bridge Artist", title: "Bridge Song" }]);
-    expect(result.operations[0]!.removed).toEqual([{ artist: "Poppy", title: "Chic Chick" }]);
-    expect(result.maxEdgeShareAfter).toBeLessThan(before);
+    expect(result.operations.some((operation) => operation.inserted.includes("Bridge Song"))).toBe(true);
+    expect(gradientMaxEdgeShare(result.path)).toBeLessThan(before);
     expect(result.queryCount).toBeGreaterThan(0);
   });
 
   test("does not rewrite an exact-length route when no validated bridge exists", async () => {
     const rows = Array.from({ length: 10 }, (_, index) => gradientRecording(`Artist ${index}`, `Track ${index}`));
     const original = makePath(rows, [0.9, 0.9, 0.9, 0.1, 0.8, 0.8, 0.8, 0.8, 0.8]);
-    const result = await repairGradientRecordingPathSpacing(original, 10, provider({}), {
-      budget: createRouteBudget(40, 60_000),
+    const result = await densifyGradientRecordingPathWithSubpathFallback(original, 10, provider({}), {
+      maxQueries: 40,
       endpointArtists: ["Artist 0", "Artist 9"],
     });
 
     expect(result.path.recordings.map((row) => row.key)).toEqual(original.recordings.map((row) => row.key));
     expect(result.operations).toHaveLength(0);
-    expect(["no_bridge", "query_budget"]).toContain(result.stoppedReason);
+    expect(result.stoppedReason).toBe("requested_length");
   });
 
   test("leaves an already balanced route untouched without provider work", async () => {
@@ -112,12 +108,13 @@ describe("Gradient fixed-length spacing repair", () => {
         return [];
       },
     };
-    const result = await repairGradientRecordingPathSpacing(original, 10, p, {
-      budget: createRouteBudget(40, 60_000),
+    const result = await densifyGradientRecordingPathWithSubpathFallback(original, 10, p, {
+      maxQueries: 40,
     });
 
-    expect(result.stoppedReason).toBe("balanced");
+    expect(result.path.recordings.map((row) => row.key)).toEqual(original.recordings.map((row) => row.key));
     expect(result.operations).toHaveLength(0);
+    expect(result.queryCount).toBe(0);
     expect(calls).toBe(0);
   });
 });
