@@ -1,0 +1,461 @@
+import type { GradientAlgorithm, RadioSeedRow, RadioSettings } from "../db/repositories/radio";
+import { normalizeForComparison } from "../domain/normalization";
+import * as lastfm from "./lastfm";
+import {
+  densifyGradientRecordingPath,
+  discoverGradientRecordingPath,
+  gradientRecording,
+  type GradientDensificationOperation,
+  type GradientRecording,
+  type GradientRecordingNeighborProvider,
+  type GradientRecordingPathEdge,
+} from "./radio-gradient-recording-path";
+
+export type GradientSeedConstraint = "exact_track" | "artist" | "region";
+
+export interface GradientSeedRecordingRegion {
+  seedId: string;
+  label: string;
+  seedType: RadioSeedRow["seed_type"];
+  position: number;
+  constraint: GradientSeedConstraint;
+  requestedArtist: string | null;
+  requestedTitle: string | null;
+  recordings: GradientRecording[];
+}
+
+export interface GradientRecordingRouteSegment {
+  index: number;
+  fromSeedId: string;
+  toSeedId: string;
+  fromLabel: string;
+  toLabel: string;
+  fromPosition: number;
+  toPosition: number;
+  connected: boolean;
+  queryCount: number;
+  rawRecordings: GradientRecording[];
+  recordings: Array<GradientRecording & { routePosition: number; routeConfidence: number }>;
+  edges: GradientRecordingPathEdge[];
+  densificationOperations: GradientDensificationOperation[];
+  densificationStoppedReason: string | null;
+  fallbackReason: string | null;
+}
+
+export interface GradientRecordingRoutePlan {
+  algorithm: GradientAlgorithm;
+  state: "complete" | "partial" | "no_route";
+  usable: boolean;
+  complete: boolean;
+  requestedLength: number;
+  regions: GradientSeedRecordingRegion[];
+  segments: GradientRecordingRouteSegment[];
+  recordings: Array<GradientRecording & {
+    routePosition: number | null;
+    routeConfidence: number;
+    waypointSeedId?: string;
+    waypointConstraint?: GradientSeedConstraint;
+    unsupportedWaypoint?: boolean;
+  }>;
+  queryCount: number;
+  bottleneck: number | null;
+  middleNovelty: {
+    count: number;
+    knownCount: number;
+    unknownCount: number;
+    meanFamiliarity: number | null;
+  };
+  endpointStatus: {
+    startSatisfied: boolean;
+    endSatisfied: boolean;
+    startConstraint: GradientSeedConstraint | null;
+    endConstraint: GradientSeedConstraint | null;
+  };
+}
+
+export interface GradientSeedRecordingSources {
+  artistTracks(artist: string, limit: number): Promise<Array<{ artist: string; title: string; mbid?: string | null; weight?: number }>>;
+  albumTracks(artist: string, album: string, limit: number): Promise<Array<{ artist: string; title: string; mbid?: string | null; weight?: number }>>;
+  genreTracks(genre: string, limit: number): Promise<Array<{ artist: string; title: string; mbid?: string | null; weight?: number }>>;
+}
+
+const DEFAULT_SOURCES: GradientSeedRecordingSources = {
+  async artistTracks(artist, limit) {
+    const rows = await lastfm.getArtistTopTracks(artist, limit);
+    return rows.map((row) => ({ artist, title: row.name, mbid: row.mbid || null, weight: row.match }));
+  },
+  async albumTracks(artist, album, limit) {
+    const rows = await lastfm.getAlbumTracks(artist, album);
+    return rows.slice(0, limit).map((row) => ({ artist: row.artist || artist, title: row.name, mbid: row.mbid || null, weight: row.match }));
+  },
+  async genreTracks(genre, limit) {
+    const rows = await lastfm.getTagTopTracks(genre, limit);
+    return rows.map((row) => ({ artist: row.artist, title: row.name, mbid: row.mbid || null, weight: row.match }));
+  },
+};
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function parseObject(raw: string | null): Record<string, unknown> {
+  try { return raw ? JSON.parse(raw) as Record<string, unknown> : {}; }
+  catch { return {}; }
+}
+
+function text(value: unknown) {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function exactSeedMbid(seed: RadioSeedRow) {
+  const metadata = parseObject(seed.metadata_json);
+  return text(metadata.recordingMbid) ?? text(metadata.musicbrainzId) ?? text(metadata.mbid);
+}
+
+function metadataRecordings(seed: RadioSeedRow) {
+  const metadata = parseObject(seed.metadata_json);
+  if (!Array.isArray(metadata.tracks)) return [] as Array<GradientRecording & { weight: number }>;
+  return metadata.tracks.flatMap((raw) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
+    const row = raw as Record<string, unknown>;
+    const artist = text(row.artist);
+    const title = text(row.title) ?? text(row.name);
+    if (!artist || !title) return [];
+    const mbid = text(row.recordingMbid) ?? text(row.musicbrainzId) ?? text(row.mbid);
+    const weight = typeof row.weight === "number" && Number.isFinite(row.weight) ? row.weight : 1;
+    return [{ ...gradientRecording(artist, title, mbid), weight }];
+  });
+}
+
+function dedupeRecordings(rows: Array<GradientRecording & { weight?: number }>, limit: number) {
+  const best = new Map<string, GradientRecording & { weight: number }>();
+  for (const row of rows) {
+    if (!row.artist.trim() || !row.title.trim()) continue;
+    const current = best.get(row.key);
+    const weight = Number.isFinite(row.weight) ? Number(row.weight) : 1;
+    if (!current || weight > current.weight) best.set(row.key, { ...row, weight });
+  }
+  return [...best.values()]
+    .sort((a, b) => b.weight - a.weight || a.artist.localeCompare(b.artist) || a.title.localeCompare(b.title))
+    .slice(0, limit)
+    .map(({ weight: _weight, ...row }) => row);
+}
+
+function positionedSeeds(seeds: RadioSeedRow[]) {
+  return [...seeds]
+    .map((seed, index) => ({
+      seed,
+      position: clamp(seed.position ?? (seeds.length <= 1 ? 0 : index / Math.max(1, seeds.length - 1)), 0, 1),
+    }))
+    .sort((a, b) => a.position - b.position);
+}
+
+export async function gradientSeedRecordingRegion(
+  seed: RadioSeedRow,
+  position: number,
+  sources: GradientSeedRecordingSources = DEFAULT_SOURCES,
+): Promise<GradientSeedRecordingRegion> {
+  let constraint: GradientSeedConstraint = "region";
+  let recordings: GradientRecording[] = [];
+  if (seed.seed_type === "track" && seed.artist?.trim() && seed.title?.trim()) {
+    constraint = "exact_track";
+    recordings = [gradientRecording(seed.artist, seed.title, exactSeedMbid(seed))];
+  } else if (seed.seed_type === "artist" && seed.artist?.trim()) {
+    constraint = "artist";
+    try {
+      const rows = await sources.artistTracks(seed.artist, 14);
+      recordings = dedupeRecordings(rows.map((row) => ({
+        ...gradientRecording(seed.artist!, row.title, row.mbid || null),
+        weight: row.weight ?? 1,
+      })), 14);
+    } catch { /* empty region becomes an honest unsupported waypoint */ }
+  } else if (seed.seed_type === "album" && seed.artist?.trim()) {
+    try {
+      const rows = await sources.albumTracks(seed.artist, seed.label, 24);
+      recordings = dedupeRecordings(rows.map((row) => ({
+        ...gradientRecording(row.artist || seed.artist!, row.title, row.mbid || null),
+        weight: row.weight ?? 1,
+      })), 24);
+    } catch { /* fall through to supplied metadata */ }
+  } else if (seed.seed_type === "genre") {
+    try {
+      const rows = await sources.genreTracks(seed.label, 24);
+      recordings = dedupeRecordings(rows.map((row) => ({
+        ...gradientRecording(row.artist, row.title, row.mbid || null),
+        weight: row.weight ?? 1,
+      })), 24);
+    } catch { /* fall through to supplied metadata */ }
+  }
+
+  if (!recordings.length) recordings = dedupeRecordings(metadataRecordings(seed), 24);
+  if (!recordings.length && seed.artist?.trim() && seed.title?.trim()) {
+    recordings = [gradientRecording(seed.artist, seed.title, exactSeedMbid(seed))];
+  }
+
+  return {
+    seedId: seed.id,
+    label: seed.label,
+    seedType: seed.seed_type,
+    position,
+    constraint,
+    requestedArtist: seed.artist?.trim() || null,
+    requestedTitle: seed.title?.trim() || null,
+    recordings,
+  };
+}
+
+function segmentTransitionAllocation(regions: GradientSeedRecordingRegion[], requestedLength: number) {
+  const count = Math.max(0, regions.length - 1);
+  if (!count) return [] as number[];
+  const transitionBudget = Math.max(count, requestedLength - 1);
+  const spans = Array.from({ length: count }, (_, index) => Math.max(0.0001, regions[index + 1]!.position - regions[index]!.position));
+  const total = spans.reduce((sum, span) => sum + span, 0);
+  const raw = spans.map((span) => span / total * transitionBudget);
+  const allocated = raw.map((value) => Math.max(1, Math.floor(value)));
+  let delta = transitionBudget - allocated.reduce((sum, value) => sum + value, 0);
+  if (delta > 0) {
+    const order = raw.map((value, index) => ({ index, fraction: value - Math.floor(value) }))
+      .sort((a, b) => b.fraction - a.fraction || a.index - b.index);
+    for (let cursor = 0; delta > 0; cursor++, delta--) allocated[order[cursor % order.length]!.index]!++;
+  } else if (delta < 0) {
+    const order = raw.map((value, index) => ({ index, excess: allocated[index]! - value }))
+      .sort((a, b) => b.excess - a.excess || a.index - b.index);
+    let cursor = 0;
+    while (delta < 0 && order.some((row) => allocated[row.index]! > 1)) {
+      const row = order[cursor % order.length]!;
+      if (allocated[row.index]! > 1) {
+        allocated[row.index]!--;
+        delta++;
+      }
+      cursor++;
+    }
+  }
+  return allocated;
+}
+
+function segmentConfidence(edges: GradientRecordingPathEdge[]) {
+  if (!edges.length) return 1;
+  return Math.exp(edges.reduce((sum, edge) => sum + Math.log(Math.max(0.01, edge.similarity * edge.confidence)), 0) / edges.length);
+}
+
+function requiredWaypointRecording(region: GradientSeedRecordingRegion) {
+  return region.constraint === "exact_track" || region.constraint === "artist" ? region.recordings[0] ?? null : null;
+}
+
+function satisfiesRegion(recording: GradientRecording | undefined, region: GradientSeedRecordingRegion) {
+  if (!recording) return false;
+  if (region.constraint === "exact_track") return recording.key === region.recordings[0]?.key;
+  if (region.constraint === "artist") return Boolean(region.requestedArtist)
+    && normalizeForComparison(recording.artist) === normalizeForComparison(region.requestedArtist!);
+  return true;
+}
+
+function middleNovelty(
+  recordings: GradientRecordingRoutePlan["recordings"],
+  familiarity?: (recording: GradientRecording) => number | null,
+) {
+  const middle = recordings.filter((row) => row.routePosition != null && row.routePosition >= 0.33 && row.routePosition <= 0.67);
+  if (!middle.length || !familiarity) return { count: middle.length, knownCount: 0, unknownCount: middle.length, meanFamiliarity: null };
+  const values = middle.map((row) => familiarity(row)).filter((value): value is number => value != null);
+  return {
+    count: middle.length,
+    knownCount: values.filter((value) => value >= 0.35).length,
+    unknownCount: middle.length - values.filter((value) => value >= 0.35).length,
+    meanFamiliarity: values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null,
+  };
+}
+
+/** Plan one coherent recording trajectory across all requested waypoints. */
+export async function planGradientRecordingRoute(input: {
+  seeds: RadioSeedRow[];
+  settings: RadioSettings;
+  requestedLength: number;
+  provider: GradientRecordingNeighborProvider;
+  familiarity?: (recording: GradientRecording) => number | null;
+  sources?: GradientSeedRecordingSources;
+}): Promise<GradientRecordingRoutePlan> {
+  const { seeds, settings, provider } = input;
+  const algorithm = settings.gradientAlgorithm;
+  const requestedLength = Math.max(1, input.requestedLength);
+  if (algorithm === "blend" || seeds.length < 2) {
+    return {
+      algorithm,
+      state: "no_route",
+      usable: false,
+      complete: false,
+      requestedLength,
+      regions: [],
+      segments: [],
+      recordings: [],
+      queryCount: 0,
+      bottleneck: null,
+      middleNovelty: { count: 0, knownCount: 0, unknownCount: 0, meanFamiliarity: null },
+      endpointStatus: { startSatisfied: false, endSatisfied: false, startConstraint: null, endConstraint: null },
+    };
+  }
+
+  const positions = positionedSeeds(seeds);
+  const regions = await Promise.all(positions.map(({ seed, position }) => gradientSeedRecordingRegion(seed, position, input.sources ?? DEFAULT_SOURCES)));
+  const allocation = segmentTransitionAllocation(regions, requestedLength);
+  const segments: GradientRecordingRouteSegment[] = [];
+  const output: GradientRecordingRoutePlan["recordings"] = [];
+  let queryCount = 0;
+  let previousWaypoint: GradientRecording | null = null;
+  const overallEndpointArtists: [string, string] | null = regions[0]?.requestedArtist && regions.at(-1)?.requestedArtist
+    ? [regions[0]!.requestedArtist!, regions.at(-1)!.requestedArtist!]
+    : null;
+  const scenic = algorithm === "scenic";
+
+  for (let index = 0; index < regions.length - 1; index++) {
+    const left = regions[index]!;
+    const right = regions[index + 1]!;
+    const fromCandidates = previousWaypoint ? [previousWaypoint] : left.recordings;
+    const toCandidates = right.recordings;
+    const base = {
+      index,
+      fromSeedId: left.seedId,
+      toSeedId: right.seedId,
+      fromLabel: left.label,
+      toLabel: right.label,
+      fromPosition: left.position,
+      toPosition: right.position,
+    };
+    if (!fromCandidates.length || !toCandidates.length) {
+      segments.push({
+        ...base, connected: false, queryCount: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
+        densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings",
+      });
+      previousWaypoint = null;
+      continue;
+    }
+
+    const raw = await discoverGradientRecordingPath(fromCandidates, toCandidates, provider, {
+      maxQueries: scenic ? 88 : 64,
+      maxNodes: scenic ? 1800 : 1200,
+      beamPerSide: scenic ? 5 : 4,
+      frontierCap: scenic ? 180 : 120,
+      neighborLimit: scenic ? 44 : 36,
+      refineQueries: scenic ? 18 : 10,
+    });
+    if (!raw) {
+      segments.push({
+        ...base, connected: false, queryCount: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
+        densificationStoppedReason: null, fallbackReason: "no_recording_path_found",
+      });
+      previousWaypoint = null;
+      continue;
+    }
+    queryCount += raw.queryCount;
+    const targetNodes = (allocation[index] ?? 1) + 1;
+    const dense = await densifyGradientRecordingPath(raw, Math.max(raw.recordings.length, targetNodes), provider, {
+      maxQueries: scenic ? 128 : 96,
+      neighborLimit: scenic ? 56 : 48,
+      minBridgeSimilarity: scenic ? 0.09 : 0.12,
+      endpointArtists: overallEndpointArtists,
+      familiarity: input.familiarity,
+      familiarityWeight: scenic ? 0.26 : 0.18,
+    });
+    queryCount += dense.queryCount;
+    const scaled = dense.positioned.map((recording) => ({
+      ...recording,
+      routePosition: left.position + (right.position - left.position) * recording.routePosition,
+    }));
+    segments.push({
+      ...base,
+      connected: true,
+      queryCount: raw.queryCount + dense.queryCount,
+      rawRecordings: raw.recordings,
+      recordings: scaled,
+      edges: dense.path.edges,
+      densificationOperations: dense.operations,
+      densificationStoppedReason: dense.stoppedReason,
+      fallbackReason: dense.path.recordings.length < targetNodes ? "densification_exhausted_before_target_length" : null,
+    });
+
+    previousWaypoint = dense.path.recordings.at(-1) ?? null;
+    for (let rowIndex = 0; rowIndex < scaled.length; rowIndex++) {
+      const recording = scaled[rowIndex]!;
+      const isLeftWaypoint = rowIndex === 0;
+      const isRightWaypoint = rowIndex === scaled.length - 1;
+      if (output.length && output.at(-1)!.key === recording.key && Math.abs((output.at(-1)!.routePosition ?? -1) - recording.routePosition) < 1e-6) continue;
+      output.push({
+        ...recording,
+        ...(isLeftWaypoint && left.constraint !== "region" ? { waypointSeedId: left.seedId, waypointConstraint: left.constraint } : {}),
+        ...(isRightWaypoint && right.constraint !== "region" ? { waypointSeedId: right.seedId, waypointConstraint: right.constraint } : {}),
+      });
+    }
+  }
+
+  const connectedCount = segments.filter((segment) => segment.connected).length;
+  const allConnected = connectedCount === segments.length && segments.length > 0;
+
+  // A partial route still exposes required exact/artist waypoints honestly, but
+  // they remain unpositioned if no connected segment established their place.
+  if (!allConnected) {
+    for (const region of regions) {
+      if (region.constraint === "region") continue;
+      const already = output.find((row) => row.waypointSeedId === region.seedId || (row.routePosition != null && Math.abs(row.routePosition - region.position) < 1e-6 && satisfiesRegion(row, region)));
+      if (already) continue;
+      const fallback = requiredWaypointRecording(region);
+      if (!fallback) continue;
+      output.push({
+        ...fallback,
+        routePosition: null,
+        routeConfidence: 0,
+        waypointSeedId: region.seedId,
+        waypointConstraint: region.constraint,
+        unsupportedWaypoint: true,
+      });
+    }
+  }
+
+  output.sort((a, b) => {
+    if (a.routePosition == null && b.routePosition == null) {
+      const aRegion = regions.find((region) => region.seedId === a.waypointSeedId)?.position ?? 0.5;
+      const bRegion = regions.find((region) => region.seedId === b.waypointSeedId)?.position ?? 0.5;
+      return aRegion - bRegion;
+    }
+    if (a.routePosition == null) {
+      const target = regions.find((region) => region.seedId === a.waypointSeedId)?.position ?? 0.5;
+      return target - (b.routePosition ?? target);
+    }
+    if (b.routePosition == null) {
+      const target = regions.find((region) => region.seedId === b.waypointSeedId)?.position ?? 0.5;
+      return a.routePosition - target;
+    }
+    return a.routePosition - b.routePosition;
+  });
+
+  const edgeSimilarities = segments.filter((segment) => segment.connected).flatMap((segment) => segment.edges.map((edge) => edge.similarity * edge.confidence));
+  const bottleneck = edgeSimilarities.length ? Math.min(...edgeSimilarities) : null;
+  const firstRegion = regions[0];
+  const lastRegion = regions.at(-1);
+  const first = output[0];
+  const last = output.at(-1);
+  const state: GradientRecordingRoutePlan["state"] = allConnected ? "complete" : connectedCount ? "partial" : "no_route";
+  return {
+    algorithm,
+    state,
+    usable: connectedCount > 0,
+    complete: allConnected,
+    requestedLength,
+    regions,
+    segments,
+    recordings: output,
+    queryCount,
+    bottleneck,
+    middleNovelty: middleNovelty(output, input.familiarity),
+    endpointStatus: {
+      startSatisfied: firstRegion ? satisfiesRegion(first, firstRegion) : false,
+      endSatisfied: lastRegion ? satisfiesRegion(last, lastRegion) : false,
+      startConstraint: firstRegion?.constraint ?? null,
+      endConstraint: lastRegion?.constraint ?? null,
+    },
+  };
+}
+
+export function gradientRecordingRouteConfidence(plan: GradientRecordingRoutePlan) {
+  const connected = plan.segments.filter((segment) => segment.connected);
+  if (!connected.length) return 0;
+  return connected.reduce((sum, segment) => sum + segmentConfidence(segment.edges), 0) / connected.length;
+}
