@@ -1,8 +1,8 @@
 import type { GradientAlgorithm, RadioSeedRow, RadioSettings } from "../db/repositories/radio";
 import { normalizeForComparison } from "../domain/normalization";
 import * as lastfm from "./lastfm";
+import { densifyGradientRecordingPathWithSubpathFallback } from "./radio-gradient-densify-subpath";
 import {
-  densifyGradientRecordingPath,
   discoverGradientRecordingPath,
   gradientRecording,
   type GradientDensificationOperation,
@@ -347,7 +347,7 @@ export async function planGradientRecordingRoute(input: {
     }
     queryCount += raw.queryCount;
     const targetNodes = (allocation[index] ?? 1) + 1;
-    const dense = await densifyGradientRecordingPath(raw, Math.max(raw.recordings.length, targetNodes), provider, {
+    const dense = await densifyGradientRecordingPathWithSubpathFallback(raw, Math.max(raw.recordings.length, targetNodes), provider, {
       maxQueries: scenic ? 128 : 96,
       neighborLimit: scenic ? 56 : 48,
       minBridgeSimilarity: scenic ? 0.09 : 0.12,
