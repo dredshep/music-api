@@ -2,6 +2,7 @@ import { normalizeForComparison } from "../domain/normalization";
 import {
   densifyGradientRecordingPath,
   gradientFamiliarityTarget,
+  gradientRecordingEdgeCost,
   positionGradientRecordingPath,
   type GradientDensificationOperation,
   type GradientDensificationResult,
@@ -19,6 +20,35 @@ function clamp(value: number, min: number, max: number) {
 
 function edgeStrength(edge: GradientRecordingPathEdge | undefined) {
   return edge ? edge.similarity * edge.confidence : 0;
+}
+
+function edgeCost(edge: GradientRecordingPathEdge) {
+  return gradientRecordingEdgeCost(edge.similarity, edge.confidence);
+}
+
+export function gradientMaxEdgeShare(path: GradientRecordingPath) {
+  if (!path.edges.length) return 0;
+  const costs = path.edges.map(edgeCost);
+  const total = Math.max(0.000001, costs.reduce((sum, value) => sum + value, 0));
+  return Math.max(...costs.map((value) => value / total));
+}
+
+function worstGap(path: GradientRecordingPath) {
+  if (!path.edges.length) return null;
+  const costs = path.edges.map(edgeCost);
+  const total = Math.max(0.000001, costs.reduce((sum, value) => sum + value, 0));
+  let index = 0;
+  for (let i = 1; i < costs.length; i++) {
+    if (costs[i]! > costs[index]!) index = i;
+  }
+  return { index, share: costs[index]! / total };
+}
+
+function withPathCost(path: GradientRecordingPath): GradientRecordingPath {
+  return {
+    ...path,
+    cost: path.edges.reduce((sum, edge) => sum + edgeCost(edge), 0),
+  };
 }
 
 function sameEndpointArtist(
@@ -141,11 +171,273 @@ function bridgeEdges(
   ];
 }
 
+function makeGapPath(path: GradientRecordingPath, gapIndex: number): GradientRecordingPath {
+  const edge = path.edges[gapIndex]!;
+  return {
+    recordings: [path.recordings[gapIndex]!, path.recordings[gapIndex + 1]!],
+    edges: [edge],
+    cost: edgeCost(edge),
+    queryCount: 0,
+    nodesVisited: 2,
+    forwardFrontierSize: 0,
+    backwardFrontierSize: 0,
+    intersection: null,
+  };
+}
+
+type FixedLengthCompression = {
+  path: GradientRecordingPath;
+  removed: GradientRecording[];
+  queryCount: number;
+};
+
+/**
+ * Reclaim slots after a targeted gap insertion. Every removal requires a real
+ * validated prev->next edge. When several removals are safe, prefer reclaiming
+ * tightly packed slots and repeated endpoint artists instead of moving the cliff.
+ */
+async function compressFixedLengthBalanced(
+  original: GradientRecordingPath,
+  requestedLength: number,
+  provider: GradientRecordingNeighborProvider,
+  options: GradientDensifyOptions,
+  maxQueries: number,
+  protectedKeys: Set<string>,
+): Promise<FixedLengthCompression | null> {
+  const recordings = [...original.recordings];
+  const edges = [...original.edges];
+  const protectedSet = new Set(protectedKeys);
+  protectedSet.add(recordings[0]!.key);
+  protectedSet.add(recordings.at(-1)!.key);
+  const endpointArtists = new Set((options.endpointArtists ?? []).map(normalizeForComparison));
+  const cache = new Map<string, GradientRecordingNeighbor[]>();
+  const removed: GradientRecording[] = [];
+  let queryCount = 0;
+
+  const neighbors = async (recording: GradientRecording) => {
+    const cached = cache.get(recording.key);
+    if (cached) return cached;
+    if (queryCount >= maxQueries) return null;
+    queryCount++;
+    const rows = await provider.neighbors(recording, Math.max(24, Math.min(64, options.neighborLimit ?? 48)))
+      .catch(() => [] as GradientRecordingNeighbor[]);
+    cache.set(recording.key, rows);
+    return rows;
+  };
+
+  while (recordings.length > requestedLength) {
+    const totalCost = Math.max(0.000001, edges.reduce((sum, edge) => sum + edgeCost(edge), 0));
+    const artistCounts = new Map<string, number>();
+    for (const recording of recordings) {
+      const artist = normalizeForComparison(recording.artist);
+      artistCounts.set(artist, (artistCounts.get(artist) ?? 0) + 1);
+    }
+
+    let best: { index: number; edge: GradientRecordingPathEdge; score: number } | null = null;
+    for (let index = 1; index < recordings.length - 1; index++) {
+      const current = recordings[index]!;
+      if (protectedSet.has(current.key)) continue;
+      const prev = recordings[index - 1]!;
+      const next = recordings[index + 1]!;
+      const rows = await neighbors(prev);
+      if (rows == null) return null;
+      const match = rows.find((row) => row.key === next.key);
+      if (!match || match.similarity < 0.08) continue;
+
+      const skipEdge: GradientRecordingPathEdge = {
+        from: prev,
+        to: next,
+        similarity: match.similarity,
+        confidence: match.confidence ?? 0.8,
+        provider: match.provider ?? "recording_similarity",
+      };
+      const oldCost = edgeCost(edges[index - 1]!) + edgeCost(edges[index]!);
+      const newCost = edgeCost(skipEdge);
+      const localSpanShare = oldCost / totalCost;
+      const artist = normalizeForComparison(current.artist);
+      const repeats = Math.max(0, (artistCounts.get(artist) ?? 1) - 1);
+      const repeatBonus = repeats * 0.12;
+      const endpointRepeatBonus = endpointArtists.has(artist) && repeats > 0 ? 0.14 : 0;
+      const score = (newCost - oldCost) + localSpanShare * 0.35 - repeatBonus - endpointRepeatBonus;
+      if (!best || score < best.score) best = { index, edge: skipEdge, score };
+    }
+
+    if (!best) return null;
+    const [removedRecording] = recordings.splice(best.index, 1);
+    edges.splice(best.index - 1, 2, best.edge);
+    if (removedRecording) removed.push(removedRecording);
+  }
+
+  return {
+    path: withPathCost({ ...original, recordings, edges }),
+    removed,
+    queryCount,
+  };
+}
+
+type SpacingRepairResult = {
+  path: GradientRecordingPath;
+  operations: GradientDensificationOperation[];
+  queryCount: number;
+};
+
+/**
+ * Fixed-length route resampling. If one edge consumes a disproportionate share
+ * of total musical-route distance, temporarily insert one or two validated
+ * recordings into that exact gap and reclaim the same number of slots elsewhere
+ * through validated skip edges. This lets a 10-track route repair a 14%->50%
+ * cliff instead of declaring success merely because it already has 10 nodes.
+ */
+async function repairFixedLengthSpacing(
+  original: GradientRecordingPath,
+  requestedLength: number,
+  provider: GradientRecordingNeighborProvider,
+  options: GradientDensifyOptions,
+  maxQueries: number,
+): Promise<SpacingRepairResult> {
+  if (original.recordings.length !== requestedLength || original.edges.length < 3 || maxQueries <= 0) {
+    return { path: original, operations: [], queryCount: 0 };
+  }
+
+  const threshold = Math.max(0.24, Math.min(0.34, 2.4 / Math.max(4, requestedLength - 1)));
+  if (gradientMaxEdgeShare(original) <= threshold) return { path: original, operations: [], queryCount: 0 };
+
+  let current = original;
+  let queryCount = 0;
+  const operations: GradientDensificationOperation[] = [];
+
+  for (let attempt = 0; attempt < 2 && queryCount < maxQueries; attempt++) {
+    const worst = worstGap(current);
+    if (!worst || worst.share <= threshold) break;
+    const gap = makeGapPath(current, worst.index);
+    let bridgePath: GradientRecordingPath | null = null;
+    let bridgeOperations: GradientDensificationOperation[] = [];
+    let insertedKeys = new Set<string>();
+
+    const singleBudget = Math.min(24, maxQueries - queryCount);
+    if (singleBudget > 0) {
+      const single = await densifyGradientRecordingPath(gap, 3, provider, {
+        ...options,
+        maxQueries: singleBudget,
+        familiarity: undefined,
+        familiarityWeight: 0,
+      });
+      queryCount += single.queryCount;
+      if (single.path.recordings.length > 2) {
+        bridgePath = single.path;
+        bridgeOperations = single.operations;
+        insertedKeys = new Set(single.path.recordings.slice(1, -1).map((row) => row.key));
+      }
+    }
+
+    if (!bridgePath && maxQueries - queryCount >= 3) {
+      const twoBudget = Math.min(36, maxQueries - queryCount);
+      const found = await findTwoInteriorBridge(gap, provider, { ...options, familiarity: undefined }, twoBudget);
+      queryCount += found.queries;
+      if (found.bridge) {
+        const left = gap.recordings[0]!;
+        const right = gap.recordings[1]!;
+        const newEdges = bridgeEdges(left, right, found.bridge);
+        bridgePath = withPathCost({
+          ...gap,
+          recordings: [left, found.bridge.c, found.bridge.d, right],
+          edges: newEdges,
+          queryCount: gap.queryCount + found.queries,
+        });
+        insertedKeys = new Set([found.bridge.c.key, found.bridge.d.key]);
+        const targetFamiliarity = gradientFamiliarityTarget(found.bridge.midpoint);
+        bridgeOperations = [
+          {
+            gapIndex: 0,
+            left: `${left.artist} — ${left.title}`,
+            inserted: `${found.bridge.c.artist} — ${found.bridge.c.title}`,
+            right: `${found.bridge.d.artist} — ${found.bridge.d.title}`,
+            leftSimilarity: newEdges[0]!.similarity,
+            rightSimilarity: newEdges[1]!.similarity,
+            bottleneck: found.bridge.bottleneck,
+            familiarityTarget: targetFamiliarity,
+            familiarityActual: null,
+          },
+          {
+            gapIndex: 1,
+            left: `${found.bridge.c.artist} — ${found.bridge.c.title}`,
+            inserted: `${found.bridge.d.artist} — ${found.bridge.d.title}`,
+            right: `${right.artist} — ${right.title}`,
+            leftSimilarity: newEdges[1]!.similarity,
+            rightSimilarity: newEdges[2]!.similarity,
+            bottleneck: found.bridge.bottleneck,
+            familiarityTarget: targetFamiliarity,
+            familiarityActual: null,
+          },
+        ];
+      }
+    }
+
+    if (!bridgePath || !insertedKeys.size) break;
+
+    const recordings = [...current.recordings];
+    const edges = [...current.edges];
+    recordings.splice(worst.index, 2, ...bridgePath.recordings);
+    edges.splice(worst.index, 1, ...bridgePath.edges);
+    const expanded = withPathCost({
+      ...current,
+      recordings,
+      edges,
+      queryCount: current.queryCount + queryCount,
+    });
+
+    const compression = await compressFixedLengthBalanced(
+      expanded,
+      requestedLength,
+      provider,
+      options,
+      maxQueries - queryCount,
+      insertedKeys,
+    );
+    if (!compression) break;
+    queryCount += compression.queryCount;
+
+    const after = gradientMaxEdgeShare(compression.path);
+    if (after > worst.share + 0.005) break;
+
+    // Translate the gap-local operation index back to the full route so
+    // diagnostics still identify the repaired transition.
+    operations.push(...bridgeOperations.map((operation) => ({
+      ...operation,
+      gapIndex: worst.index + operation.gapIndex,
+    })));
+    current = compression.path;
+  }
+
+  return { path: current, operations, queryCount };
+}
+
+async function addFixedLengthSpacingRepair(
+  result: GradientDensificationResult,
+  requestedLength: number,
+  provider: GradientRecordingNeighborProvider,
+  options: GradientDensifyOptions,
+  totalBudget: number,
+): Promise<GradientDensificationResult> {
+  if (result.path.recordings.length !== requestedLength) return result;
+  const remaining = Math.max(0, totalBudget - result.queryCount);
+  if (!remaining) return result;
+  const repaired = await repairFixedLengthSpacing(result.path, requestedLength, provider, options, remaining);
+  if (!repaired.queryCount && !repaired.operations.length) return result;
+  return {
+    path: repaired.path,
+    positioned: positionGradientRecordingPath(repaired.path),
+    operations: [...result.operations, ...repaired.operations],
+    queryCount: result.queryCount + repaired.queryCount,
+    stoppedReason: "requested_length",
+  };
+}
+
 /**
  * Normal densification prefers a single bottleneck-safe common neighbor. If it
  * exhausts that option, probe a few weak gaps for a bounded C→D connector and
  * then resume normal densification. `maxQueries` is a hard total budget across
- * all three phases rather than a separate allowance for each phase.
+ * all phases, including fixed-length spacing repair.
  */
 export async function densifyGradientRecordingPathWithSubpathFallback(
   original: GradientRecordingPath,
@@ -158,7 +450,10 @@ export async function densifyGradientRecordingPathWithSubpathFallback(
     ...options,
     maxQueries: totalBudget,
   });
-  if (first.path.recordings.length >= requestedLength || first.stoppedReason !== "no_bridge") return first;
+  if (first.path.recordings.length >= requestedLength) {
+    return addFixedLengthSpacingRepair(first, requestedLength, provider, options, totalBudget);
+  }
+  if (first.stoppedReason !== "no_bridge") return first;
   if (requestedLength - first.path.recordings.length < 2) return first;
 
   let remainingBudget = Math.max(0, totalBudget - first.queryCount);
@@ -187,12 +482,12 @@ export async function densifyGradientRecordingPathWithSubpathFallback(
   const newEdges = bridgeEdges(left, right, found.bridge);
   recordings.splice(gap + 1, 0, found.bridge.c, found.bridge.d);
   edges.splice(gap, 1, ...newEdges);
-  const insertedPath: GradientRecordingPath = {
+  const insertedPath: GradientRecordingPath = withPathCost({
     ...first.path,
     recordings,
     edges,
     queryCount: first.path.queryCount + found.queries,
-  };
+  });
   const targetFamiliarity = gradientFamiliarityTarget(found.bridge.midpoint);
   const operations: GradientDensificationOperation[] = [
     ...first.operations,
@@ -221,13 +516,13 @@ export async function densifyGradientRecordingPathWithSubpathFallback(
   ];
 
   if (recordings.length >= requestedLength) {
-    return {
+    return addFixedLengthSpacingRepair({
       path: insertedPath,
       positioned: positionGradientRecordingPath(insertedPath),
       operations,
       queryCount: consumed,
       stoppedReason: "requested_length",
-    };
+    }, requestedLength, provider, options, totalBudget);
   }
 
   if (remainingBudget === 0) {
@@ -244,9 +539,9 @@ export async function densifyGradientRecordingPathWithSubpathFallback(
     ...options,
     maxQueries: remainingBudget,
   });
-  return {
+  return addFixedLengthSpacingRepair({
     ...second,
     operations: [...operations, ...second.operations],
     queryCount: consumed + second.queryCount,
-  };
+  }, requestedLength, provider, options, totalBudget);
 }
