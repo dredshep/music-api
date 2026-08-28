@@ -92,6 +92,27 @@ function routeTiming(plan: GradientRecordingRoutePlan) {
   };
 }
 
+function budgetDiagnostics(plan: GradientRecordingRoutePlan) {
+  if (!plan.budget) return null;
+  return {
+    query_budget: plan.budget.maxQueries,
+    query_budget_used: plan.budget.totalUsed,
+    query_budget_remaining: plan.budget.remaining,
+    deadline_ms: plan.budget.deadlineMs,
+    deadline_exhausted: plan.budget.deadlineExhausted,
+    budget_exhausted: plan.budget.budgetExhausted,
+    initial_recording_queries: plan.budget.initialRecordingQueries,
+    cached_nodes_expanded: plan.budget.cachedGraphNodesExpanded,
+    artist_bridge_calls: plan.budget.artistBridgeCalls,
+    bridge_track_lookups: plan.budget.bridgeTrackLookups,
+    chained_recording_queries: plan.budget.chainedRecordingQueries,
+    densification_queries: plan.budget.densificationQueries,
+    compression_queries: plan.budget.compressionQueries,
+    recording_neighbor_expansions: plan.budget.recordingNeighborExpansions,
+    total_route_search_ms: plan.budget.elapsedMs,
+  };
+}
+
 function routeDiagnostics(plan: GradientRecordingRoutePlan, provider: GradientValidatedProviderDiagnostics) {
   const connected = plan.segments.filter((segment) => segment.connected);
   return {
@@ -146,6 +167,7 @@ function routeDiagnostics(plan: GradientRecordingRoutePlan, provider: GradientVa
       waypoint_constraint: row.waypointConstraint ?? null,
       index,
     }]),
+    budget: budgetDiagnostics(plan),
     segments: plan.segments.map((segment) => ({
       index: segment.index,
       from: segment.fromLabel,
@@ -248,13 +270,14 @@ function fallbackWaypointForRegion(plan: GradientRecordingRoutePlan, region: Gra
 }
 
 function endpointExpectation(region: GradientSeedRecordingRegion | undefined): GradientHardEndpointExpectation {
-  if (!region) return { constraint: "region", requestedArtist: null, exactCanonicalKey: null };
+  if (!region) return { constraint: "region", requestedArtist: null, exactCanonicalKey: null, requestedMbid: null };
   return {
     constraint: region.constraint,
     requestedArtist: region.requestedArtist,
     exactCanonicalKey: region.constraint === "exact_track" && region.requestedArtist && region.requestedTitle
       ? canonicalRadioTrackKey(region.requestedArtist, region.requestedTitle)
       : null,
+    requestedMbid: region.constraint === "exact_track" ? region.recordings[0]?.mbid ?? null : null,
   };
 }
 
@@ -276,9 +299,15 @@ function enforceFallbackHardWaypoints(generationId: string, plan: GradientRecord
     const requested = fallbackWaypointForRegion(plan, region);
     if (!requested) continue;
     const desired = seedTargetIndex(region, output.length);
-    const existing = output.findIndex((track) => region.constraint === "exact_track"
-      ? track.canonical_key === canonicalRadioTrackKey(requested.artist, requested.title)
-      : normalizeForComparison(track.artist) === normalizeForComparison(region.requestedArtist ?? requested.artist));
+    const requestedKey = canonicalRadioTrackKey(requested.artist, requested.title);
+    const existing = output.findIndex((track) => {
+      if (region.constraint === "exact_track") {
+        if (track.canonical_key !== requestedKey) return false;
+        if (requested.mbid && requested.mbid !== track.musicbrainz_id) return false;
+        return true;
+      }
+      return normalizeForComparison(track.artist) === normalizeForComparison(region.requestedArtist ?? requested.artist);
+    });
     const source = existing >= 0 ? output[existing]! : {
       canonical_key: canonicalRadioTrackKey(requested.artist, requested.title),
       artist: requested.artist,
@@ -322,7 +351,7 @@ function finishRecordingGeneration(
   extra: Record<string, unknown> = {},
 ) {
   const selected = getGenerationTracks(generationId);
-  const lengthComplete = storedCount >= plan.requestedLength;
+  const lengthComplete = storedCount === plan.requestedLength;
   const plannedEndpointComplete = plan.endpointStatus.startSatisfied && plan.endpointStatus.endSatisfied;
   const finalEndpointComplete = actualEndpoints?.satisfied ?? plannedEndpointComplete;
   const endpointComplete = plannedEndpointComplete && finalEndpointComplete;

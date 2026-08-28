@@ -27,6 +27,7 @@ export type LiveGradientRouteState = {
   next_index: number;
   previous_key: string | null;
   completed: boolean;
+  route_complete: boolean;
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -44,11 +45,11 @@ export function isValidGradientLiveRouteState(
   stationId: string,
   state: LiveGradientRouteState | null | undefined,
 ): state is LiveGradientRouteState {
-  return Boolean(
-    state && state.version === 1 && state.station_id === stationId && Array.isArray(state.tracks)
-      && state.tracks.length <= 200 && Number.isInteger(state.next_index) && state.next_index >= 0
-      && state.next_index <= state.tracks.length,
-  );
+  if (!state || state.version !== 1 || state.station_id !== stationId || !Array.isArray(state.tracks)) return false;
+  if (state.tracks.length > 200 || !Number.isInteger(state.next_index) || state.next_index < 0) return false;
+  if (state.next_index > state.tracks.length) return false;
+  if (state.next_index >= state.tracks.length && !state.completed) return false;
+  return true;
 }
 
 export function consumeGradientLiveRouteState(
@@ -64,7 +65,8 @@ export function consumeGradientLiveRouteState(
     tracks.push(track);
   }
   const previousKey = tracks.at(-1)?.canonical_key ?? state.previous_key;
-  const completed = cursor >= state.tracks.length;
+  const arrayExhausted = cursor >= state.tracks.length;
+  const completed = arrayExhausted && state.route_complete;
   const nextState: LiveGradientRouteState = {
     ...state,
     next_index: cursor,
@@ -95,6 +97,16 @@ export function createGradientLiveRouteState(stationId: string, generation: {
   const fallback = generation.diagnostics?.gradient_fallback_radio === true;
   const positioned = generation.tracks.filter((track) => authoritativeGradientLiveRoutePosition(track) != null);
   if (!isRecordingPath || fallback || positioned.length < 2) return null;
+
+  const finalEp = generation.diagnostics?.gradient_final_endpoint_status as Record<string, unknown> | null | undefined;
+  const plannerEp = routeObject?.endpoint_status as Record<string, unknown> | null | undefined;
+  const endpointStatus = finalEp ?? plannerEp;
+  const routeComplete = routeObject?.complete === true
+    && endpointStatus?.start_satisfied === true
+    && endpointStatus?.end_satisfied === true;
+
+  if (!routeComplete) return null;
+
   return {
     version: 1 as const,
     station_id: stationId,
@@ -103,5 +115,6 @@ export function createGradientLiveRouteState(stationId: string, generation: {
     next_index: 0,
     previous_key: null,
     completed: false,
+    route_complete: true,
   } satisfies LiveGradientRouteState;
 }

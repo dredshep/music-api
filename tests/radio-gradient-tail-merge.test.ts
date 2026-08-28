@@ -123,8 +123,8 @@ describe("Gradient tail merge", () => {
     const merged = [planned("A", 0), planned("X", 0.5), planned("Pinned outro", 0.8)];
     const status = assessGradientMergedEndpoints(
       merged,
-      { constraint: "artist", requestedArtist: "A", exactCanonicalKey: null },
-      { constraint: "artist", requestedArtist: "B", exactCanonicalKey: null },
+      { constraint: "artist", requestedArtist: "A", exactCanonicalKey: null, requestedMbid: null },
+      { constraint: "artist", requestedArtist: "B", exactCanonicalKey: null, requestedMbid: null },
     );
     expect(status.startSatisfied).toBe(true);
     expect(status.endSatisfied).toBe(false);
@@ -134,9 +134,64 @@ describe("Gradient tail merge", () => {
   test("broad region endpoints do not become hard endpoint constraints", () => {
     const status = assessGradientMergedEndpoints(
       [planned("Whatever", 0), planned("Elsewhere", 1)],
-      { constraint: "region", requestedArtist: null, exactCanonicalKey: null },
-      { constraint: "region", requestedArtist: null, exactCanonicalKey: null },
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null, requestedMbid: null },
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null, requestedMbid: null },
     );
     expect(status.satisfied).toBe(true);
+  });
+
+  test("exact_track with matching canonical key but wrong MBID is not satisfied", () => {
+    const tracks: StoredGradientTrack[] = [
+      { ...planned("SongA", 0), musicbrainz_id: "mbid-wrong" },
+      planned("SongB", 1),
+    ];
+    const status = assessGradientMergedEndpoints(
+      tracks,
+      { constraint: "exact_track", requestedArtist: "SongA", exactCanonicalKey: "SongA", requestedMbid: "mbid-correct" },
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null, requestedMbid: null },
+    );
+    expect(status.startSatisfied).toBe(false);
+    expect(status.conflict).toBe(true);
+  });
+
+  test("exact_track with matching canonical key and matching MBID is satisfied", () => {
+    const tracks: StoredGradientTrack[] = [
+      { ...planned("SongA", 0), musicbrainz_id: "mbid-123" },
+      planned("SongB", 1),
+    ];
+    const status = assessGradientMergedEndpoints(
+      tracks,
+      { constraint: "exact_track", requestedArtist: "SongA", exactCanonicalKey: "SongA", requestedMbid: "mbid-123" },
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null, requestedMbid: null },
+    );
+    expect(status.startSatisfied).toBe(true);
+    expect(status.satisfied).toBe(true);
+  });
+
+  test("exact_track with known MBID rejects track missing MBID entirely", () => {
+    const tracks: StoredGradientTrack[] = [
+      { ...planned("SongA", 0), musicbrainz_id: null },
+      planned("SongB", 1),
+    ];
+    const status = assessGradientMergedEndpoints(
+      tracks,
+      { constraint: "exact_track", requestedArtist: "SongA", exactCanonicalKey: "SongA", requestedMbid: "mbid-123" },
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null, requestedMbid: null },
+    );
+    expect(status.startSatisfied).toBe(false);
+    expect(status.conflict).toBe(true);
+  });
+
+  test("exact_track without requested MBID matches by canonical key alone", () => {
+    const tracks: StoredGradientTrack[] = [
+      { ...planned("SongA", 0), musicbrainz_id: null },
+      planned("SongB", 1),
+    ];
+    const status = assessGradientMergedEndpoints(
+      tracks,
+      { constraint: "exact_track", requestedArtist: "SongA", exactCanonicalKey: "SongA", requestedMbid: null },
+      { constraint: "region", requestedArtist: null, exactCanonicalKey: null, requestedMbid: null },
+    );
+    expect(status.startSatisfied).toBe(true);
   });
 });

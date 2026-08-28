@@ -30,11 +30,19 @@ function track(index: number, total = 10): GradientLivePresentedTrack {
   };
 }
 
-function generation(total = 10) {
+function generation(total = 10, routeComplete = true) {
   return {
     generator_version: "radio-v5-gradient-recording-geodesic",
     diagnostics: {
-      gradient_route: { model: "recording_path_v1", usable: true },
+      gradient_route: {
+        model: "recording_path_v1",
+        usable: true,
+        complete: routeComplete,
+        endpoint_status: {
+          start_satisfied: routeComplete,
+          end_satisfied: routeComplete,
+        },
+      },
       gradient_fallback_radio: false,
     },
     tracks: Array.from({ length: total }, (_, index) => track(index, total)),
@@ -79,6 +87,35 @@ describe("Gradient Live route state", () => {
     expect(final.state.next_index).toBe(6);
     expect(final.nextCursor).toBe(1);
     expect(final.state.previous_key).toBe("text:artist-5|track-5");
+  });
+
+  test("no reusable state is created for an incomplete route", () => {
+    const state = createGradientLiveRouteState("station", generation(4, false));
+    expect(state).toBeNull();
+  });
+
+  test("exhausted non-completed state is rejected by validation", () => {
+    const state = createGradientLiveRouteState("station", generation(4))!;
+    expect(state).not.toBeNull();
+    const result = consumeGradientLiveRouteState(state, 10, new Set());
+    expect(result.completed).toBe(true);
+    expect(result.state.next_index).toBe(4);
+    expect(isValidGradientLiveRouteState("station", result.state)).toBe(true);
+
+    const nonCompleteExhausted = { ...result.state, completed: false, route_complete: false };
+    expect(isValidGradientLiveRouteState("station", nonCompleteExhausted)).toBe(false);
+  });
+
+  test("final endpoint status overrides planner endpoint status", () => {
+    const gen = generation(6, true);
+    const diag = gen.diagnostics as Record<string, unknown>;
+    diag.gradient_final_endpoint_status = { start_satisfied: false, end_satisfied: true };
+    const state = createGradientLiveRouteState("station", gen);
+    expect(state).toBeNull();
+
+    diag.gradient_final_endpoint_status = { start_satisfied: true, end_satisfied: true };
+    const state2 = createGradientLiveRouteState("station", gen);
+    expect(state2).not.toBeNull();
   });
 
   test("only creates reusable state for a genuine non-fallback recording path", () => {

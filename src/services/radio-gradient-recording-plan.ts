@@ -2,15 +2,30 @@ import type { GradientAlgorithm, RadioSeedRow, RadioSettings } from "../db/repos
 import { normalizeForComparison } from "../domain/normalization";
 import * as lastfm from "./lastfm";
 import { densifyGradientRecordingPathWithSubpathFallback } from "./radio-gradient-densify-subpath";
+import { discoverValidatedCachedRecordingPath } from "./radio-gradient-cached-path";
 import {
-  discoverCachedRecordingPath,
+  compressGradientRecordingPath,
   discoverGradientRecordingPath,
   gradientRecording,
+  gradientRecordingEdgeCost,
+  refinePathNovelty,
+  searchGradientRecordingPath,
   type GradientDensificationOperation,
+  type GradientPathSearchOptions,
   type GradientRecording,
   type GradientRecordingNeighborProvider,
+  type GradientRecordingPath,
   type GradientRecordingPathEdge,
 } from "./radio-gradient-recording-path";
+import {
+  budgetRemaining,
+  budgetTotalUsed,
+  createRouteBudget,
+  isBudgetExhausted,
+  snapshotBudget,
+  type GradientRouteBudget,
+  type GradientRouteBudgetSnapshot,
+} from "./radio-gradient-budget";
 import { log } from "../middleware/logging";
 
 export type GradientSeedConstraint = "exact_track" | "artist" | "region";
@@ -48,6 +63,7 @@ export interface GradientRecordingRouteSegment {
   densificationOperations: GradientDensificationOperation[];
   densificationStoppedReason: string | null;
   fallbackReason: string | null;
+  compressionPartial: string | null;
 }
 
 export interface GradientRecordingRoutePlan {
@@ -79,6 +95,7 @@ export interface GradientRecordingRoutePlan {
     startConstraint: GradientSeedConstraint | null;
     endConstraint: GradientSeedConstraint | null;
   };
+  budget: GradientRouteBudgetSnapshot | null;
 }
 
 export interface GradientSeedRecordingSources {
@@ -256,7 +273,12 @@ function requiredWaypointRecording(region: GradientSeedRecordingRegion) {
 
 function satisfiesRegion(recording: GradientRecording | undefined, region: GradientSeedRecordingRegion) {
   if (!recording) return false;
-  if (region.constraint === "exact_track") return recording.key === region.recordings[0]?.key;
+  if (region.constraint === "exact_track") {
+    const expected = region.recordings[0];
+    if (!expected || recording.key !== expected.key) return false;
+    if (expected.mbid && expected.mbid !== recording.mbid) return false;
+    return true;
+  }
   if (region.constraint === "artist") return Boolean(region.requestedArtist)
     && normalizeForComparison(recording.artist) === normalizeForComparison(region.requestedArtist!);
   return true;
@@ -289,6 +311,7 @@ async function findArtistBridge(
   endArtist: string,
   maxDepth = 5,
   beamWidth = 6,
+  budget?: GradientRouteBudget,
 ): Promise<string[]> {
   const startNorm = normalizeForComparison(startArtist);
   const endNorm = normalizeForComparison(endArtist);
@@ -303,9 +326,15 @@ async function findArtistBridge(
   backwardVisited.set(endNorm, backwardQueue[0]!);
 
   for (let iteration = 0; iteration < maxDepth; iteration++) {
+    if (budget && isBudgetExhausted(budget)) break;
+
     const expandQueue = async (queue: Node[], visited: Map<string, Node>, other: Map<string, Node>) => {
       const batch = queue.splice(0, beamWidth);
       const results = await Promise.all(batch.map(async (node) => {
+        if (budget) {
+          if (isBudgetExhausted(budget)) return { node, similar: [] as Awaited<ReturnType<typeof lastfm.getSimilarArtists>> };
+          budget.artistBridgeCalls += 1;
+        }
         try {
           return { node, similar: await lastfm.getSimilarArtists(node.artist, 30) };
         } catch { return { node, similar: [] as Awaited<ReturnType<typeof lastfm.getSimilarArtists>> }; }
@@ -348,7 +377,6 @@ async function findArtistBridge(
         cursor = node.parent;
       }
       path.push(...fwdPath, ...bwdPath);
-      // Remove the endpoint artists themselves
       const filtered = path.filter((a) => {
         const n = normalizeForComparison(a);
         return n !== startNorm && n !== endNorm;
@@ -364,6 +392,53 @@ async function findArtistBridge(
   }
   log("info", "gradient_artist_bridge_not_found", { start: startArtist, end: endArtist, maxDepth });
   return [];
+}
+
+/**
+ * Chain recording-level hops through bridge regions. Each hop's start is
+ * constrained to the exact recording where the previous hop ended, preventing
+ * fabricated adjacencies from independent region-level solves.
+ */
+export async function chainRecordingHops(
+  chainRegions: GradientRecording[][],
+  provider: GradientRecordingNeighborProvider,
+  pathSearchOptions: GradientPathSearchOptions,
+  budget?: GradientRouteBudget,
+): Promise<GradientRecordingPath | null> {
+  if (chainRegions.length < 2) return null;
+  const chainRecordings: GradientRecording[] = [];
+  const chainEdges: GradientRecordingPathEdge[] = [];
+  let chainQueryCount = 0;
+  let hopStartCandidates = chainRegions[0]!;
+  for (let hop = 0; hop < chainRegions.length - 1; hop++) {
+    if (budget && isBudgetExhausted(budget)) break;
+    const hopMaxQueries = budget
+      ? Math.min(pathSearchOptions.maxQueries ?? 64, budgetRemaining(budget))
+      : pathSearchOptions.maxQueries;
+    const result = await searchGradientRecordingPath(
+      hopStartCandidates, chainRegions[hop + 1]!, provider,
+      { ...pathSearchOptions, maxQueries: hopMaxQueries },
+    );
+    if (budget) budget.chainedRecordingQueries += result.queryCount;
+    if (!result.path) return null;
+    chainQueryCount += result.queryCount;
+    const start = hop === 0 ? 0 : 1;
+    chainRecordings.push(...result.path.recordings.slice(start));
+    chainEdges.push(...result.path.edges.slice(start > 0 ? start - 1 : 0));
+    const lastRecording = result.path.recordings.at(-1);
+    hopStartCandidates = lastRecording ? [lastRecording] : chainRegions[hop + 1]!;
+  }
+  if (chainRecordings.length < 2) return null;
+  return {
+    recordings: chainRecordings,
+    edges: chainEdges,
+    cost: chainEdges.reduce((sum, e) => sum + gradientRecordingEdgeCost(e.similarity, e.confidence), 0),
+    queryCount: chainQueryCount,
+    nodesVisited: chainRecordings.length,
+    forwardFrontierSize: 0,
+    backwardFrontierSize: 0,
+    intersection: chainRecordings[Math.floor(chainRecordings.length / 2)]?.key ?? null,
+  };
 }
 
 /** Plan one coherent recording trajectory across all requested waypoints. */
@@ -392,6 +467,7 @@ export async function planGradientRecordingRoute(input: {
       bottleneck: null,
       middleNovelty: { count: 0, knownCount: 0, unknownCount: 0, meanFamiliarity: null },
       endpointStatus: { startSatisfied: false, endSatisfied: false, startConstraint: null, endConstraint: null },
+      budget: null,
     };
   }
 
@@ -406,6 +482,7 @@ export async function planGradientRecordingRoute(input: {
     ? [regions[0]!.requestedArtist!, regions.at(-1)!.requestedArtist!]
     : null;
   const scenic = algorithm === "scenic";
+  const budget = createRouteBudget(scenic ? 600 : 480, 45_000);
 
   for (let index = 0; index < regions.length - 1; index++) {
     const left = regions[index]!;
@@ -425,14 +502,25 @@ export async function planGradientRecordingRoute(input: {
       segments.push({
         ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
         frontierIntersection: null, pathSearchMs: 0, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
-        densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings",
+        densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings", compressionPartial: null,
       });
       previousWaypoint = null;
       continue;
     }
 
+    if (isBudgetExhausted(budget)) {
+      segments.push({
+        ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
+        frontierIntersection: null, pathSearchMs: 0, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
+        densificationStoppedReason: null, fallbackReason: "global_budget_exhausted", compressionPartial: null,
+      });
+      previousWaypoint = null;
+      continue;
+    }
+
+    const segmentSearchBudget = Math.min(scenic ? 160 : 128, budgetRemaining(budget));
     const pathSearchOptions = {
-      maxQueries: scenic ? 160 : 128,
+      maxQueries: segmentSearchBudget,
       maxNodes: scenic ? 6000 : 4000,
       beamPerSide: scenic ? 6 : 5,
       frontierCap: scenic ? 400 : 300,
@@ -440,15 +528,16 @@ export async function planGradientRecordingRoute(input: {
       refineQueries: scenic ? 18 : 12,
     };
     const pathStartedAt = performance.now();
-    let raw = await discoverGradientRecordingPath(fromCandidates, toCandidates, provider, pathSearchOptions);
+    const initialResult = await searchGradientRecordingPath(fromCandidates, toCandidates, provider, pathSearchOptions);
+    budget.initialRecordingQueries += initialResult.queryCount;
+    budget.recordingNeighborExpansions += initialResult.nodesVisited;
+    let raw = initialResult.path;
 
-    // When the online provider search fails, try an offline BFS over the
-    // entire cached recording similarity graph. This catches multi-hop
-    // paths that span more hops than the live search budget allows.
-    if (!raw) {
+    if (!raw && !isBudgetExhausted(budget)) {
       try {
-        const cachedPath = discoverCachedRecordingPath(fromCandidates, toCandidates);
+        const cachedPath = discoverValidatedCachedRecordingPath(fromCandidates, toCandidates);
         if (cachedPath) {
+          budget.cachedGraphNodesExpanded += cachedPath.nodesVisited;
           log("info", "gradient_cached_path_found", {
             from: left.label,
             to: right.label,
@@ -476,16 +565,14 @@ export async function planGradientRecordingRoute(input: {
       }
     }
 
-    // When both online and cached searches fail, discover artist-level
-    // bridge artists via Last.fm similarity and chain shorter recording-
-    // level hops through them.
-    if (!raw && left.requestedArtist && right.requestedArtist) {
-      const bridgeArtists = await findArtistBridge(left.requestedArtist, right.requestedArtist, 8, 12);
+    if (!raw && !isBudgetExhausted(budget) && left.requestedArtist && right.requestedArtist) {
+      const bridgeArtists = await findArtistBridge(left.requestedArtist, right.requestedArtist, 8, 12, budget);
       if (bridgeArtists.length) {
-        // Build a chain of recording-level hops: A → bridge1 → bridge2 → ... → B
         const chainRegions: GradientRecording[][] = [fromCandidates];
         for (const bridgeArtist of bridgeArtists) {
+          if (isBudgetExhausted(budget)) break;
           try {
+            budget.bridgeTrackLookups += 1;
             const tracks = await (input.sources ?? DEFAULT_SOURCES).artistTracks(bridgeArtist, 10);
             const recordings = dedupeRecordings(
               tracks.map((row) => ({ ...gradientRecording(bridgeArtist, row.title, row.mbid || null), weight: row.weight ?? 1 })), 10,
@@ -494,32 +581,7 @@ export async function planGradientRecordingRoute(input: {
           } catch { /* skip failed bridge lookup */ }
         }
         chainRegions.push(toCandidates);
-
-        // Try recording-level search between each adjacent pair in the chain
-        const chainRecordings: GradientRecording[] = [];
-        const chainEdges: GradientRecordingPathEdge[] = [];
-        let chainQueryCount = 0;
-        let chainConnected = true;
-        for (let hop = 0; hop < chainRegions.length - 1; hop++) {
-          const hopPath = await discoverGradientRecordingPath(chainRegions[hop]!, chainRegions[hop + 1]!, provider, pathSearchOptions);
-          if (!hopPath) { chainConnected = false; break; }
-          chainQueryCount += hopPath.queryCount;
-          const start = hop === 0 ? 0 : 1;
-          chainRecordings.push(...hopPath.recordings.slice(start));
-          chainEdges.push(...hopPath.edges.slice(start > 0 ? start - 1 : 0));
-        }
-        if (chainConnected && chainRecordings.length >= 2) {
-          raw = {
-            recordings: chainRecordings,
-            edges: chainEdges,
-            cost: chainEdges.reduce((sum, e) => sum + (e.similarity * e.confidence), 0),
-            queryCount: chainQueryCount,
-            nodesVisited: chainRecordings.length,
-            forwardFrontierSize: 0,
-            backwardFrontierSize: 0,
-            intersection: chainRecordings[Math.floor(chainRecordings.length / 2)]?.key ?? null,
-          };
-        }
+        raw = await chainRecordingHops(chainRegions, provider, pathSearchOptions, budget) ?? null;
       }
     }
 
@@ -528,7 +590,7 @@ export async function planGradientRecordingRoute(input: {
       segments.push({
         ...base, connected: false, queryCount: 0, nodesVisited: 0, forwardFrontierSize: 0, backwardFrontierSize: 0,
         frontierIntersection: null, pathSearchMs, densificationMs: 0, rawRecordings: [], recordings: [], edges: [], densificationOperations: [],
-        densificationStoppedReason: null, fallbackReason: "no_recording_path_found",
+        densificationStoppedReason: null, fallbackReason: isBudgetExhausted(budget) ? "global_budget_exhausted" : "no_recording_path_found", compressionPartial: null,
       });
       previousWaypoint = null;
       continue;
@@ -536,14 +598,44 @@ export async function planGradientRecordingRoute(input: {
     queryCount += raw.queryCount;
     const targetNodes = (allocation[index] ?? 1) + 1;
     const densificationStartedAt = performance.now();
-    const dense = await densifyGradientRecordingPathWithSubpathFallback(raw, Math.max(raw.recordings.length, targetNodes), provider, {
-      maxQueries: scenic ? 128 : 96,
+    let pathForDensification = raw;
+    let compressionPartial: string | null = null;
+    if (raw.recordings.length > targetNodes) {
+      const mandatoryKeys = new Set<string>();
+      if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
+      if (right.constraint !== "region") for (const r of right.recordings) mandatoryKeys.add(r.key);
+      const compressed = await compressGradientRecordingPath(raw, targetNodes, provider, mandatoryKeys, budget);
+      pathForDensification = compressed.path;
+      if (!compressed.compressed) compressionPartial = compressed.partialReason;
+    }
+
+    if (input.familiarity && pathForDensification.recordings.length >= 4 && !isBudgetExhausted(budget)) {
+      const noveltyBudget = Math.min(scenic ? 16 : 10, budgetRemaining(budget));
+      const mandatoryKeys = new Set<string>();
+      if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
+      if (right.constraint !== "region") for (const r of right.recordings) mandatoryKeys.add(r.key);
+      const refined = await refinePathNovelty(pathForDensification, provider, {
+        familiarity: input.familiarity,
+        maxQueries: noveltyBudget,
+        neighborLimit: scenic ? 48 : 36,
+        mandatoryKeys,
+        endpointArtists: overallEndpointArtists,
+        minTransitionSimilarity: scenic ? 0.09 : 0.12,
+      });
+      pathForDensification = refined.path;
+      budget.densificationQueries += refined.queryCount;
+    }
+
+    const densifyBudget = Math.min(scenic ? 128 : 96, budgetRemaining(budget));
+    const dense = await densifyGradientRecordingPathWithSubpathFallback(pathForDensification, targetNodes, provider, {
+      maxQueries: densifyBudget,
       neighborLimit: scenic ? 56 : 48,
       minBridgeSimilarity: scenic ? 0.09 : 0.12,
       endpointArtists: overallEndpointArtists,
       familiarity: input.familiarity,
       familiarityWeight: scenic ? 0.26 : 0.18,
     });
+    budget.densificationQueries += dense.queryCount;
     const densificationMs = elapsedMs(densificationStartedAt);
     queryCount += dense.queryCount;
     const scaled = dense.positioned.map((recording) => ({
@@ -566,6 +658,7 @@ export async function planGradientRecordingRoute(input: {
       densificationOperations: dense.operations,
       densificationStoppedReason: dense.stoppedReason,
       fallbackReason: dense.path.recordings.length < targetNodes ? "densification_exhausted_before_target_length" : null,
+      compressionPartial,
     });
 
     previousWaypoint = dense.path.recordings.at(-1) ?? null;
@@ -626,12 +719,14 @@ export async function planGradientRecordingRoute(input: {
   const lastRegion = regions.at(-1);
   const first = output[0];
   const last = output.at(-1);
-  const state: GradientRecordingRoutePlan["state"] = allConnected ? "complete" : connectedCount ? "partial" : "no_route";
+  const anyCompressionFailure = segments.some((s) => s.compressionPartial != null);
+  const routeComplete = allConnected && !anyCompressionFailure;
+  const state: GradientRecordingRoutePlan["state"] = routeComplete ? "complete" : connectedCount ? "partial" : "no_route";
   return {
     algorithm,
     state,
     usable: connectedCount > 0,
-    complete: allConnected,
+    complete: routeComplete,
     requestedLength,
     regions,
     segments,
@@ -645,6 +740,7 @@ export async function planGradientRecordingRoute(input: {
       startConstraint: firstRegion?.constraint ?? null,
       endConstraint: lastRegion?.constraint ?? null,
     },
+    budget: snapshotBudget(budget),
   };
 }
 
