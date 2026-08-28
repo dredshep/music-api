@@ -8,14 +8,14 @@ const trackParameters = [
   { name: "trackId", in: "path", required: true, schema: { type: "string" } },
 ] as const;
 
-const gradientSettingsDescription = "Gradient station settings support gradientAlgorithm=geodesic|scenic|blend, gradientRouteStrength, and gradientRouteWidth. Geodesic/scenic discover locally connected musical regions; blend is the legacy endpoint-interpolation baseline.";
+const gradientSettingsDescription = "Gradient station settings support gradientAlgorithm=geodesic|scenic|blend, gradientRouteStrength, and gradientRouteWidth. Geodesic/scenic discover bounded recording-level paths; blend is the legacy endpoint-interpolation baseline.";
 
 const managerRadioSpec = {
   openapi: "3.1.0",
   info: {
     title: "Music Manager Radio API",
-    version: "1.2.0",
-    description: `Internal workstation API for saved Radio generations, graph-routed Gradient Radio, cursor-aware bounded live continuation, playlist import/editing, and local audio analysis. ${gradientSettingsDescription} Not intended as the compact agent surface.`,
+    version: "1.3.0",
+    description: `Internal workstation API for saved Radio generations, recording-routed Gradient Radio, coherent live route continuation, playlist import/editing, and local audio analysis. ${gradientSettingsDescription} Not intended as the compact agent surface.`,
   },
   servers: [{ url: "https://music-api.besto.me" }],
   security: [{ bearerAuth: [] }],
@@ -36,13 +36,13 @@ const managerRadioSpec = {
       delete: { operationId: "deleteManagerRadioStation", summary: "Delete a Radio station", parameters: idParameter, responses: { "200": { description: "Station deleted" } } },
     },
     "/manager/v1/radio/stations/{id}/generate": {
-      post: { operationId: "generateManagerRadioVersion", summary: "Generate another finite saved version", description: "Gradient stations discover a route using their selected algorithm and persist route nodes/edges/confidence in generation diagnostics.", parameters: idParameter, responses: { "201": { description: "New generation" } } },
+      post: { operationId: "generateManagerRadioVersion", summary: "Generate another finite saved version", description: "Gradient stations discover a bounded recording-level path using their selected algorithm and persist route nodes/edges/confidence in generation diagnostics.", parameters: idParameter, responses: { "201": { description: "New generation" } } },
     },
     "/manager/v1/radio/stations/{id}/live-batch": {
       post: {
         operationId: "generateManagerLiveRadioBatch",
-        summary: "Generate an ephemeral bounded live continuation",
-        description: "Gradient live batches use the same graph-route algorithm as saved generations. Pass the previous response next_cursor as routeCursor so refills continue forward through the A→B musical route; reaching the end wraps to a new A→B cycle. No generation history is retained.",
+        summary: "Generate or continue an ephemeral bounded live route",
+        description: "For a successful recording-level Gradient route, the first batch plans farther ahead and returns route_state. Send that routeState back on later refills so every batch consumes the same finalized A→B recording path. routeCursor remains for legacy/partial/fallback windowing. A recording route ends at B with route_completed=true and does not silently wrap or restart at A.",
         parameters: idParameter,
         requestBody: { content: { "application/json": { schema: {
           type: "object",
@@ -50,20 +50,21 @@ const managerRadioSpec = {
             count: { type: "integer", minimum: 4, maximum: 30 },
             excludeKeys: { type: "array", maxItems: 5000, items: { type: "string" } },
             tasteProfile: { type: "array", maxItems: 5000, items: { type: "object", additionalProperties: true } },
-            routeCursor: { type: ["number", "null"], minimum: 0, maximum: 1, description: "Normalized musical-route coordinate returned as next_cursor by the prior Gradient live batch. Omit/null for non-Gradient or first batch." },
+            routeCursor: { type: ["number", "null"], minimum: 0, maximum: 1, description: "Legacy/partial Gradient cursor. Successful recording-path sessions should return the prior route_state instead." },
+            routeState: { type: ["object", "null"], additionalProperties: true, description: "Opaque bounded recording-route session state returned as route_state by the prior live batch. Return it unchanged on the next refill." },
           },
         } } } },
-        responses: { "200": { description: "Ephemeral continuation with route_cursor, next_cursor and route_wrapped for cursor-aware Gradient live playback" } },
+        responses: { "200": { description: "Ephemeral continuation with route_state, route_completed, route_cursor and next_cursor. Successful recording paths terminate at the destination." } },
       },
     },
     "/manager/v1/radio/generations/{id}": {
-      get: { operationId: "getManagerRadioGeneration", summary: "Get an exact saved Radio generation", description: "Graph-routed Gradient tracks expose true musical route coordinates plus per-generation route diagnostics; legacy blend does not claim musical coordinates.", parameters: idParameter, responses: { "200": { description: "Generation with exact track order" } } },
+      get: { operationId: "getManagerRadioGeneration", summary: "Get an exact saved Radio generation", description: "Recording-routed Gradient tracks expose authoritative musical-route coordinates plus per-generation graph/search diagnostics; legacy blend does not claim musical coordinates.", parameters: idParameter, responses: { "200": { description: "Generation with exact track order" } } },
     },
     "/manager/v1/radio/generations/{id}/clone": {
       post: { operationId: "cloneManagerRadioGeneration", summary: "Clone a generation as another saved version", parameters: idParameter, responses: { "201": { description: "Cloned generation" } } },
     },
     "/manager/v1/radio/generations/{id}/regenerate-tail": {
-      post: { operationId: "regenerateManagerRadioTail", summary: "Regenerate a generation tail while preserving its prefix and pins", description: "For Gradient generations the regenerated tail is re-fit to the discovered musical route while the retained prefix and pins stay fixed.", parameters: idParameter, responses: { "200": { description: "Updated generation" } } },
+      post: { operationId: "regenerateManagerRadioTail", summary: "Regenerate a generation tail while preserving its prefix and pins", description: "For Gradient generations the regenerated tail is re-fit to the discovered recording path. Preserved/pinned/manual tracks are reprojected only when they still belong to the new path; otherwise they remain locked and explicitly unpositioned.", parameters: idParameter, responses: { "200": { description: "Updated generation" } } },
     },
     "/manager/v1/radio/generations/{id}/resolve": {
       post: { operationId: "resolveManagerRadioTracks", summary: "Attach external playback identifiers to generation tracks", parameters: idParameter, responses: { "200": { description: "Resolved generation" } } },
