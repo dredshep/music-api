@@ -149,7 +149,7 @@ const spec = {
       post: {
         operationId: "continueLiveRadio",
         summary: "Generate or continue a bounded live route",
-        description: "A successful recording-level Gradient first batch returns route_state containing the bounded finalized route. Return that state unchanged as routeState on later refills so every batch consumes the same A→B path. The route terminates at B with route_completed=true; it does not silently wrap to A. routeCursor remains for legacy/partial/fallback continuation.",
+        description: "Successful recording Gradient batches return route_state. Send it back as routeState so refills consume the same A→B path. route_completed=true at B; no wrap. routeCursor remains for legacy, partial, or fallback continuation.",
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         requestBody: { content: { "application/json": { schema: {
           type: "object",
