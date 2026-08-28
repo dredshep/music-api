@@ -7,6 +7,7 @@ import {
   type RadioTrackRow,
 } from "../db/repositories/radio";
 import { normalizeForComparison } from "../domain/normalization";
+import { assessAcousticTransition } from "./radio-transition-quality";
 
 interface AnalysisRow {
   bpm: number | null;
@@ -141,13 +142,15 @@ export function introOutroCompatibility(outro?: Record<string, number>, intro?: 
   return null;
 }
 
+/**
+ * Semantic evidence is independent of Gradient route placement. A planner
+ * coordinate is a constraint/result, not evidence that two recordings sound or
+ * mean similar things; counting it here would be circular.
+ */
 function semanticCompatibility(a: RadioTrackRow, b: RadioTrackRow, af: TrackFeatures, bf: TrackFeatures): number | null {
   if (a.album && b.album && normalizeForComparison(a.album) === normalizeForComparison(b.album)) return 1;
   if (af.genreSeed && bf.genreSeed && normalizeForComparison(af.genreSeed) === normalizeForComparison(bf.genreSeed)) return 0.95;
   if (normalizeForComparison(a.artist) === normalizeForComparison(b.artist)) return 0.82;
-  if (a.trajectory_position != null && b.trajectory_position != null) {
-    return Math.max(0, 1 - Math.abs(a.trajectory_position - b.trajectory_position) * 3);
-  }
   return null;
 }
 
@@ -181,6 +184,9 @@ export function radioTransitionScore(
   if (normalizeForComparison(a.artist) === normalizeForComparison(b.artist)) {
     result -= (settings.djWeights.artistSpacing ?? 0) * settings.repeatStrength;
   }
+
+  const acoustic = assessAcousticTransition(af, bf);
+  if (acoustic.catastrophic) result -= 4;
   return result * settings.djFlow;
 }
 
