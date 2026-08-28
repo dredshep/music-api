@@ -127,4 +127,63 @@ export const RADIO_MIGRATIONS = [
       );
     `,
   },
+  {
+    version: 11,
+    sql: `
+      CREATE TABLE IF NOT EXISTS recording_similarity_nodes (
+        canonical_key TEXT PRIMARY KEY,
+        artist TEXT NOT NULL,
+        title TEXT NOT NULL,
+        recording_mbid TEXT,
+        updated_at DATETIME NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_recording_similarity_nodes_mbid
+        ON recording_similarity_nodes(recording_mbid);
+
+      CREATE TABLE IF NOT EXISTS recording_similarity_edges (
+        source_key TEXT NOT NULL,
+        target_key TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        similarity REAL NOT NULL,
+        confidence REAL NOT NULL DEFAULT 1,
+        directionality TEXT NOT NULL DEFAULT 'observed',
+        metadata_json TEXT,
+        retrieved_at DATETIME NOT NULL,
+        PRIMARY KEY (source_key, target_key, provider),
+        FOREIGN KEY (source_key) REFERENCES recording_similarity_nodes(canonical_key) ON DELETE CASCADE,
+        FOREIGN KEY (target_key) REFERENCES recording_similarity_nodes(canonical_key) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_recording_similarity_edges_source
+        ON recording_similarity_edges(source_key, provider, similarity DESC);
+      CREATE INDEX IF NOT EXISTS idx_recording_similarity_edges_target
+        ON recording_similarity_edges(target_key, provider);
+
+      CREATE TABLE IF NOT EXISTS recording_similarity_fetches (
+        source_key TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        status TEXT NOT NULL,
+        result_count INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        retrieved_at DATETIME NOT NULL,
+        PRIMARY KEY (source_key, provider),
+        FOREIGN KEY (source_key) REFERENCES recording_similarity_nodes(canonical_key) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS track_audio_embeddings (
+        canonical_key TEXT NOT NULL,
+        model TEXT NOT NULL,
+        model_version TEXT NOT NULL,
+        dimensions INTEGER NOT NULL,
+        source_fingerprint TEXT,
+        vector BLOB,
+        status TEXT NOT NULL DEFAULT 'pending',
+        error TEXT,
+        created_at DATETIME NOT NULL,
+        updated_at DATETIME NOT NULL,
+        PRIMARY KEY (canonical_key, model, model_version)
+      );
+    `,
+  },
 ];
