@@ -1,0 +1,162 @@
+name: Apply Gradient spacing integration
+on:
+  push:
+    branches: [fix/gradient-route-spacing]
+    paths: [.github/workflows/apply-gradient-spacing-fix.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/gradient-route-spacing
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Patch planner and diagnostics
+        shell: python
+        run: |
+          from pathlib import Path
+
+          plan_path = Path('src/services/radio-gradient-recording-plan.ts')
+          text = plan_path.read_text()
+          text = text.replace(
+              'import { densifyGradientRecordingPathWithSubpathFallback } from "./radio-gradient-densify-subpath";\n',
+              'import { densifyGradientRecordingPathWithSubpathFallback } from "./radio-gradient-densify-subpath";\nimport {\n  repairGradientRecordingPathSpacing,\n  type GradientSpacingRepairOperation,\n} from "./radio-gradient-spacing-repair";\n',
+          )
+          text = text.replace(
+              '  fallbackReason: string | null;\n  compressionPartial: string | null;\n',
+              '  fallbackReason: string | null;\n  compressionPartial: string | null;\n  spacingRepairOperations: GradientSpacingRepairOperation[];\n  spacingRepairStoppedReason: string | null;\n  maxEdgeShareBefore: number | null;\n  maxEdgeShareAfter: number | null;\n',
+          )
+          text = text.replace(
+              '        densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings", compressionPartial: null,\n',
+              '        densificationStoppedReason: null, fallbackReason: !fromCandidates.length ? "from_seed_has_no_recordings" : "to_seed_has_no_recordings", compressionPartial: null,\n        spacingRepairOperations: [], spacingRepairStoppedReason: null, maxEdgeShareBefore: null, maxEdgeShareAfter: null,\n',
+          )
+          text = text.replace(
+              '        densificationStoppedReason: null, fallbackReason: "global_budget_exhausted", compressionPartial: null,\n',
+              '        densificationStoppedReason: null, fallbackReason: "global_budget_exhausted", compressionPartial: null,\n        spacingRepairOperations: [], spacingRepairStoppedReason: null, maxEdgeShareBefore: null, maxEdgeShareAfter: null,\n',
+          )
+          text = text.replace(
+              '        densificationStoppedReason: null, fallbackReason: isBudgetExhausted(budget) ? "global_budget_exhausted" : "no_recording_path_found", compressionPartial: null,\n',
+              '        densificationStoppedReason: null, fallbackReason: isBudgetExhausted(budget) ? "global_budget_exhausted" : "no_recording_path_found", compressionPartial: null,\n        spacingRepairOperations: [], spacingRepairStoppedReason: null, maxEdgeShareBefore: null, maxEdgeShareAfter: null,\n',
+          )
+          mandatory = '''      const mandatoryKeys = new Set<string>();
+      if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
+      if (right.constraint !== "region") for (const r of right.recordings) mandatoryKeys.add(r.key);'''
+          replacement = '''      // The segment's concrete first/last recordings are already protected by
+      // compression/refinement. Protecting every candidate from an artist seed
+      // makes all endpoint-artist tracks effectively mandatory and causes
+      // clusters such as three Poppy tracks to survive even when safely removable.
+      const mandatoryKeys = new Set<string>();'''
+          if text.count(mandatory) != 2:
+              raise SystemExit(f'expected two candidate-region mandatory blocks, got {text.count(mandatory)}')
+          text = text.replace(mandatory, replacement)
+
+          old = '''    budget.densificationQueries += dense.queryCount;
+    const densificationMs = elapsedMs(densificationStartedAt);
+    queryCount += dense.queryCount;
+    const scaled = dense.positioned.map((recording) => ({
+      ...recording,
+      routePosition: left.position + (right.position - left.position) * recording.routePosition,
+    }));
+    segments.push({
+      ...base,
+      connected: true,
+      queryCount: raw.queryCount + dense.queryCount,
+      nodesVisited: raw.nodesVisited,
+      forwardFrontierSize: raw.forwardFrontierSize,
+      backwardFrontierSize: raw.backwardFrontierSize,
+      frontierIntersection: raw.intersection,
+      pathSearchMs,
+      densificationMs,
+      rawRecordings: raw.recordings,
+      recordings: scaled,
+      edges: dense.path.edges,
+      densificationOperations: dense.operations,
+      densificationStoppedReason: dense.stoppedReason,
+      fallbackReason: dense.path.recordings.length < targetNodes ? "densification_exhausted_before_target_length" : null,
+      compressionPartial,
+    });
+
+    previousWaypoint = dense.path.recordings.at(-1) ?? null;'''
+          new = '''    budget.densificationQueries += dense.queryCount;
+    queryCount += dense.queryCount;
+
+    // Exact requested length is not enough: a route can spend several slots in
+    // the first few percent and then cross a third of its musical distance in a
+    // single transition. Repair that dominant gap by temporarily inserting a
+    // validated bridge and reclaiming the slot from safely skippable dense or
+    // repeated endpoint territory.
+    const spacing = await repairGradientRecordingPathSpacing(dense.path, targetNodes, provider, {
+      budget,
+      endpointArtists: overallEndpointArtists,
+      scenic,
+    });
+    queryCount += spacing.queryCount;
+    const densificationMs = elapsedMs(densificationStartedAt);
+    const scaled = spacing.positioned.map((recording) => ({
+      ...recording,
+      routePosition: left.position + (right.position - left.position) * recording.routePosition,
+    }));
+    segments.push({
+      ...base,
+      connected: true,
+      queryCount: raw.queryCount + dense.queryCount + spacing.queryCount,
+      nodesVisited: raw.nodesVisited,
+      forwardFrontierSize: raw.forwardFrontierSize,
+      backwardFrontierSize: raw.backwardFrontierSize,
+      frontierIntersection: raw.intersection,
+      pathSearchMs,
+      densificationMs,
+      rawRecordings: raw.recordings,
+      recordings: scaled,
+      edges: spacing.path.edges,
+      densificationOperations: dense.operations,
+      densificationStoppedReason: dense.stoppedReason,
+      fallbackReason: spacing.path.recordings.length < targetNodes ? "densification_exhausted_before_target_length" : null,
+      compressionPartial,
+      spacingRepairOperations: spacing.operations,
+      spacingRepairStoppedReason: spacing.stoppedReason,
+      maxEdgeShareBefore: spacing.maxEdgeShareBefore,
+      maxEdgeShareAfter: spacing.maxEdgeShareAfter,
+    });
+
+    previousWaypoint = spacing.path.recordings.at(-1) ?? null;'''
+          if old not in text:
+              raise SystemExit('planner densification block not found')
+          text = text.replace(old, new)
+          plan_path.write_text(text)
+
+          generation_path = Path('src/services/radio-gradient-recording-generation.ts')
+          text = generation_path.read_text()
+          old = '''      densification_stopped_reason: segment.densificationStoppedReason,
+      densification_operations: segment.densificationOperations,
+      edges: segment.edges.map((edge) => ({'''
+          new = '''      densification_stopped_reason: segment.densificationStoppedReason,
+      densification_operations: segment.densificationOperations,
+      spacing_repair_stopped_reason: segment.spacingRepairStoppedReason,
+      spacing_repair_operations: segment.spacingRepairOperations,
+      max_edge_share_before: segment.maxEdgeShareBefore,
+      max_edge_share_after: segment.maxEdgeShareAfter,
+      edges: segment.edges.map((edge) => ({'''
+          if old not in text:
+              raise SystemExit('generation diagnostics block not found')
+          generation_path.write_text(text.replace(old, new))
+
+          spacing_path = Path('src/services/radio-gradient-spacing-repair.ts')
+          text = spacing_path.read_text()
+          old = '  const threshold = options.maxEdgeShare ?? Math.max(0.24, 2.4 / Math.max(4, requestedLength - 1));'
+          new = '  const threshold = options.maxEdgeShare ?? Math.max(0.24, Math.min(0.34, 2.4 / Math.max(4, requestedLength - 1)));'
+          if old not in text:
+              raise SystemExit('spacing threshold line not found')
+          spacing_path.write_text(text.replace(old, new))
+      - name: Commit patch and remove temporary workflow
+        run: |
+          rm .github/workflows/apply-gradient-spacing-fix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/services/radio-gradient-recording-plan.ts src/services/radio-gradient-recording-generation.ts src/services/radio-gradient-spacing-repair.ts .github/workflows/apply-gradient-spacing-fix.yml
+          git commit -m "Integrate fixed-length Gradient spacing repair"
+          git push origin HEAD:fix/gradient-route-spacing
