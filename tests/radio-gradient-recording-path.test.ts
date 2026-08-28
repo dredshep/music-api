@@ -1,11 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
+  compressGradientRecordingPath,
   densifyGradientRecordingPath,
   discoverGradientRecordingPath,
   gradientFamiliarityTarget,
   gradientRecording,
+  gradientRecordingEdgeCost,
+  refinePathNovelty,
   type GradientRecording,
   type GradientRecordingNeighborProvider,
+  type GradientRecordingPath,
+  type GradientRecordingPathEdge,
 } from "../src/services/radio-gradient-recording-path";
 
 function provider(graph: Record<string, Array<[string, string, number]>>): GradientRecordingNeighborProvider {
@@ -153,5 +158,170 @@ describe("recording-level Gradient densification", () => {
     expect(gradientFamiliarityTarget(0.5)).toBeCloseTo(0, 8);
     expect(gradientFamiliarityTarget(0.25)).toBeGreaterThan(gradientFamiliarityTarget(0.5));
     expect(gradientFamiliarityTarget(0.75)).toBeGreaterThan(gradientFamiliarityTarget(0.5));
+  });
+});
+
+function makePath(artists: string[]): GradientRecordingPath {
+  const recordings = artists.map((a) => gradientRecording(a, `${a}-song`));
+  const edges: GradientRecordingPathEdge[] = [];
+  for (let i = 1; i < recordings.length; i++) {
+    edges.push({
+      from: recordings[i - 1]!, to: recordings[i]!,
+      similarity: 0.7, confidence: 0.9, provider: "test",
+    });
+  }
+  return {
+    recordings, edges, cost: edges.reduce((s, e) => s + gradientRecordingEdgeCost(e.similarity, e.confidence), 0),
+    queryCount: 0, nodesVisited: recordings.length, forwardFrontierSize: 0, backwardFrontierSize: 0, intersection: null,
+  };
+}
+
+describe("path compression", () => {
+  test("overlong path compresses safely to exact requested length", () => {
+    const path = makePath(["A", "B", "C", "D", "E", "F", "G"]);
+    const p = provider({});
+    const result = compressGradientRecordingPath(path, 4, p);
+    expect(result.compressed).toBe(true);
+    expect(result.path.recordings).toHaveLength(4);
+    expect(result.removedCount).toBe(3);
+  });
+
+  test("exact endpoints survive compression", () => {
+    const path = makePath(["Start", "M1", "M2", "M3", "End"]);
+    const p = provider({});
+    const result = compressGradientRecordingPath(path, 2, p);
+    expect(result.path.recordings[0]!.artist).toBe("Start");
+    expect(result.path.recordings.at(-1)!.artist).toBe("End");
+  });
+
+  test("mandatory waypoints survive compression", () => {
+    const path = makePath(["A", "B", "C", "D", "E"]);
+    const p = provider({});
+    const mandatory = new Set([gradientRecording("C", "C-song").key]);
+    const result = compressGradientRecordingPath(path, 3, p, mandatory);
+    expect(result.path.recordings).toHaveLength(3);
+    expect(result.path.recordings.some((r) => r.artist === "C")).toBe(true);
+    expect(result.path.recordings[0]!.artist).toBe("A");
+    expect(result.path.recordings.at(-1)!.artist).toBe("E");
+  });
+
+  test("no resulting adjacency lacks validated evidence", () => {
+    const path = makePath(["A", "B", "C", "D", "E"]);
+    const p = provider({});
+    const result = compressGradientRecordingPath(path, 3, p);
+    for (let i = 0; i < result.path.edges.length; i++) {
+      const edge = result.path.edges[i]!;
+      expect(edge.from.key).toBe(result.path.recordings[i]!.key);
+      expect(edge.to.key).toBe(result.path.recordings[i + 1]!.key);
+      expect(edge.similarity).toBeGreaterThan(0);
+      expect(edge.confidence).toBeGreaterThan(0);
+    }
+  });
+
+  test("impossible compression returns partial, not fake ready", () => {
+    const recordings = ["A", "B", "C", "D", "E"].map((a) => gradientRecording(a, `${a}-song`));
+    const edges: GradientRecordingPathEdge[] = [];
+    for (let i = 1; i < recordings.length; i++) {
+      edges.push({
+        from: recordings[i - 1]!, to: recordings[i]!,
+        similarity: 0.05, confidence: 0.9, provider: "test",
+      });
+    }
+    const path: GradientRecordingPath = {
+      recordings, edges, cost: 0, queryCount: 0, nodesVisited: 5,
+      forwardFrontierSize: 0, backwardFrontierSize: 0, intersection: null,
+    };
+    const p = provider({});
+    const result = compressGradientRecordingPath(path, 2, p);
+    expect(result.compressed).toBe(false);
+    expect(result.partialReason).toBe("no_safe_removable_node");
+    expect(result.path.recordings.length).toBeGreaterThan(2);
+  });
+
+  test("path already at requested length is unchanged", () => {
+    const path = makePath(["A", "B", "C"]);
+    const p = provider({});
+    const result = compressGradientRecordingPath(path, 3, p);
+    expect(result.compressed).toBe(true);
+    expect(result.removedCount).toBe(0);
+    expect(result.path.recordings).toHaveLength(3);
+  });
+});
+
+describe("novelty refinement", () => {
+  function familiarityMap(map: Record<string, number>): (r: GradientRecording) => number | null {
+    return (r) => map[r.key] ?? null;
+  }
+
+  test("replaces overfamiliar central recording when a novel bridge exists", async () => {
+    const path = makePath(["A", "B", "Familiar", "D", "E"]);
+    const novelKey = key("Novel", "Novel-song");
+    const familiarKey = key("Familiar", "Familiar-song");
+    const p = provider({
+      [key("B", "B-song")]: [["Novel", "Novel-song", 0.6]],
+      [key("D", "D-song")]: [["Novel", "Novel-song", 0.6]],
+    });
+    const fam = familiarityMap({ [familiarKey]: 0.95, [novelKey]: 0.1 });
+    const result = await refinePathNovelty(path, p, { familiarity: fam });
+    expect(result.replacements).toBe(1);
+    expect(result.path.recordings[2]!.artist).toBe("Novel");
+    expect(result.path.edges[1]!.to.key).toBe(novelKey);
+    expect(result.path.edges[2]!.from.key).toBe(novelKey);
+  });
+
+  test("does not replace endpoints or mandatory waypoints", async () => {
+    const path = makePath(["A", "B", "Waypoint", "D", "E"]);
+    const waypointKey = key("Waypoint", "Waypoint-song");
+    const p = provider({
+      [key("B", "B-song")]: [["Alt", "Alt-song", 0.8]],
+      [key("D", "D-song")]: [["Alt", "Alt-song", 0.8]],
+    });
+    const fam = familiarityMap({ [waypointKey]: 0.99 });
+    const mandatory = new Set([waypointKey]);
+    const result = await refinePathNovelty(path, p, { familiarity: fam, mandatoryKeys: mandatory });
+    expect(result.replacements).toBe(0);
+    expect(result.path.recordings[2]!.artist).toBe("Waypoint");
+  });
+
+  test("does not replace when no novel bridge maintains transition quality", async () => {
+    const path = makePath(["A", "B", "Familiar", "D", "E"]);
+    const familiarKey = key("Familiar", "Familiar-song");
+    const p = provider({
+      [key("B", "B-song")]: [["Bad", "Bad-song", 0.05]],
+      [key("D", "D-song")]: [["Bad", "Bad-song", 0.05]],
+    });
+    const fam = familiarityMap({ [familiarKey]: 0.95 });
+    const result = await refinePathNovelty(path, p, { familiarity: fam });
+    expect(result.replacements).toBe(0);
+    expect(result.path.recordings[2]!.artist).toBe("Familiar");
+  });
+
+  test("leaves recordings near endpoints untouched regardless of familiarity", async () => {
+    const names = ["A", "TooClose", "C", "D", "E", "F", "G", "H", "I", "J"];
+    const path = makePath(names);
+    const tooCloseKey = key("TooClose", "TooClose-song");
+    const p = provider({
+      [key("A", "A-song")]: [["Alt", "Alt-song", 0.9]],
+      [key("C", "C-song")]: [["Alt", "Alt-song", 0.9]],
+    });
+    const fam = familiarityMap({ [tooCloseKey]: 0.99 });
+    const result = await refinePathNovelty(path, p, { familiarity: fam });
+    expect(result.path.recordings[1]!.artist).toBe("TooClose");
+  });
+
+  test("preserves all edge invariants after replacement", async () => {
+    const path = makePath(["A", "B", "Old", "D", "E"]);
+    const p = provider({
+      [key("B", "B-song")]: [["New", "New-song", 0.7]],
+      [key("D", "D-song")]: [["New", "New-song", 0.65]],
+    });
+    const fam = familiarityMap({ [key("Old", "Old-song")]: 0.95, [key("New", "New-song")]: 0.1 });
+    const result = await refinePathNovelty(path, p, { familiarity: fam });
+    expect(result.replacements).toBe(1);
+    for (let i = 0; i < result.path.edges.length; i++) {
+      expect(result.path.edges[i]!.from.key).toBe(result.path.recordings[i]!.key);
+      expect(result.path.edges[i]!.to.key).toBe(result.path.recordings[i + 1]!.key);
+      expect(result.path.edges[i]!.similarity).toBeGreaterThan(0);
+    }
   });
 });

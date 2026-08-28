@@ -27,6 +27,7 @@ export type LiveGradientRouteState = {
   next_index: number;
   previous_key: string | null;
   completed: boolean;
+  route_complete: boolean;
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -64,7 +65,8 @@ export function consumeGradientLiveRouteState(
     tracks.push(track);
   }
   const previousKey = tracks.at(-1)?.canonical_key ?? state.previous_key;
-  const completed = cursor >= state.tracks.length;
+  const arrayExhausted = cursor >= state.tracks.length;
+  const completed = arrayExhausted && state.route_complete;
   const nextState: LiveGradientRouteState = {
     ...state,
     next_index: cursor,
@@ -95,6 +97,12 @@ export function createGradientLiveRouteState(stationId: string, generation: {
   const fallback = generation.diagnostics?.gradient_fallback_radio === true;
   const positioned = generation.tracks.filter((track) => authoritativeGradientLiveRoutePosition(track) != null);
   if (!isRecordingPath || fallback || positioned.length < 2) return null;
+
+  const endpointStatus = routeObject?.endpoint_status as Record<string, unknown> | null | undefined;
+  const routeComplete = routeObject?.complete === true
+    && endpointStatus?.start_satisfied === true
+    && endpointStatus?.end_satisfied === true;
+
   return {
     version: 1 as const,
     station_id: stationId,
@@ -103,5 +111,6 @@ export function createGradientLiveRouteState(stationId: string, generation: {
     next_index: 0,
     previous_key: null,
     completed: false,
+    route_complete: routeComplete,
   } satisfies LiveGradientRouteState;
 }

@@ -24,6 +24,7 @@ export type GradientHardEndpointExpectation = {
   constraint: "exact_track" | "artist" | "region";
   requestedArtist: string | null;
   exactCanonicalKey: string | null;
+  requestedMbid: string | null;
 };
 
 function parseObject(raw: string | null): Record<string, unknown> {
@@ -151,7 +152,9 @@ function endpointMatches(track: StoredGradientTrack | undefined, expectation: Gr
   if (expectation.constraint === "region") return true;
   if (!track) return false;
   if (expectation.constraint === "exact_track") {
-    return Boolean(expectation.exactCanonicalKey && track.canonical_key === expectation.exactCanonicalKey);
+    if (!expectation.exactCanonicalKey || track.canonical_key !== expectation.exactCanonicalKey) return false;
+    if (expectation.requestedMbid && track.musicbrainz_id && expectation.requestedMbid !== track.musicbrainz_id) return false;
+    return true;
   }
   return Boolean(
     expectation.requestedArtist

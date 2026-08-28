@@ -1,4 +1,3 @@
-import { getDb } from "../db/database";
 import { normalizeForComparison } from "../domain/normalization";
 
 export interface GradientRecording {
@@ -60,6 +59,12 @@ export interface GradientDensificationResult {
   operations: GradientDensificationOperation[];
   queryCount: number;
   stoppedReason: "requested_length" | "no_bridge" | "query_budget";
+}
+
+export interface GradientRecordingSearchResult {
+  path: GradientRecordingPath | null;
+  queryCount: number;
+  nodesVisited: number;
 }
 
 export interface GradientPathSearchOptions {
@@ -324,103 +329,6 @@ async function expandSide(input: {
 }
 
 /**
- * When the online provider-driven search fails, fall back to a pure offline
- * search over ALL edges already cached in the database. This traverses the
- * entire accumulated recording similarity graph without any provider calls,
- * catching paths that span more hops than the live search budget allows.
- */
-export function discoverCachedRecordingPath(
-  starts: GradientRecording[],
-  ends: GradientRecording[],
-): GradientRecordingPath | null {
-  const db = getDb();
-  const endKeys = new Set(ends.map((r) => r.key));
-  if (starts.some((r) => endKeys.has(r.key))) {
-    const overlap = starts.find((r) => endKeys.has(r.key))!;
-    return { recordings: [overlap], edges: [], cost: 0, queryCount: 0, nodesVisited: 1, forwardFrontierSize: 0, backwardFrontierSize: 0, intersection: overlap.key };
-  }
-
-  interface NodeInfo { artist: string; title: string; mbid: string | null }
-  const nodeCache = new Map<string, NodeInfo>();
-  const loadNode = (key: string): NodeInfo | null => {
-    const cached = nodeCache.get(key);
-    if (cached) return cached;
-    const row = db.prepare("SELECT artist, title, recording_mbid FROM recording_similarity_nodes WHERE canonical_key = ?").get(key) as { artist: string; title: string; recording_mbid: string | null } | undefined;
-    if (!row) return null;
-    const info = { artist: row.artist, title: row.title, mbid: row.recording_mbid };
-    nodeCache.set(key, info);
-    return info;
-  };
-
-  for (const r of [...starts, ...ends]) nodeCache.set(r.key, { artist: r.artist, title: r.title, mbid: r.mbid });
-
-  const forwardDist = new Map<string, number>(starts.map((r) => [r.key, 0]));
-  const backwardDist = new Map<string, number>(ends.map((r) => [r.key, 0]));
-  const forwardParent = new Map<string, string>();
-  const backwardParent = new Map<string, string>();
-  let forwardQueue = starts.map((r) => r.key);
-  let backwardQueue = ends.map((r) => r.key);
-  const forwardExpanded = new Set<string>();
-  const backwardExpanded = new Set<string>();
-  let best: { key: string; cost: number } | null = null;
-  const maxExpanded = 12000;
-
-  const getEdges = db.prepare("SELECT target_key, MAX(similarity) as similarity, MAX(confidence) as confidence FROM recording_similarity_edges WHERE source_key = ? GROUP BY target_key ORDER BY similarity DESC LIMIT 40");
-
-  while ((forwardQueue.length || backwardQueue.length) && forwardExpanded.size + backwardExpanded.size < maxExpanded) {
-    const expandQueue = (queue: string[], dist: Map<string, number>, parent: Map<string, string>, expanded: Set<string>, otherDist: Map<string, number>) => {
-      const batchSize = Math.min(256, queue.length);
-      const batch = queue.splice(0, batchSize).filter((k) => !expanded.has(k));
-      for (const key of batch) {
-        expanded.add(key);
-        const cost = dist.get(key) ?? Infinity;
-        const rows = getEdges.all(key) as Array<{ target_key: string; similarity: number; confidence: number }>;
-        for (const row of rows) {
-          const edgeCost = gradientRecordingEdgeCost(row.similarity, row.confidence);
-          const newCost = cost + edgeCost;
-          if (newCost + 1e-9 < (dist.get(row.target_key) ?? Infinity)) {
-            dist.set(row.target_key, newCost);
-            parent.set(row.target_key, key);
-            if (!expanded.has(row.target_key)) queue.push(row.target_key);
-          }
-          const totalCost = newCost + (otherDist.get(row.target_key) ?? Infinity);
-          if (otherDist.has(row.target_key) && (!best || totalCost < best.cost)) {
-            best = { key: row.target_key, cost: totalCost };
-          }
-        }
-      }
-    };
-    expandQueue(forwardQueue, forwardDist, forwardParent, forwardExpanded, backwardDist);
-    expandQueue(backwardQueue, backwardDist, backwardParent, backwardExpanded, forwardDist);
-    if (best) break;
-  }
-
-  if (!best) return null;
-
-  const keys = reconstructKeys(best.key, forwardParent, backwardParent);
-  const graph = newGraph();
-  const recordings: GradientRecording[] = [];
-  for (const key of keys) {
-    const info = loadNode(key);
-    if (!info) return null;
-    const rec = gradientRecording(info.artist, info.title, info.mbid);
-    recordings.push(rec);
-    remember(graph, rec);
-  }
-  const edgeQuery = db.prepare("SELECT similarity, confidence, provider FROM recording_similarity_edges WHERE source_key = ? AND target_key = ? ORDER BY similarity DESC LIMIT 1");
-  for (let i = 1; i < keys.length; i++) {
-    const edge = (edgeQuery.get(keys[i - 1]!, keys[i]!) ?? edgeQuery.get(keys[i]!, keys[i - 1]!)) as { similarity: number; confidence: number; provider: string } | undefined;
-    if (edge) addEdge(graph, recordings[i - 1]!, recordings[i]!, edge.similarity, edge.confidence, edge.provider);
-  }
-  return graphPath(graph, keys, 0, {
-    nodesVisited: forwardExpanded.size + backwardExpanded.size,
-    forwardFrontierSize: forwardQueue.length,
-    backwardFrontierSize: backwardQueue.length,
-    intersection: best.key,
-  });
-}
-
-/**
  * Bounded multi-source bidirectional search over playable recordings. This is
  * deliberately not greedy: both endpoint regions expand until their discovered
  * graphs intersect, then search refines briefly for a lower-bottleneck path.
@@ -512,6 +420,92 @@ export async function discoverGradientRecordingPath(
   });
 }
 
+/**
+ * Same as discoverGradientRecordingPath but always returns a structured result
+ * with the consumed budget, even when no path is found.
+ */
+export async function searchGradientRecordingPath(
+  startCandidates: GradientRecording[],
+  endCandidates: GradientRecording[],
+  provider: GradientRecordingNeighborProvider,
+  options: GradientPathSearchOptions = {},
+): Promise<GradientRecordingSearchResult> {
+  const maxQueries = Math.max(1, options.maxQueries ?? 64);
+  const maxNodes = Math.max(16, options.maxNodes ?? 1200);
+  const beam = Math.max(1, options.beamPerSide ?? 4);
+  const frontierCap = Math.max(beam * 2, options.frontierCap ?? 120);
+  const neighborLimit = Math.max(4, options.neighborLimit ?? 36);
+  const refineQueries = Math.max(0, options.refineQueries ?? 10);
+  const graph = newGraph();
+  const starts = startCandidates.map(normalizeRecording).filter((row): row is GradientRecording => Boolean(row));
+  const ends = endCandidates.map(normalizeRecording).filter((row): row is GradientRecording => Boolean(row));
+  for (const row of [...starts, ...ends]) remember(graph, row);
+  if (!starts.length || !ends.length) return { path: null, queryCount: 0, nodesVisited: graph.nodes.size };
+
+  const endKeys = new Set(ends.map((row) => row.key));
+  const overlap = starts.find((row) => endKeys.has(row.key));
+  if (overlap) {
+    const path: GradientRecordingPath = {
+      recordings: [overlap], edges: [], cost: 0, queryCount: 0, nodesVisited: graph.nodes.size,
+      forwardFrontierSize: starts.length, backwardFrontierSize: ends.length, intersection: overlap.key,
+    };
+    return { path, queryCount: 0, nodesVisited: graph.nodes.size };
+  }
+
+  const forwardSeedArtists = new Set(starts.map((row) => keyArtist(row.key)));
+  const backwardSeedArtists = new Set(ends.map((row) => keyArtist(row.key)));
+  const forwardDistances = new Map(starts.map((row) => [row.key, 0]));
+  const backwardDistances = new Map(ends.map((row) => [row.key, 0]));
+  const forwardParent = new Map<string, string>();
+  const backwardParent = new Map<string, string>();
+  const forwardExpanded = new Set<string>();
+  const backwardExpanded = new Set<string>();
+  let forwardFrontier = starts.map((row) => ({ key: row.key, cost: 0, depth: 0 }));
+  let backwardFrontier = ends.map((row) => ({ key: row.key, cost: 0, depth: 0 }));
+  let queryCount = 0;
+  let foundAt: number | null = null;
+  let best: { key: string; cost: number } | null = null;
+  const initialBudget = Math.ceil(maxQueries * 0.45);
+
+  while (queryCount < maxQueries && (forwardFrontier.length || backwardFrontier.length)) {
+    const remaining = maxQueries - queryCount;
+    const leftBudget = Math.min(beam, Math.max(0, Math.ceil(remaining / 2)));
+    const rightBudget = Math.min(beam, Math.max(0, remaining - leftBudget));
+    const useDepthFirst = !best && queryCount >= initialBudget;
+    const [left, right] = await Promise.all([
+      expandSide({
+        graph, frontier: forwardFrontier, distances: forwardDistances, parents: forwardParent,
+        expanded: forwardExpanded, provider, beam: leftBudget, frontierCap, neighborLimit, maxNodes,
+        remainingQueries: leftBudget, seedArtists: forwardSeedArtists, depthFirst: useDepthFirst,
+      }),
+      expandSide({
+        graph, frontier: backwardFrontier, distances: backwardDistances, parents: backwardParent,
+        expanded: backwardExpanded, provider, beam: rightBudget, frontierCap, neighborLimit, maxNodes,
+        remainingQueries: rightBudget, seedArtists: backwardSeedArtists, depthFirst: useDepthFirst,
+      }),
+    ]);
+    forwardFrontier = left.frontier;
+    backwardFrontier = right.frontier;
+    queryCount += left.queries + right.queries;
+
+    const intersection = bestIntersection(forwardDistances, backwardDistances);
+    if (intersection && (!best || intersection.cost < best.cost)) best = intersection;
+    if (intersection && foundAt == null) foundAt = queryCount;
+    if (foundAt != null && queryCount >= foundAt + refineQueries) break;
+    if (!left.queries && !right.queries) break;
+  }
+
+  if (!best) return { path: null, queryCount, nodesVisited: graph.nodes.size };
+  const keys = reconstructKeys(best.key, forwardParent, backwardParent);
+  const path = graphPath(graph, keys, queryCount, {
+    nodesVisited: graph.nodes.size,
+    forwardFrontierSize: forwardFrontier.length,
+    backwardFrontierSize: backwardFrontier.length,
+    intersection: best.key,
+  });
+  return { path, queryCount, nodesVisited: graph.nodes.size };
+}
+
 function harmonicMean(a: number, b: number) {
   return (2 * a * b) / Math.max(0.000001, a + b);
 }
@@ -541,6 +535,236 @@ export function positionGradientRecordingPath(path: GradientRecordingPath): Posi
       routeConfidence: clamp(routeConfidence, 0.05, 1),
     };
   });
+}
+
+export interface GradientNoveltyRefinementResult {
+  path: GradientRecordingPath;
+  replacements: number;
+  queryCount: number;
+}
+
+/**
+ * Post-path novelty refinement: replaces overfamiliar interior recordings in
+ * the central portion of the path when both neighboring transitions remain
+ * valid. Never touches endpoints or mandatory waypoints.
+ */
+export async function refinePathNovelty(
+  original: GradientRecordingPath,
+  provider: GradientRecordingNeighborProvider,
+  options: {
+    familiarity: (recording: GradientRecording) => number | null;
+    maxQueries?: number;
+    neighborLimit?: number;
+    mandatoryKeys?: Set<string>;
+    endpointArtists?: [string, string] | null;
+    minTransitionSimilarity?: number;
+  },
+): Promise<GradientNoveltyRefinementResult> {
+  const maxQueries = Math.max(0, options.maxQueries ?? 24);
+  const neighborLimit = Math.max(4, options.neighborLimit ?? 36);
+  const minSim = clamp(options.minTransitionSimilarity ?? 0.12, 0.01, 0.95);
+  const mandatory = options.mandatoryKeys ?? new Set<string>();
+  const endpointArtists = new Set(
+    (options.endpointArtists ?? []).filter(Boolean).map((a) => normalizeForComparison(a)),
+  );
+
+  if (original.recordings.length < 4) return { path: original, replacements: 0, queryCount: 0 };
+
+  const recordings = [...original.recordings];
+  const edges = [...original.edges];
+  mandatory.add(recordings[0]!.key);
+  mandatory.add(recordings.at(-1)!.key);
+
+  const usedKeys = new Set(recordings.map((r) => r.key));
+  const neighborCache = new Map<string, Promise<GradientRecordingNeighbor[]>>();
+  let queryCount = 0;
+
+  const fetchNeighbors = async (recording: GradientRecording) => {
+    const existing = neighborCache.get(recording.key);
+    if (existing) return existing;
+    if (queryCount >= maxQueries) return [];
+    queryCount++;
+    const promise = provider.neighbors(recording, neighborLimit).catch(() => [] as GradientRecordingNeighbor[]);
+    neighborCache.set(recording.key, promise);
+    return promise;
+  };
+
+  let replacements = 0;
+  const len = recordings.length;
+
+  for (let i = 1; i < len - 1; i++) {
+    if (queryCount >= maxQueries) break;
+    const position = i / (len - 1);
+    if (position < 0.2 || position > 0.8) continue;
+    const rec = recordings[i]!;
+    if (mandatory.has(rec.key)) continue;
+
+    const currentFamiliarity = options.familiarity(rec);
+    if (currentFamiliarity == null) continue;
+    const target = gradientFamiliarityTarget(position);
+    if (currentFamiliarity <= target + 0.15) continue;
+
+    const prev = recordings[i - 1]!;
+    const next = recordings[i + 1]!;
+    const [leftNeighbors, rightNeighbors] = await Promise.all([
+      fetchNeighbors(prev),
+      fetchNeighbors(next),
+    ]);
+
+    const rightMap = new Map(rightNeighbors.map((n) => [gradientRecordingKey(n.artist, n.title), n]));
+
+    let best: {
+      recording: GradientRecording;
+      leftEdge: GradientRecordingNeighbor;
+      rightEdge: GradientRecordingNeighbor;
+      score: number;
+    } | null = null;
+
+    for (const leftCandidate of leftNeighbors) {
+      const key = gradientRecordingKey(leftCandidate.artist, leftCandidate.title);
+      if (key === rec.key || key === prev.key || key === next.key) continue;
+      if (usedKeys.has(key)) continue;
+      const rightCandidate = rightMap.get(key);
+      if (!rightCandidate) continue;
+      if (leftCandidate.similarity < minSim || rightCandidate.similarity < minSim) continue;
+
+      const candidateRec = gradientRecording(leftCandidate.artist, leftCandidate.title, leftCandidate.mbid);
+      const candidateFamiliarity = options.familiarity(candidateRec);
+      const familiarityImprovement = candidateFamiliarity != null
+        ? (currentFamiliarity - target) - Math.max(0, candidateFamiliarity - target)
+        : (currentFamiliarity - target) * 0.5;
+      if (familiarityImprovement <= 0.05) continue;
+
+      const bridge = harmonicMean(
+        clamp(leftCandidate.similarity, 0, 1),
+        clamp(rightCandidate.similarity, 0, 1),
+      );
+      const currentBridge = harmonicMean(
+        clamp(edges[i - 1]!.similarity, 0, 1),
+        clamp(edges[i]!.similarity, 0, 1),
+      );
+      if (bridge < currentBridge * 0.65) continue;
+
+      const artistNorm = normalizeForComparison(leftCandidate.artist);
+      const endpointPenalty = endpointArtists.has(artistNorm) ? 0.15 : 0;
+      const score = familiarityImprovement * 0.55 + bridge * 0.35 - endpointPenalty;
+      if (!best || score > best.score) {
+        best = { recording: candidateRec, leftEdge: leftCandidate, rightEdge: rightCandidate, score };
+      }
+    }
+
+    if (best) {
+      usedKeys.delete(rec.key);
+      usedKeys.add(best.recording.key);
+      recordings[i] = best.recording;
+      edges[i - 1] = {
+        from: prev, to: best.recording,
+        similarity: best.leftEdge.similarity,
+        confidence: best.leftEdge.confidence ?? 0.8,
+        provider: best.leftEdge.provider ?? "recording_similarity",
+      };
+      edges[i] = {
+        from: best.recording, to: next,
+        similarity: best.rightEdge.similarity,
+        confidence: best.rightEdge.confidence ?? 0.8,
+        provider: best.rightEdge.provider ?? "recording_similarity",
+      };
+      replacements++;
+    }
+  }
+
+  const cost = edges.reduce((sum, e) => sum + gradientRecordingEdgeCost(e.similarity, e.confidence), 0);
+  return {
+    path: { ...original, recordings, edges, cost },
+    replacements,
+    queryCount,
+  };
+}
+
+export interface GradientPathCompressionResult {
+  path: GradientRecordingPath;
+  removedCount: number;
+  compressed: boolean;
+  partialReason: string | null;
+}
+
+/**
+ * Safely compress a path to the requested length by removing interior nodes
+ * only when the previous and next retained recordings have a validated edge
+ * in the existing edge set. Endpoints and waypoints are never removed.
+ */
+export function compressGradientRecordingPath(
+  original: GradientRecordingPath,
+  requestedLength: number,
+  provider: GradientRecordingNeighborProvider,
+  mandatoryKeys?: Set<string>,
+): GradientPathCompressionResult {
+  if (original.recordings.length <= requestedLength) {
+    return { path: original, removedCount: 0, compressed: true, partialReason: null };
+  }
+  const recordings = [...original.recordings];
+  const edges = [...original.edges];
+  const mandatory = mandatoryKeys ?? new Set<string>();
+  mandatory.add(recordings[0]!.key);
+  mandatory.add(recordings.at(-1)!.key);
+  let removedCount = 0;
+
+  while (recordings.length > requestedLength) {
+    let bestIndex = -1;
+    let bestCostIncrease = Infinity;
+
+    for (let i = 1; i < recordings.length - 1; i++) {
+      if (mandatory.has(recordings[i]!.key)) continue;
+      const leftEdge = edges[i - 1];
+      const rightEdge = edges[i];
+      if (!leftEdge || !rightEdge) continue;
+      const skipSimilarity = Math.min(leftEdge.similarity, rightEdge.similarity);
+      const skipConfidence = Math.min(leftEdge.confidence, rightEdge.confidence);
+      if (skipSimilarity < 0.08) continue;
+      const currentCost = gradientRecordingEdgeCost(leftEdge.similarity, leftEdge.confidence)
+        + gradientRecordingEdgeCost(rightEdge.similarity, rightEdge.confidence);
+      const newCost = gradientRecordingEdgeCost(skipSimilarity, skipConfidence);
+      const costIncrease = newCost - currentCost;
+      if (costIncrease < bestCostIncrease) {
+        bestCostIncrease = costIncrease;
+        bestIndex = i;
+      }
+    }
+
+    if (bestIndex < 0) {
+      return {
+        path: { ...original, recordings, edges, cost: edges.reduce((sum, e) => sum + gradientRecordingEdgeCost(e.similarity, e.confidence), 0) },
+        removedCount,
+        compressed: false,
+        partialReason: "no_safe_removable_node",
+      };
+    }
+
+    const leftEdge = edges[bestIndex - 1]!;
+    const rightEdge = edges[bestIndex]!;
+    const bridgeEdge: GradientRecordingPathEdge = {
+      from: recordings[bestIndex - 1]!,
+      to: recordings[bestIndex + 1]!,
+      similarity: Math.min(leftEdge.similarity, rightEdge.similarity),
+      confidence: Math.min(leftEdge.confidence, rightEdge.confidence),
+      provider: leftEdge.similarity <= rightEdge.similarity ? leftEdge.provider : rightEdge.provider,
+    };
+    recordings.splice(bestIndex, 1);
+    edges.splice(bestIndex - 1, 2, bridgeEdge);
+    removedCount++;
+  }
+
+  return {
+    path: {
+      ...original,
+      recordings,
+      edges,
+      cost: edges.reduce((sum, e) => sum + gradientRecordingEdgeCost(e.similarity, e.confidence), 0),
+    },
+    removedCount,
+    compressed: true,
+    partialReason: null,
+  };
 }
 
 /**

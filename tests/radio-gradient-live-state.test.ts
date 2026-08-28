@@ -30,11 +30,19 @@ function track(index: number, total = 10): GradientLivePresentedTrack {
   };
 }
 
-function generation(total = 10) {
+function generation(total = 10, routeComplete = true) {
   return {
     generator_version: "radio-v5-gradient-recording-geodesic",
     diagnostics: {
-      gradient_route: { model: "recording_path_v1", usable: true },
+      gradient_route: {
+        model: "recording_path_v1",
+        usable: true,
+        complete: routeComplete,
+        endpoint_status: {
+          start_satisfied: routeComplete,
+          end_satisfied: routeComplete,
+        },
+      },
       gradient_fallback_radio: false,
     },
     tracks: Array.from({ length: total }, (_, index) => track(index, total)),
@@ -79,6 +87,16 @@ describe("Gradient Live route state", () => {
     expect(final.state.next_index).toBe(6);
     expect(final.nextCursor).toBe(1);
     expect(final.state.previous_key).toBe("text:artist-5|track-5");
+  });
+
+  test("partial route does not falsely complete when array is exhausted", () => {
+    const initial = createGradientLiveRouteState("station", generation(4, false))!;
+    expect(initial).not.toBeNull();
+    expect(initial.route_complete).toBe(false);
+    const result = consumeGradientLiveRouteState(initial, 10, new Set());
+    expect(result.tracks).toHaveLength(4);
+    expect(result.completed).toBe(false);
+    expect(result.state.completed).toBe(false);
   });
 
   test("only creates reusable state for a genuine non-fallback recording path", () => {
