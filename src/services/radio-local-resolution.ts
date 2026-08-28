@@ -16,6 +16,16 @@ export function localRadioSearchQueries(artist: string, title: string) {
   ])];
 }
 
+export function localRadioCandidateMatches(
+  requestedArtist: string,
+  requestedTitle: string,
+  candidateArtist: string,
+  candidateTitle: string,
+) {
+  return radioArtistCreditMatches(requestedArtist, candidateArtist)
+    && titleMatch(requestedTitle, candidateTitle).match;
+}
+
 /**
  * Resolve the exact selected generation against Navidrome after ranking.
  * Candidate discovery intentionally limits some pre-selection availability work;
@@ -45,10 +55,12 @@ export async function resolveRadioGenerationLocally(
             albumCount: 0,
             songCount: 8,
           });
-          best = result.songs.find((song) =>
-            radioArtistCreditMatches(track.artist, song.artist) &&
-            titleMatch(track.title, song.title).match
-          );
+          best = result.songs.find((song) => localRadioCandidateMatches(
+            track.artist,
+            track.title,
+            song.artist,
+            song.title,
+          ));
           if (best) break;
         }
         if (!best) return;
