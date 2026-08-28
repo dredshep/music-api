@@ -1,7 +1,7 @@
 import { getConfig } from "../config";
 import { getDb } from "../db/database";
 import { getGenerationTracks } from "../db/repositories/radio";
-import { normalizeForComparison } from "../domain/normalization";
+import { titleMatch } from "../domain/normalization";
 import * as navidrome from "./navidrome";
 import { presentGeneration } from "./radio";
 import { primaryRadioArtistCredit, radioArtistCreditMatches } from "./radio-artist-credit";
@@ -47,7 +47,7 @@ export async function resolveRadioGenerationLocally(
           });
           best = result.songs.find((song) =>
             radioArtistCreditMatches(track.artist, song.artist) &&
-            normalizeForComparison(song.title) === normalizeForComparison(track.title)
+            titleMatch(track.title, song.title).match
           );
           if (best) break;
         }
