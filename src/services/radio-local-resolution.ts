@@ -4,8 +4,17 @@ import { getGenerationTracks } from "../db/repositories/radio";
 import { normalizeForComparison } from "../domain/normalization";
 import * as navidrome from "./navidrome";
 import { presentGeneration } from "./radio";
+import { primaryRadioArtistCredit, radioArtistCreditMatches } from "./radio-artist-credit";
 
 type LocalSearch = typeof navidrome.search3;
+
+export function localRadioSearchQueries(artist: string, title: string) {
+  const primary = primaryRadioArtistCredit(artist);
+  return [...new Set([
+    `${artist} ${title}`,
+    ...(primary && primary !== artist ? [`${primary} ${title}`] : []),
+  ])];
+}
 
 /**
  * Resolve the exact selected generation against Navidrome after ranking.
@@ -29,15 +38,19 @@ export async function resolveRadioGenerationLocally(
   for (let i = 0; i < tracks.length; i += batchSize) {
     await Promise.all(tracks.slice(i, i + batchSize).map(async (track) => {
       try {
-        const result = await searchLocal(`${track.artist} ${track.title}`, {
-          artistCount: 0,
-          albumCount: 0,
-          songCount: 8,
-        });
-        const best = result.songs.find((song) =>
-          normalizeForComparison(song.artist) === normalizeForComparison(track.artist) &&
-          normalizeForComparison(song.title) === normalizeForComparison(track.title)
-        );
+        let best: Awaited<ReturnType<LocalSearch>>["songs"][number] | undefined;
+        for (const query of localRadioSearchQueries(track.artist, track.title)) {
+          const result = await searchLocal(query, {
+            artistCount: 0,
+            albumCount: 0,
+            songCount: 8,
+          });
+          best = result.songs.find((song) =>
+            radioArtistCreditMatches(track.artist, song.artist) &&
+            normalizeForComparison(song.title) === normalizeForComparison(track.title)
+          );
+          if (best) break;
+        }
         if (!best) return;
         updates.push({
           trackId: track.id,
