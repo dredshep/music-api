@@ -1,10 +1,15 @@
 name: Apply Gradient spacing integration
+
 on:
   push:
-    branches: [fix/gradient-route-spacing]
-    paths: [.github/workflows/apply-gradient-spacing-fix.yml]
+    branches:
+      - "fix/gradient-route-spacing"
+    paths:
+      - ".github/workflows/apply-gradient-spacing-fix.yml"
+
 permissions:
   contents: write
+
 jobs:
   apply:
     runs-on: ubuntu-latest
@@ -12,12 +17,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: fix/gradient-route-spacing
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
       - name: Patch planner and diagnostics
-        shell: python
+        shell: bash
         run: |
+          python3 <<'PY'
           from pathlib import Path
 
           plan_path = Path('src/services/radio-gradient-recording-plan.ts')
@@ -45,10 +48,9 @@ jobs:
           mandatory = '''      const mandatoryKeys = new Set<string>();
       if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
       if (right.constraint !== "region") for (const r of right.recordings) mandatoryKeys.add(r.key);'''
-          replacement = '''      // The segment's concrete first/last recordings are already protected by
-      // compression/refinement. Protecting every candidate from an artist seed
-      // makes all endpoint-artist tracks effectively mandatory and causes
-      // clusters such as three Poppy tracks to survive even when safely removable.
+          replacement = '''      // Concrete segment endpoints are already protected by the path transforms.
+      // Protecting every candidate from an artist seed makes every endpoint-artist
+      // recording effectively mandatory and preserves redundant endpoint clusters.
       const mandatoryKeys = new Set<string>();'''
           if text.count(mandatory) != 2:
               raise SystemExit(f'expected two candidate-region mandatory blocks, got {text.count(mandatory)}')
@@ -84,11 +86,10 @@ jobs:
           new = '''    budget.densificationQueries += dense.queryCount;
     queryCount += dense.queryCount;
 
-    // Exact requested length is not enough: a route can spend several slots in
-    // the first few percent and then cross a third of its musical distance in a
-    // single transition. Repair that dominant gap by temporarily inserting a
-    // validated bridge and reclaiming the slot from safely skippable dense or
-    // repeated endpoint territory.
+    // Exact length alone can hide a badly allocated route: several slots may sit
+    // in the first few percent while one transition crosses a third of the
+    // musical distance. Repair a dominant gap by inserting a validated bridge,
+    // then reclaim the extra slot from safely skippable dense/repeated territory.
     const spacing = await repairGradientRecordingPathSpacing(dense.path, targetNodes, provider, {
       budget,
       endpointArtists: overallEndpointArtists,
@@ -152,7 +153,9 @@ jobs:
           if old not in text:
               raise SystemExit('spacing threshold line not found')
           spacing_path.write_text(text.replace(old, new))
+          PY
       - name: Commit patch and remove temporary workflow
+        shell: bash
         run: |
           rm .github/workflows/apply-gradient-spacing-fix.yml
           git config user.name "github-actions[bot]"
