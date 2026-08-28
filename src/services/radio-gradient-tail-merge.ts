@@ -1,4 +1,5 @@
 import type { RadioTrackRow } from "../db/repositories/radio";
+import { normalizeForComparison } from "../domain/normalization";
 
 export type StoredGradientTrack = {
   canonical_key: string;
@@ -17,6 +18,12 @@ export type StoredGradientTrack = {
   selection_score: number;
   trajectory_position: number | null;
   metadata_json: string | null;
+};
+
+export type GradientHardEndpointExpectation = {
+  constraint: "exact_track" | "artist" | "region";
+  requestedArtist: string | null;
+  exactCanonicalKey: string | null;
 };
 
 function parseObject(raw: string | null): Record<string, unknown> {
@@ -138,4 +145,34 @@ export function mergeGradientPlannedTail(
     used.add(candidate.canonical_key);
   }
   return output;
+}
+
+function endpointMatches(track: StoredGradientTrack | undefined, expectation: GradientHardEndpointExpectation) {
+  if (expectation.constraint === "region") return true;
+  if (!track) return false;
+  if (expectation.constraint === "exact_track") {
+    return Boolean(expectation.exactCanonicalKey && track.canonical_key === expectation.exactCanonicalKey);
+  }
+  return Boolean(
+    expectation.requestedArtist
+    && normalizeForComparison(track.artist) === normalizeForComparison(expectation.requestedArtist),
+  );
+}
+
+/** Check hard endpoint semantics against the actual merged playlist, not the abstract plan. */
+export function assessGradientMergedEndpoints(
+  tracks: StoredGradientTrack[],
+  start: GradientHardEndpointExpectation,
+  end: GradientHardEndpointExpectation,
+) {
+  const startSatisfied = endpointMatches(tracks[0], start);
+  const endSatisfied = endpointMatches(tracks.at(-1), end);
+  return {
+    startSatisfied,
+    endSatisfied,
+    satisfied: startSatisfied && endSatisfied,
+    conflict: !(startSatisfied && endSatisfied),
+    firstKey: tracks[0]?.canonical_key ?? null,
+    lastKey: tracks.at(-1)?.canonical_key ?? null,
+  };
 }
