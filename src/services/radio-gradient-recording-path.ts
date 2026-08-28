@@ -16,6 +16,8 @@ export interface GradientRecordingNeighbor extends GradientRecording {
 
 export interface GradientRecordingNeighborProvider {
   neighbors(recording: GradientRecording, limit: number): Promise<GradientRecordingNeighbor[]>;
+  bidirectionalNeighbors?(recording: GradientRecording, limit: number): Promise<GradientRecordingNeighbor[]>;
+  lookupEdge?(sourceKey: string, targetKey: string): GradientRecordingNeighbor | null;
 }
 
 export interface GradientRecordingPathEdge {
@@ -713,6 +715,7 @@ export async function compressGradientRecordingPath(
 
   const neighborCache = new Map<string, GradientRecordingNeighbor[]>();
   let compressionBudgetExhausted = false;
+  const biNeighbors = provider.bidirectionalNeighbors?.bind(provider);
   const fetchNeighbors = async (rec: GradientRecording) => {
     const cached = neighborCache.get(rec.key);
     if (cached) return cached;
@@ -721,7 +724,7 @@ export async function compressGradientRecordingPath(
       return [] as GradientRecordingNeighbor[];
     }
     if (budget) budget.compressionQueries += 1;
-    const result = await provider.neighbors(rec, 48).catch(() => [] as GradientRecordingNeighbor[]);
+    const result = await (biNeighbors?.(rec, 48) ?? provider.neighbors(rec, 48)).catch(() => [] as GradientRecordingNeighbor[]);
     neighborCache.set(rec.key, result);
     return result;
   };
@@ -744,7 +747,8 @@ export async function compressGradientRecordingPath(
           partialReason: "global_budget_exhausted",
         };
       }
-      const match = prevNeighbors.find((n) => gradientRecordingKey(n.artist, n.title) === next.key);
+      const match = prevNeighbors.find((n) => gradientRecordingKey(n.artist, n.title) === next.key)
+        ?? provider.lookupEdge?.(prev.key, next.key) ?? null;
       if (!match || match.similarity < 0.08) continue;
 
       const skipEdge: GradientRecordingPathEdge = {
