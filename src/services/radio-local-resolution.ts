@@ -1,7 +1,7 @@
 import { getConfig } from "../config";
 import { getDb } from "../db/database";
 import { getGenerationTracks } from "../db/repositories/radio";
-import { normalizeForComparison } from "../domain/normalization";
+import { titleMatch } from "../domain/normalization";
 import * as navidrome from "./navidrome";
 import { presentGeneration } from "./radio";
 import { primaryRadioArtistCredit, radioArtistCreditMatches } from "./radio-artist-credit";
@@ -14,6 +14,16 @@ export function localRadioSearchQueries(artist: string, title: string) {
     `${artist} ${title}`,
     ...(primary && primary !== artist ? [`${primary} ${title}`] : []),
   ])];
+}
+
+export function localRadioCandidateMatches(
+  requestedArtist: string,
+  requestedTitle: string,
+  candidateArtist: string,
+  candidateTitle: string,
+) {
+  return radioArtistCreditMatches(requestedArtist, candidateArtist)
+    && titleMatch(requestedTitle, candidateTitle).match;
 }
 
 /**
@@ -45,10 +55,12 @@ export async function resolveRadioGenerationLocally(
             albumCount: 0,
             songCount: 8,
           });
-          best = result.songs.find((song) =>
-            radioArtistCreditMatches(track.artist, song.artist) &&
-            normalizeForComparison(song.title) === normalizeForComparison(track.title)
-          );
+          best = result.songs.find((song) => localRadioCandidateMatches(
+            track.artist,
+            track.title,
+            song.artist,
+            song.title,
+          ));
           if (best) break;
         }
         if (!best) return;
