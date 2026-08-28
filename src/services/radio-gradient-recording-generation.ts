@@ -85,7 +85,15 @@ function planMaxGap(plan: GradientRecordingRoutePlan) {
   return max;
 }
 
+function routeTiming(plan: GradientRecordingRoutePlan) {
+  return {
+    pathSearchMs: Number(plan.segments.reduce((sum, segment) => sum + segment.pathSearchMs, 0).toFixed(2)),
+    densificationMs: Number(plan.segments.reduce((sum, segment) => sum + segment.densificationMs, 0).toFixed(2)),
+  };
+}
+
 function routeDiagnostics(plan: GradientRecordingRoutePlan, provider: GradientValidatedProviderDiagnostics) {
+  const connected = plan.segments.filter((segment) => segment.connected);
   return {
     algorithm: plan.algorithm,
     model: "recording_path_v1",
@@ -109,7 +117,10 @@ function routeDiagnostics(plan: GradientRecordingRoutePlan, provider: GradientVa
       mean_familiarity: plan.middleNovelty.meanFamiliarity,
     },
     recording_graph: {
-      nodes_visited_hint: plan.segments.reduce((sum, segment) => sum + segment.rawRecordings.length, 0),
+      nodes_visited: connected.reduce((sum, segment) => sum + segment.nodesVisited, 0),
+      forward_frontier_max: connected.reduce((max, segment) => Math.max(max, segment.forwardFrontierSize), 0),
+      backward_frontier_max: connected.reduce((max, segment) => Math.max(max, segment.backwardFrontierSize), 0),
+      frontier_intersections: connected.flatMap((segment) => segment.frontierIntersection ? [{ segment: segment.index, key: segment.frontierIntersection }] : []),
       neighbor_lookups: provider.neighborLookups,
       cache_hits: provider.cacheHits,
       cache_misses: provider.cacheMisses,
@@ -119,6 +130,7 @@ function routeDiagnostics(plan: GradientRecordingRoutePlan, provider: GradientVa
       acoustic_assessments: provider.acousticAssessments,
       acoustic_evidence_edges: provider.acousticEvidenceEdges,
       acoustic_penalty_edges: provider.acousticPenaltyEdges,
+      acoustic_validation_ms: provider.acousticValidationMs,
       catastrophic_rejected_edges: provider.catastrophicRejectedEdges,
       catastrophic_reasons: provider.catastrophicReasons,
     },
@@ -149,6 +161,12 @@ function routeDiagnostics(plan: GradientRecordingRoutePlan, provider: GradientVa
         ? Math.exp(segment.edges.reduce((sum, edge) => sum + Math.log(Math.max(0.01, edge.similarity * edge.confidence)), 0) / segment.edges.length)
         : segment.connected ? 1 : 0,
       query_count: segment.queryCount,
+      nodes_visited: segment.nodesVisited,
+      forward_frontier_size: segment.forwardFrontierSize,
+      backward_frontier_size: segment.backwardFrontierSize,
+      frontier_intersection: segment.frontierIntersection,
+      path_search_ms: segment.pathSearchMs,
+      densification_ms: segment.densificationMs,
       fallback_reason: segment.fallbackReason,
       raw_path: segment.rawRecordings.map((row) => ({ artist: row.artist, title: row.title, recording_mbid: row.mbid })),
       densification_stopped_reason: segment.densificationStoppedReason,
@@ -309,6 +327,7 @@ function finishRecordingGeneration(
   const finalEndpointComplete = actualEndpoints?.satisfied ?? plannedEndpointComplete;
   const endpointComplete = plannedEndpointComplete && finalEndpointComplete;
   const status = plan.complete && lengthComplete && endpointComplete ? "ready" : "partial";
+  const timing = routeTiming(plan);
   finishGeneration(generationId, status, {
     gradient_route: routeDiagnostics(plan, providerDiagnostics),
     gradient_route_candidate_count: plan.recordings.length,
@@ -329,6 +348,9 @@ function finishRecordingGeneration(
     gradient_stage_route_selected: summarizeGradientStage(selected),
     gradient_pipeline_timing: {
       route_search_ms: routeSearchMs,
+      path_search_ms: timing.pathSearchMs,
+      densification_ms: timing.densificationMs,
+      acoustic_validation_ms: providerDiagnostics.acousticValidationMs,
       route_selection_ms: 0,
       route_materialization_ms: 0,
       pre_finalize_total_ms: routeSearchMs,
@@ -369,6 +391,7 @@ export async function generateRadioStationWithRecordingGradient(
     enforceFallbackHardWaypoints(fallback.id, planned.plan);
     const generation = getGeneration(fallback.id)!;
     const previous = parseObject(generation.diagnostics_json);
+    const timing = routeTiming(planned.plan);
     finishGeneration(fallback.id, "partial", {
       ...previous,
       gradient_route: routeDiagnostics(planned.plan, providerDiagnostics),
@@ -377,6 +400,9 @@ export async function generateRadioStationWithRecordingGradient(
       gradient_stage_route_selected: summarizeGradientStage(getGenerationTracks(fallback.id)),
       gradient_pipeline_timing: {
         route_search_ms: planned.routeSearchMs,
+        path_search_ms: timing.pathSearchMs,
+        densification_ms: timing.densificationMs,
+        acoustic_validation_ms: providerDiagnostics.acousticValidationMs,
         pre_finalize_total_ms: planned.routeSearchMs,
       },
     });
@@ -424,12 +450,19 @@ export async function regenerateRadioTailWithRecordingGradient(
   if (planned.plan.state === "no_route") {
     const fallback = await regenerateTail(generationId, fromPosition, tasteProfile);
     enforceFallbackHardWaypoints(generationId, planned.plan);
+    const timing = routeTiming(planned.plan);
     finishGeneration(generationId, "partial", {
       ...(fallback.diagnostics ?? {}),
       gradient_route: routeDiagnostics(planned.plan, providerDiagnostics),
       gradient_fallback_radio: true,
       gradient_fallback_reason: "No valid recording-level musical bridge was found; regenerated tail is fallback radio.",
-      gradient_pipeline_timing: { route_search_ms: planned.routeSearchMs, pre_finalize_total_ms: planned.routeSearchMs },
+      gradient_pipeline_timing: {
+        route_search_ms: planned.routeSearchMs,
+        path_search_ms: timing.pathSearchMs,
+        densification_ms: timing.densificationMs,
+        acoustic_validation_ms: providerDiagnostics.acousticValidationMs,
+        pre_finalize_total_ms: planned.routeSearchMs,
+      },
     });
     return presentGeneration(generationId)!;
   }
