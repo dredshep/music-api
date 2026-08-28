@@ -1,3 +1,4 @@
+import { getDb } from "../db/database";
 import { normalizeForComparison } from "../domain/normalization";
 
 export interface GradientRecording {
@@ -190,7 +191,30 @@ function dedupeFrontier(frontier: FrontierState[], distances: Map<string, number
     const current = best.get(state.key);
     if (!current || state.cost < current.cost) best.set(state.key, state);
   }
-  return [...best.values()].sort((a, b) => a.cost - b.cost || a.depth - b.depth || a.key.localeCompare(b.key)).slice(0, cap);
+  const sorted = [...best.values()].sort((a, b) => a.cost - b.cost || a.depth - b.depth || a.key.localeCompare(b.key));
+  if (sorted.length <= cap) return sorted;
+
+  // Preserve depth diversity so deeper frontier nodes aren't lost to cheaper
+  // shallow entries. Reserve slots per depth level before filling the rest.
+  const byDepth = new Map<number, FrontierState[]>();
+  for (const s of sorted) {
+    const bucket = byDepth.get(s.depth);
+    if (bucket) bucket.push(s); else byDepth.set(s.depth, [s]);
+  }
+  const depthCount = byDepth.size;
+  const perDepth = Math.max(4, Math.floor(cap / Math.max(1, depthCount * 2)));
+  const selected = new Set<string>();
+  const result: FrontierState[] = [];
+  for (const [, bucket] of byDepth) {
+    for (const s of bucket.slice(0, perDepth)) {
+      if (!selected.has(s.key)) { selected.add(s.key); result.push(s); }
+    }
+  }
+  for (const s of sorted) {
+    if (result.length >= cap) break;
+    if (!selected.has(s.key)) { selected.add(s.key); result.push(s); }
+  }
+  return result.sort((a, b) => a.cost - b.cost || a.depth - b.depth || a.key.localeCompare(b.key));
 }
 
 function bestIntersection(forward: Map<string, number>, backward: Map<string, number>) {
@@ -224,6 +248,11 @@ function reconstructKeys(
   return [...left, ...right];
 }
 
+function keyArtist(key: string) {
+  const sep = key.indexOf("|");
+  return sep > 0 ? key.slice(0, sep) : key;
+}
+
 async function expandSide(input: {
   graph: Graph;
   frontier: FrontierState[];
@@ -236,10 +265,29 @@ async function expandSide(input: {
   neighborLimit: number;
   maxNodes: number;
   remainingQueries: number;
+  seedArtists?: Set<string>;
+  depthFirst?: boolean;
 }) {
+  const seedArtists = input.seedArtists;
+  const depthFirst = input.depthFirst ?? false;
   const batch = input.frontier
     .filter((state) => !input.expanded.has(state.key))
-    .sort((a, b) => a.cost - b.cost || a.depth - b.depth)
+    .sort((a, b) => {
+      // Recordings by seed endpoint artists share nearly identical neighbor
+      // sets. Expanding them first wastes the query budget in a comfort zone
+      // rather than bridging toward the other endpoint. Prefer non-seed-artist
+      // nodes so the search branches outward sooner.
+      if (seedArtists) {
+        const aIsSeed = seedArtists.has(keyArtist(a.key)) ? 1 : 0;
+        const bIsSeed = seedArtists.has(keyArtist(b.key)) ? 1 : 0;
+        if (aIsSeed !== bIsSeed) return aIsSeed - bIsSeed;
+      }
+      // When no intersection has been found after the initial budget,
+      // prioritize depth over cost so the search reaches further into
+      // intermediate genre territory.
+      if (depthFirst) return b.depth - a.depth || a.cost - b.cost;
+      return a.cost - b.cost || a.depth - b.depth;
+    })
     .slice(0, Math.min(input.beam, input.remainingQueries));
   batch.forEach((state) => input.expanded.add(state.key));
   const rows = await Promise.all(batch.map(async (state) => {
@@ -276,6 +324,103 @@ async function expandSide(input: {
 }
 
 /**
+ * When the online provider-driven search fails, fall back to a pure offline
+ * search over ALL edges already cached in the database. This traverses the
+ * entire accumulated recording similarity graph without any provider calls,
+ * catching paths that span more hops than the live search budget allows.
+ */
+export function discoverCachedRecordingPath(
+  starts: GradientRecording[],
+  ends: GradientRecording[],
+): GradientRecordingPath | null {
+  const db = getDb();
+  const endKeys = new Set(ends.map((r) => r.key));
+  if (starts.some((r) => endKeys.has(r.key))) {
+    const overlap = starts.find((r) => endKeys.has(r.key))!;
+    return { recordings: [overlap], edges: [], cost: 0, queryCount: 0, nodesVisited: 1, forwardFrontierSize: 0, backwardFrontierSize: 0, intersection: overlap.key };
+  }
+
+  interface NodeInfo { artist: string; title: string; mbid: string | null }
+  const nodeCache = new Map<string, NodeInfo>();
+  const loadNode = (key: string): NodeInfo | null => {
+    const cached = nodeCache.get(key);
+    if (cached) return cached;
+    const row = db.prepare("SELECT artist, title, recording_mbid FROM recording_similarity_nodes WHERE canonical_key = ?").get(key) as { artist: string; title: string; recording_mbid: string | null } | undefined;
+    if (!row) return null;
+    const info = { artist: row.artist, title: row.title, mbid: row.recording_mbid };
+    nodeCache.set(key, info);
+    return info;
+  };
+
+  for (const r of [...starts, ...ends]) nodeCache.set(r.key, { artist: r.artist, title: r.title, mbid: r.mbid });
+
+  const forwardDist = new Map<string, number>(starts.map((r) => [r.key, 0]));
+  const backwardDist = new Map<string, number>(ends.map((r) => [r.key, 0]));
+  const forwardParent = new Map<string, string>();
+  const backwardParent = new Map<string, string>();
+  let forwardQueue = starts.map((r) => r.key);
+  let backwardQueue = ends.map((r) => r.key);
+  const forwardExpanded = new Set<string>();
+  const backwardExpanded = new Set<string>();
+  let best: { key: string; cost: number } | null = null;
+  const maxExpanded = 12000;
+
+  const getEdges = db.prepare("SELECT target_key, MAX(similarity) as similarity, MAX(confidence) as confidence FROM recording_similarity_edges WHERE source_key = ? GROUP BY target_key ORDER BY similarity DESC LIMIT 40");
+
+  while ((forwardQueue.length || backwardQueue.length) && forwardExpanded.size + backwardExpanded.size < maxExpanded) {
+    const expandQueue = (queue: string[], dist: Map<string, number>, parent: Map<string, string>, expanded: Set<string>, otherDist: Map<string, number>) => {
+      const batchSize = Math.min(256, queue.length);
+      const batch = queue.splice(0, batchSize).filter((k) => !expanded.has(k));
+      for (const key of batch) {
+        expanded.add(key);
+        const cost = dist.get(key) ?? Infinity;
+        const rows = getEdges.all(key) as Array<{ target_key: string; similarity: number; confidence: number }>;
+        for (const row of rows) {
+          const edgeCost = gradientRecordingEdgeCost(row.similarity, row.confidence);
+          const newCost = cost + edgeCost;
+          if (newCost + 1e-9 < (dist.get(row.target_key) ?? Infinity)) {
+            dist.set(row.target_key, newCost);
+            parent.set(row.target_key, key);
+            if (!expanded.has(row.target_key)) queue.push(row.target_key);
+          }
+          const totalCost = newCost + (otherDist.get(row.target_key) ?? Infinity);
+          if (otherDist.has(row.target_key) && (!best || totalCost < best.cost)) {
+            best = { key: row.target_key, cost: totalCost };
+          }
+        }
+      }
+    };
+    expandQueue(forwardQueue, forwardDist, forwardParent, forwardExpanded, backwardDist);
+    expandQueue(backwardQueue, backwardDist, backwardParent, backwardExpanded, forwardDist);
+    if (best) break;
+  }
+
+  if (!best) return null;
+
+  const keys = reconstructKeys(best.key, forwardParent, backwardParent);
+  const graph = newGraph();
+  const recordings: GradientRecording[] = [];
+  for (const key of keys) {
+    const info = loadNode(key);
+    if (!info) return null;
+    const rec = gradientRecording(info.artist, info.title, info.mbid);
+    recordings.push(rec);
+    remember(graph, rec);
+  }
+  const edgeQuery = db.prepare("SELECT similarity, confidence, provider FROM recording_similarity_edges WHERE source_key = ? AND target_key = ? ORDER BY similarity DESC LIMIT 1");
+  for (let i = 1; i < keys.length; i++) {
+    const edge = (edgeQuery.get(keys[i - 1]!, keys[i]!) ?? edgeQuery.get(keys[i]!, keys[i - 1]!)) as { similarity: number; confidence: number; provider: string } | undefined;
+    if (edge) addEdge(graph, recordings[i - 1]!, recordings[i]!, edge.similarity, edge.confidence, edge.provider);
+  }
+  return graphPath(graph, keys, 0, {
+    nodesVisited: forwardExpanded.size + backwardExpanded.size,
+    forwardFrontierSize: forwardQueue.length,
+    backwardFrontierSize: backwardQueue.length,
+    intersection: best.key,
+  });
+}
+
+/**
  * Bounded multi-source bidirectional search over playable recordings. This is
  * deliberately not greedy: both endpoint regions expand until their discovered
  * graphs intersect, then search refines briefly for a lower-bottleneck path.
@@ -307,6 +452,9 @@ export async function discoverGradientRecordingPath(
     };
   }
 
+  const forwardSeedArtists = new Set(starts.map((row) => keyArtist(row.key)));
+  const backwardSeedArtists = new Set(ends.map((row) => keyArtist(row.key)));
+
   const forwardDistances = new Map(starts.map((row) => [row.key, 0]));
   const backwardDistances = new Map(ends.map((row) => [row.key, 0]));
   const forwardParent = new Map<string, string>();
@@ -319,20 +467,28 @@ export async function discoverGradientRecordingPath(
   let foundAt: number | null = null;
   let best: { key: string; cost: number } | null = null;
 
+  // Initial cost-first phase uses part of the budget. If no intersection is
+  // found, a second depth-first phase spends the remaining budget reaching
+  // further into intermediate genre territory — critical for very distant
+  // endpoint pairs (e.g. Poppy → Taake) where the similarity graphs are
+  // disjoint at shallow depths.
+  const initialBudget = Math.ceil(maxQueries * 0.45);
+
   while (queryCount < maxQueries && (forwardFrontier.length || backwardFrontier.length)) {
     const remaining = maxQueries - queryCount;
     const leftBudget = Math.min(beam, Math.max(0, Math.ceil(remaining / 2)));
     const rightBudget = Math.min(beam, Math.max(0, remaining - leftBudget));
+    const useDepthFirst = !best && queryCount >= initialBudget;
     const [left, right] = await Promise.all([
       expandSide({
         graph, frontier: forwardFrontier, distances: forwardDistances, parents: forwardParent,
         expanded: forwardExpanded, provider, beam: leftBudget, frontierCap, neighborLimit, maxNodes,
-        remainingQueries: leftBudget,
+        remainingQueries: leftBudget, seedArtists: forwardSeedArtists, depthFirst: useDepthFirst,
       }),
       expandSide({
         graph, frontier: backwardFrontier, distances: backwardDistances, parents: backwardParent,
         expanded: backwardExpanded, provider, beam: rightBudget, frontierCap, neighborLimit, maxNodes,
-        remainingQueries: rightBudget,
+        remainingQueries: rightBudget, seedArtists: backwardSeedArtists, depthFirst: useDepthFirst,
       }),
     ]);
     forwardFrontier = left.frontier;

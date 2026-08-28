@@ -3,6 +3,7 @@ import { normalizeForComparison } from "../domain/normalization";
 import * as lastfm from "./lastfm";
 import { densifyGradientRecordingPathWithSubpathFallback } from "./radio-gradient-densify-subpath";
 import {
+  discoverCachedRecordingPath,
   discoverGradientRecordingPath,
   gradientRecording,
   type GradientDensificationOperation,
@@ -10,6 +11,7 @@ import {
   type GradientRecordingNeighborProvider,
   type GradientRecordingPathEdge,
 } from "./radio-gradient-recording-path";
+import { log } from "../middleware/logging";
 
 export type GradientSeedConstraint = "exact_track" | "artist" | "region";
 
@@ -275,6 +277,95 @@ function middleNovelty(
   };
 }
 
+/**
+ * When recording-level pathfinding fails because the two endpoints are in
+ * completely disjoint similarity regions, try an artist-level BFS through
+ * Last.fm's `artist.getSimilar` to discover intermediate bridge artists.
+ * Returns a list of bridge artist names (excluding the endpoints themselves)
+ * that can be used as intermediate waypoints for shorter recording-level hops.
+ */
+async function findArtistBridge(
+  startArtist: string,
+  endArtist: string,
+  maxDepth = 5,
+  beamWidth = 6,
+): Promise<string[]> {
+  const startNorm = normalizeForComparison(startArtist);
+  const endNorm = normalizeForComparison(endArtist);
+  if (startNorm === endNorm) return [];
+
+  type Node = { artist: string; norm: string; depth: number; parent: string | null };
+  const forwardVisited = new Map<string, Node>();
+  const backwardVisited = new Map<string, Node>();
+  let forwardQueue: Node[] = [{ artist: startArtist, norm: startNorm, depth: 0, parent: null }];
+  let backwardQueue: Node[] = [{ artist: endArtist, norm: endNorm, depth: 0, parent: null }];
+  forwardVisited.set(startNorm, forwardQueue[0]!);
+  backwardVisited.set(endNorm, backwardQueue[0]!);
+
+  for (let iteration = 0; iteration < maxDepth; iteration++) {
+    const expandQueue = async (queue: Node[], visited: Map<string, Node>, other: Map<string, Node>) => {
+      const batch = queue.splice(0, beamWidth);
+      const results = await Promise.all(batch.map(async (node) => {
+        try {
+          return { node, similar: await lastfm.getSimilarArtists(node.artist, 30) };
+        } catch { return { node, similar: [] as Awaited<ReturnType<typeof lastfm.getSimilarArtists>> }; }
+      }));
+      let meetingPoint: string | null = null;
+      for (const { node, similar } of results) {
+        for (const s of similar) {
+          const norm = normalizeForComparison(s.name);
+          if (visited.has(norm)) continue;
+          const child: Node = { artist: s.name, norm, depth: node.depth + 1, parent: node.norm };
+          visited.set(norm, child);
+          queue.push(child);
+          if (other.has(norm) && !meetingPoint) meetingPoint = norm;
+        }
+      }
+      return meetingPoint;
+    };
+
+    const [fwdMeet, bwdMeet] = await Promise.all([
+      expandQueue(forwardQueue, forwardVisited, backwardVisited),
+      expandQueue(backwardQueue, backwardVisited, forwardVisited),
+    ]);
+    const meeting = fwdMeet ?? bwdMeet;
+    if (meeting) {
+      const path: string[] = [];
+      let cursor: string | null = meeting;
+      const fwdPath: string[] = [];
+      while (cursor && cursor !== startNorm) {
+        const node = forwardVisited.get(cursor);
+        if (!node) break;
+        fwdPath.unshift(node.artist);
+        cursor = node.parent;
+      }
+      const bwdPath: string[] = [];
+      cursor = backwardVisited.get(meeting)?.parent ?? null;
+      while (cursor && cursor !== endNorm) {
+        const node = backwardVisited.get(cursor);
+        if (!node) break;
+        bwdPath.push(node.artist);
+        cursor = node.parent;
+      }
+      path.push(...fwdPath, ...bwdPath);
+      // Remove the endpoint artists themselves
+      const filtered = path.filter((a) => {
+        const n = normalizeForComparison(a);
+        return n !== startNorm && n !== endNorm;
+      });
+      log("info", "gradient_artist_bridge_found", {
+        start: startArtist,
+        end: endArtist,
+        bridgeArtists: filtered,
+        depth: iteration + 1,
+      });
+      return filtered;
+    }
+  }
+  log("info", "gradient_artist_bridge_not_found", { start: startArtist, end: endArtist, maxDepth });
+  return [];
+}
+
 /** Plan one coherent recording trajectory across all requested waypoints. */
 export async function planGradientRecordingRoute(input: {
   seeds: RadioSeedRow[];
@@ -340,15 +431,98 @@ export async function planGradientRecordingRoute(input: {
       continue;
     }
 
-    const pathStartedAt = performance.now();
-    const raw = await discoverGradientRecordingPath(fromCandidates, toCandidates, provider, {
-      maxQueries: scenic ? 88 : 64,
-      maxNodes: scenic ? 1800 : 1200,
-      beamPerSide: scenic ? 5 : 4,
-      frontierCap: scenic ? 180 : 120,
+    const pathSearchOptions = {
+      maxQueries: scenic ? 160 : 128,
+      maxNodes: scenic ? 6000 : 4000,
+      beamPerSide: scenic ? 6 : 5,
+      frontierCap: scenic ? 400 : 300,
       neighborLimit: scenic ? 44 : 36,
-      refineQueries: scenic ? 18 : 10,
-    });
+      refineQueries: scenic ? 18 : 12,
+    };
+    const pathStartedAt = performance.now();
+    let raw = await discoverGradientRecordingPath(fromCandidates, toCandidates, provider, pathSearchOptions);
+
+    // When the online provider search fails, try an offline BFS over the
+    // entire cached recording similarity graph. This catches multi-hop
+    // paths that span more hops than the live search budget allows.
+    if (!raw) {
+      try {
+        const cachedPath = discoverCachedRecordingPath(fromCandidates, toCandidates);
+        if (cachedPath) {
+          log("info", "gradient_cached_path_found", {
+            from: left.label,
+            to: right.label,
+            pathLength: cachedPath.recordings.length,
+            cost: cachedPath.cost,
+            nodesVisited: cachedPath.nodesVisited,
+            artists: cachedPath.recordings.map((r) => r.artist),
+          });
+          raw = cachedPath;
+        } else {
+          log("info", "gradient_cached_path_not_found", {
+            from: left.label,
+            to: right.label,
+            fromCandidates: fromCandidates.length,
+            toCandidates: toCandidates.length,
+          });
+        }
+      } catch (err) {
+        log("error", "gradient_cached_path_error", {
+          from: left.label,
+          to: right.label,
+          error: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
+        });
+      }
+    }
+
+    // When both online and cached searches fail, discover artist-level
+    // bridge artists via Last.fm similarity and chain shorter recording-
+    // level hops through them.
+    if (!raw && left.requestedArtist && right.requestedArtist) {
+      const bridgeArtists = await findArtistBridge(left.requestedArtist, right.requestedArtist, 8, 12);
+      if (bridgeArtists.length) {
+        // Build a chain of recording-level hops: A → bridge1 → bridge2 → ... → B
+        const chainRegions: GradientRecording[][] = [fromCandidates];
+        for (const bridgeArtist of bridgeArtists) {
+          try {
+            const tracks = await (input.sources ?? DEFAULT_SOURCES).artistTracks(bridgeArtist, 10);
+            const recordings = dedupeRecordings(
+              tracks.map((row) => ({ ...gradientRecording(bridgeArtist, row.title, row.mbid || null), weight: row.weight ?? 1 })), 10,
+            );
+            if (recordings.length) chainRegions.push(recordings);
+          } catch { /* skip failed bridge lookup */ }
+        }
+        chainRegions.push(toCandidates);
+
+        // Try recording-level search between each adjacent pair in the chain
+        const chainRecordings: GradientRecording[] = [];
+        const chainEdges: GradientRecordingPathEdge[] = [];
+        let chainQueryCount = 0;
+        let chainConnected = true;
+        for (let hop = 0; hop < chainRegions.length - 1; hop++) {
+          const hopPath = await discoverGradientRecordingPath(chainRegions[hop]!, chainRegions[hop + 1]!, provider, pathSearchOptions);
+          if (!hopPath) { chainConnected = false; break; }
+          chainQueryCount += hopPath.queryCount;
+          const start = hop === 0 ? 0 : 1;
+          chainRecordings.push(...hopPath.recordings.slice(start));
+          chainEdges.push(...hopPath.edges.slice(start > 0 ? start - 1 : 0));
+        }
+        if (chainConnected && chainRecordings.length >= 2) {
+          raw = {
+            recordings: chainRecordings,
+            edges: chainEdges,
+            cost: chainEdges.reduce((sum, e) => sum + (e.similarity * e.confidence), 0),
+            queryCount: chainQueryCount,
+            nodesVisited: chainRecordings.length,
+            forwardFrontierSize: 0,
+            backwardFrontierSize: 0,
+            intersection: chainRecordings[Math.floor(chainRecordings.length / 2)]?.key ?? null,
+          };
+        }
+      }
+    }
+
     const pathSearchMs = elapsedMs(pathStartedAt);
     if (!raw) {
       segments.push({
