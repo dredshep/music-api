@@ -12,6 +12,7 @@ import {
   type GradientRecordingPath,
   type GradientRecordingPathEdge,
 } from "../src/services/radio-gradient-recording-path";
+import { budgetTotalUsed, createRouteBudget } from "../src/services/radio-gradient-budget";
 
 function provider(graph: Record<string, Array<[string, string, number]>>): GradientRecordingNeighborProvider {
   return {
@@ -255,6 +256,30 @@ describe("path compression", () => {
     expect(result.compressed).toBe(false);
     expect(result.partialReason).toBe("no_validated_skip_edge");
     expect(result.path.recordings.length).toBeGreaterThan(2);
+  });
+
+  test("compression never calls the provider past the shared query ceiling", async () => {
+    const artists = ["A", "B", "C", "D", "E"];
+    const path = makePath(artists);
+    let providerCalls = 0;
+    const p: GradientRecordingNeighborProvider = {
+      async neighbors(recording) {
+        providerCalls++;
+        return artists
+          .filter((a) => key(a, `${a}-song`) !== recording.key)
+          .map((a) => ({ ...gradientRecording(a, `${a}-song`), similarity: 0.5, confidence: 0.9, provider: "synthetic" }));
+      },
+    };
+    const budget = createRouteBudget(2, 60_000);
+    budget.initialRecordingQueries = 1;
+
+    const result = await compressGradientRecordingPath(path, 2, p, undefined, budget);
+
+    expect(providerCalls).toBe(1);
+    expect(budgetTotalUsed(budget)).toBe(2);
+    expect(budgetTotalUsed(budget)).toBeLessThanOrEqual(budget.maxQueries);
+    expect(result.compressed).toBe(false);
+    expect(result.partialReason).toBe("global_budget_exhausted");
   });
 
   test("path already at requested length is unchanged", async () => {

@@ -107,6 +107,7 @@ function budgetDiagnostics(plan: GradientRecordingRoutePlan) {
     bridge_track_lookups: plan.budget.bridgeTrackLookups,
     chained_recording_queries: plan.budget.chainedRecordingQueries,
     densification_queries: plan.budget.densificationQueries,
+    compression_queries: plan.budget.compressionQueries,
     recording_neighbor_expansions: plan.budget.recordingNeighborExpansions,
     total_route_search_ms: plan.budget.elapsedMs,
   };

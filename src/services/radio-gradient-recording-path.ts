@@ -1,5 +1,5 @@
 import { normalizeForComparison } from "../domain/normalization";
-import type { GradientRouteBudget } from "./radio-gradient-budget";
+import { isBudgetExhausted, type GradientRouteBudget } from "./radio-gradient-budget";
 
 export interface GradientRecording {
   key: string;
@@ -712,9 +712,14 @@ export async function compressGradientRecordingPath(
   let removedCount = 0;
 
   const neighborCache = new Map<string, GradientRecordingNeighbor[]>();
+  let compressionBudgetExhausted = false;
   const fetchNeighbors = async (rec: GradientRecording) => {
     const cached = neighborCache.get(rec.key);
     if (cached) return cached;
+    if (budget && isBudgetExhausted(budget)) {
+      compressionBudgetExhausted = true;
+      return [] as GradientRecordingNeighbor[];
+    }
     if (budget) budget.compressionQueries += 1;
     const result = await provider.neighbors(rec, 48).catch(() => [] as GradientRecordingNeighbor[]);
     neighborCache.set(rec.key, result);
@@ -731,6 +736,14 @@ export async function compressGradientRecordingPath(
       const next = recordings[i + 1]!;
 
       const prevNeighbors = await fetchNeighbors(prev);
+      if (compressionBudgetExhausted) {
+        return {
+          path: { ...original, recordings, edges, cost: edges.reduce((sum, e) => sum + gradientRecordingEdgeCost(e.similarity, e.confidence), 0) },
+          removedCount,
+          compressed: false,
+          partialReason: "global_budget_exhausted",
+        };
+      }
       const match = prevNeighbors.find((n) => gradientRecordingKey(n.artist, n.title) === next.key);
       if (!match || match.similarity < 0.08) continue;
 
