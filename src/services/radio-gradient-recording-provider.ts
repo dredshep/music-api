@@ -7,6 +7,11 @@ import {
   type GradientRecordingNeighbor,
   type GradientRecordingNeighborProvider,
 } from "./radio-gradient-recording-path";
+import {
+  gradientSimilEnabled,
+  maybeQueueGradientSimilIndex,
+  searchGradientSimilNeighbors,
+} from "./radio-gradient-simil";
 
 const READY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const FAILED_TTL_MS = 15 * 60 * 1000;
@@ -76,18 +81,28 @@ function rememberFetch(sourceKey: string, provider: string, status: "ready" | "f
 
 function rememberEdges(source: GradientRecording, provider: string, rows: GradientRecordingNeighbor[]) {
   const now = nowIso();
+  const directionality = provider === "local_effnet" ? "acoustic" : "observed";
   const insert = getDb().query(`INSERT INTO recording_similarity_edges
       (source_key,target_key,provider,similarity,confidence,directionality,metadata_json,retrieved_at)
-      VALUES (?,?,?,?,?,'observed',NULL,?)
+      VALUES (?,?,?,?,?,?,NULL,?)
       ON CONFLICT(source_key,target_key,provider) DO UPDATE SET
         similarity=excluded.similarity,
         confidence=excluded.confidence,
+        directionality=excluded.directionality,
         retrieved_at=excluded.retrieved_at`);
   getDb().transaction(() => {
     rememberNode(source);
     for (const row of rows) {
       rememberNode(row);
-      insert.run(source.key, row.key, provider, clamp(row.similarity, 0.01, 1), clamp(row.confidence ?? 0.75, 0.05, 1), now);
+      insert.run(
+        source.key,
+        row.key,
+        provider,
+        clamp(row.similarity, 0.01, 1),
+        clamp(row.confidence ?? 0.75, 0.05, 1),
+        directionality,
+        now,
+      );
     }
     rememberFetch(source.key, provider, "ready", rows.length);
   })();
@@ -174,7 +189,8 @@ async function fetchListenBrainz(source: GradientRecording, limit: number) {
 /**
  * Persistent cache-first provider for the global recording graph. Provider rows
  * are stored separately so agreement can increase confidence without pretending
- * collaborative similarity is acoustic truth.
+ * collaborative similarity is acoustic truth. When enabled, local Discogs-EffNet
+ * neighbors from simil are stored in the same cache as independent acoustic edges.
  */
 export function createCachedGradientRecordingProvider(): CachedGradientRecordingProvider {
   const stats: GradientRecordingProviderDiagnostics = {
@@ -217,10 +233,14 @@ export function createCachedGradientRecordingProvider(): CachedGradientRecording
     async neighbors(source, limit) {
       stats.neighborLookups++;
       rememberNode(source);
+      if (gradientSimilEnabled()) maybeQueueGradientSimilIndex();
       await Promise.all([
         ensureProvider(source, "lastfm_track", () => fetchLastFm(source, limit)),
         source.mbid
           ? ensureProvider(source, "listenbrainz_similar", () => fetchListenBrainz(source, limit))
+          : Promise.resolve(),
+        gradientSimilEnabled()
+          ? ensureProvider(source, "local_effnet", () => searchGradientSimilNeighbors(source, limit))
           : Promise.resolve(),
       ]);
       return cachedEdges(source.key, limit);
