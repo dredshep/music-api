@@ -38,6 +38,26 @@ function twoNodePath(): GradientRecordingPath {
   };
 }
 
+function fourGapPath(): GradientRecordingPath {
+  const recordings = ["A", "B", "C", "D", "E"].map((name) => gradientRecording(name, name));
+  return {
+    recordings,
+    edges: recordings.slice(0, -1).map((from, index) => ({
+      from,
+      to: recordings[index + 1]!,
+      similarity: 0.15,
+      confidence: 1,
+      provider: "weak-direct",
+    })),
+    cost: 4,
+    queryCount: 0,
+    nodesVisited: recordings.length,
+    forwardFrontierSize: 0,
+    backwardFrontierSize: 0,
+    intersection: null,
+  };
+}
+
 describe("Gradient multi-hop densification fallback", () => {
   test("inserts C and D when no single common neighbor bridges A and B", async () => {
     const path = twoNodePath();
@@ -71,18 +91,18 @@ describe("Gradient multi-hop densification fallback", () => {
     expect(dense.stoppedReason).toBe("no_bridge");
   });
 
-  test("never exceeds the advertised total provider-query budget across fallback phases", async () => {
-    const path = twoNodePath();
+  test("never exceeds the advertised total provider-query budget when the first phase nearly exhausts it", async () => {
+    const path = fourGapPath();
     let lookups = 0;
     const p = provider({
-      A: [["C1", "C1", 0.8], ["C2", "C2", 0.79], ["C3", "C3", 0.78]],
-      B: [["D1", "D1", 0.8], ["D2", "D2", 0.79], ["D3", "D3", 0.78]],
-      C1: [["X", "X", 0.7]],
-      C2: [["Y", "Y", 0.7]],
-      C3: [["Z", "Z", 0.7]],
+      A: [["XA", "XA", 0.8]],
+      B: [["XB", "XB", 0.8]],
+      C: [["XC", "XC", 0.8]],
+      D: [["XD", "XD", 0.8]],
+      E: [["XE", "XE", 0.8]],
     }, () => { lookups++; });
-    const maxQueries = 6;
-    const dense = await densifyGradientRecordingPathWithSubpathFallback(path, 6, p, {
+    const maxQueries = 9;
+    const dense = await densifyGradientRecordingPathWithSubpathFallback(path, 8, p, {
       minBridgeSimilarity: 0.2,
       maxQueries,
     });
