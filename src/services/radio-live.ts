@@ -2,39 +2,17 @@ import { getDb } from "../db/database";
 import { finalizeRadioGeneration } from "./radio-finalize";
 import { presentStation, type TasteTrack } from "./radio";
 import { generateRadioStationWithGradient } from "./radio-gradient-generation";
+import {
+  consumeGradientLiveRouteState,
+  createGradientLiveRouteState,
+  isValidGradientLiveRouteState,
+  type GradientLivePresentedTrack,
+  type LiveGradientRouteState,
+} from "./radio-gradient-live-state";
 import { selectGradientLiveWindow } from "./radio-live-window";
 import { refreshNativeRadioSeedSnapshots } from "./radio-native-seeds";
 
-type PresentedTrack = {
-  id: string;
-  position: number;
-  canonical_key: string;
-  artist: string;
-  title: string;
-  album: string | null;
-  duration_ms: number | null;
-  isrc: string | null;
-  spotify_id: string | null;
-  navidrome_id: string | null;
-  musicbrainz_id: string | null;
-  playback_source: string | null;
-  availability: string;
-  pinned: boolean;
-  manual: boolean;
-  score: number;
-  trajectory_position: number | null;
-  metadata: Record<string, unknown> | null;
-};
-
-export type LiveGradientRouteState = {
-  version: 1;
-  station_id: string;
-  generator_version: string;
-  tracks: PresentedTrack[];
-  next_index: number;
-  previous_key: string | null;
-  completed: boolean;
-};
+export type { LiveGradientRouteState } from "./radio-gradient-live-state";
 
 export type LiveRadioBatchInput = {
   count?: number;
@@ -43,79 +21,6 @@ export type LiveRadioBatchInput = {
   routeCursor?: number | null;
   routeState?: LiveGradientRouteState | null;
 };
-
-function clamp(value: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, value));
-}
-
-function authoritativeRoutePosition(track: PresentedTrack) {
-  const metadata = track.metadata && typeof track.metadata === "object" ? track.metadata : {};
-  return metadata.trajectoryCoordinateKind === "musical_route" && typeof track.trajectory_position === "number"
-    ? clamp(track.trajectory_position, 0, 1)
-    : null;
-}
-
-function validRouteState(stationId: string, state: LiveGradientRouteState | null | undefined): state is LiveGradientRouteState {
-  return Boolean(
-    state && state.version === 1 && state.station_id === stationId && Array.isArray(state.tracks)
-      && state.tracks.length <= 200 && Number.isInteger(state.next_index) && state.next_index >= 0,
-  );
-}
-
-function consumeRouteState(
-  state: LiveGradientRouteState,
-  count: number,
-  exclude: Set<string>,
-) {
-  const tracks: PresentedTrack[] = [];
-  let cursor = Math.min(state.next_index, state.tracks.length);
-  while (cursor < state.tracks.length && tracks.length < count) {
-    const track = state.tracks[cursor++]!;
-    if (exclude.has(track.canonical_key)) continue;
-    tracks.push(track);
-  }
-  const previousKey = tracks.at(-1)?.canonical_key ?? state.previous_key;
-  const completed = cursor >= state.tracks.length;
-  const nextState: LiveGradientRouteState = {
-    ...state,
-    next_index: cursor,
-    previous_key: previousKey,
-    completed,
-  };
-  const positions = tracks.flatMap((track) => {
-    const value = authoritativeRoutePosition(track);
-    return value == null ? [] : [value];
-  });
-  return {
-    tracks,
-    routeCursor: positions[0] ?? null,
-    nextCursor: positions.at(-1) ?? (completed ? 1 : null),
-    completed,
-    state: nextState,
-  };
-}
-
-function routeStateFromGeneration(stationId: string, generation: {
-  generator_version: string;
-  diagnostics?: Record<string, unknown> | null;
-  tracks: PresentedTrack[];
-}) {
-  const route = generation.diagnostics?.gradient_route;
-  const routeObject = route && typeof route === "object" && !Array.isArray(route) ? route as Record<string, unknown> : null;
-  const isRecordingPath = routeObject?.model === "recording_path_v1" && routeObject?.usable === true;
-  const fallback = generation.diagnostics?.gradient_fallback_radio === true;
-  const positioned = generation.tracks.filter((track) => authoritativeRoutePosition(track) != null);
-  if (!isRecordingPath || fallback || positioned.length < 2) return null;
-  return {
-    version: 1 as const,
-    station_id: stationId,
-    generator_version: generation.generator_version,
-    tracks: generation.tracks.slice(0, 200),
-    next_index: 0,
-    previous_key: null,
-    completed: false,
-  } satisfies LiveGradientRouteState;
-}
 
 /**
  * Generate or continue a bounded live queue. Recording-level Gradient sessions
@@ -128,8 +33,8 @@ export async function generateLiveRadioBatch(stationId: string, input: LiveRadio
 
   const count = Math.max(4, Math.min(30, Math.floor(input.count ?? 12)));
   const exclude = new Set((input.excludeKeys ?? []).slice(0, 5000));
-  if (station.type === "gradient" && validRouteState(stationId, input.routeState)) {
-    const continuation = consumeRouteState(input.routeState, count, exclude);
+  if (station.type === "gradient" && isValidGradientLiveRouteState(stationId, input.routeState)) {
+    const continuation = consumeGradientLiveRouteState(input.routeState, count, exclude);
     return {
       station_id: stationId,
       mode: "live" as const,
@@ -172,10 +77,10 @@ export async function generateLiveRadioBatch(stationId: string, input: LiveRadio
     if (!finalized) return null;
 
     const recordingState = station.type === "gradient"
-      ? routeStateFromGeneration(stationId, finalized as typeof finalized & { tracks: PresentedTrack[] })
+      ? createGradientLiveRouteState(stationId, finalized as typeof finalized & { tracks: GradientLivePresentedTrack[] })
       : null;
     if (recordingState) {
-      const first = consumeRouteState(recordingState, count, exclude);
+      const first = consumeGradientLiveRouteState(recordingState, count, exclude);
       return {
         station_id: stationId,
         mode: "live" as const,
