@@ -66,10 +66,6 @@ function stateRank(state: PartialState) {
   const mean = state.totalCost / count;
   const variance = Math.max(0, state.sumSquares / count - mean * mean);
   const spread = Math.sqrt(variance);
-  // During partial search we cannot know normalized final shares yet. Keep the
-  // beam biased toward low bottlenecks and low dispersion rather than merely
-  // the cheapest cumulative path, which is what produced dense clusters plus
-  // one giant jump in the first place.
   return state.maxCost * 1.65
     + mean * 0.35
     + spread * 0.75
@@ -92,9 +88,6 @@ function completeMetrics(edges: GradientRecordingPathEdge[]) {
 
 function completeRank(edges: GradientRecordingPathEdge[], familiarityPenalty: number, repeatedArtistPenalty: number) {
   const metrics = completeMetrics(edges);
-  // Fixed-length route quality is primarily about using the available hops
-  // evenly. Total musical distance remains relevant, but cannot compensate for
-  // a single transition consuming a third of the journey.
   return metrics.maxShare * 5.0
     + metrics.imbalance * 1.8
     + metrics.maxCost * 0.12
@@ -134,7 +127,11 @@ function extendState(
   const cost = edgeCost(edge.similarity, edge.confidence);
   const previousArtist = normalizedArtist(current);
   const nextArtist = normalizedArtist(next);
-  const repeatedArtistPenalty = state.repeatedArtistPenalty + (previousArtist === nextArtist ? 0.08 : 0);
+  const endpointArtists = new Set((options.endpointArtists ?? []).map((value) => normalizeForComparison(value)));
+  const sameArtist = previousArtist === nextArtist;
+  const repeatedArtistPenalty = state.repeatedArtistPenalty
+    + (sameArtist ? 0.18 : 0)
+    + (sameArtist && endpointArtists.has(nextArtist) ? 0.12 : 0);
 
   let familiarityPenalty = state.familiarityPenalty;
   if (options.familiarity) {
@@ -168,8 +165,10 @@ async function buildLayeredBeam(input: {
   queryBudget: number;
 }) {
   const neighborLimit = Math.max(8, Math.min(64, input.options.neighborLimit ?? 48));
-  const beamWidth = Math.max(4, Math.min(32, input.options.beamWidth ?? 18));
-  const expandWidth = Math.max(3, Math.min(8, Math.ceil(beamWidth / 3)));
+  const beamWidth = Math.max(4, Math.min(32, input.options.beamWidth ?? 24));
+  const expandWidth = Math.max(3, Math.min(10, Math.ceil(beamWidth / 3)));
+  const fetchNeighbors = input.provider.bidirectionalNeighbors?.bind(input.provider)
+    ?? input.provider.neighbors.bind(input.provider);
   let queryCount = 0;
   let states: PartialState[] = [{
     recordings: [input.start],
@@ -190,7 +189,7 @@ async function buildLayeredBeam(input: {
     const expanded = await Promise.all(expandable.map(async (state) => {
       const recording = state.recordings.at(-1)!;
       try {
-        const rows = await input.provider.neighbors(recording, neighborLimit);
+        const rows = await fetchNeighbors(recording, neighborLimit);
         return { state, rows };
       } catch {
         return { state, rows: [] as GradientRecordingNeighbor[] };
@@ -211,16 +210,21 @@ async function buildLayeredBeam(input: {
       }
     }
 
-    // Keep multiple paths to the same last recording when their used-node sets
-    // differ, but cap duplicates so one popular hub cannot consume the beam.
+    // Diversity matters here: a cost-only beam near Poppy can otherwise spend
+    // every slot on different Poppy recordings before ever exploring outward.
     const perLast = new Map<string, number>();
+    const perArtist = new Map<string, number>();
     states = next
       .sort((a, b) => stateRank(a) - stateRank(b))
       .filter((state) => {
-        const key = state.recordings.at(-1)!.key;
-        const count = perLast.get(key) ?? 0;
-        if (count >= 2) return false;
-        perLast.set(key, count + 1);
+        const last = state.recordings.at(-1)!;
+        const keyCount = perLast.get(last.key) ?? 0;
+        if (keyCount >= 2) return false;
+        const artist = normalizedArtist(last);
+        const artistCount = perArtist.get(artist) ?? 0;
+        if (artistCount >= 3) return false;
+        perLast.set(last.key, keyCount + 1);
+        perArtist.set(artist, artistCount + 1);
         return true;
       })
       .slice(0, beamWidth);
@@ -235,13 +239,6 @@ function reverseBackwardState(state: PartialState) {
   return { recordings, edges };
 }
 
-/**
- * Search the recording graph for exactly N tracks, rather than first finding a
- * cheapest arbitrary-length path and trying to massage it afterward. The path
- * is built as two bounded beams joined by one validated point edge, which keeps
- * provider work bounded while making the requested hop count a first-class
- * constraint.
- */
 export async function searchBalancedFixedHopPath(
   start: GradientRecording,
   end: GradientRecording,
@@ -302,7 +299,7 @@ export async function searchBalancedFixedHopPath(
       if (edges.length !== totalEdges) continue;
 
       const repeatedArtistPenalty = leftState.repeatedArtistPenalty + rightState.repeatedArtistPenalty
-        + (normalizedArtist(leftLast) === normalizedArtist(rightLast) ? 0.08 : 0);
+        + (normalizedArtist(leftLast) === normalizedArtist(rightLast) ? 0.18 : 0);
       const familiarityPenalty = leftState.familiarityPenalty + rightState.familiarityPenalty;
       const rank = completeRank(edges, familiarityPenalty, repeatedArtistPenalty);
       const path: GradientRecordingPath = {
