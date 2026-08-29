@@ -210,8 +210,6 @@ async function buildLayeredBeam(input: {
       }
     }
 
-    // Diversity matters here: a cost-only beam near Poppy can otherwise spend
-    // every slot on different Poppy recordings before ever exploring outward.
     const perLast = new Map<string, number>();
     const perArtist = new Map<string, number>();
     states = next
@@ -256,25 +254,34 @@ export async function searchBalancedFixedHopPath(
   const rightBudget = Math.max(1, maxQueries - leftBudget);
 
   const [left, right] = await Promise.all([
-    buildLayeredBeam({
-      start,
-      depth: leftDepth,
-      totalEdges,
-      reverse: false,
-      provider,
-      options,
-      queryBudget: leftBudget,
-    }),
-    buildLayeredBeam({
-      start: end,
-      depth: rightDepth,
-      totalEdges,
-      reverse: true,
-      provider,
-      options,
-      queryBudget: rightBudget,
-    }),
+    buildLayeredBeam({ start, depth: leftDepth, totalEdges, reverse: false, provider, options, queryBudget: leftBudget }),
+    buildLayeredBeam({ start: end, depth: rightDepth, totalEdges, reverse: true, provider, options, queryBudget: rightBudget }),
   ]);
+
+  let queryCount = left.queryCount + right.queryCount;
+
+  // The last layer on each side has been discovered as neighbors but has not
+  // itself necessarily been expanded. A pure point-cache join therefore misses
+  // legitimate bridges on a cold graph. Spend whatever exact-hop budget remains
+  // expanding the best left-side terminal states once, so their edges to the
+  // right terminal layer are actually observed and validated before joining.
+  const remainingJoinQueries = Math.max(0, maxQueries - queryCount);
+  if (remainingJoinQueries && left.states.length && right.states.length) {
+    const rightKeys = new Set(right.states.map((state) => state.recordings.at(-1)!.key));
+    const fetchNeighbors = provider.bidirectionalNeighbors?.bind(provider) ?? provider.neighbors.bind(provider);
+    const joinSources = [...left.states]
+      .sort((a, b) => stateRank(a) - stateRank(b))
+      .slice(0, remainingJoinQueries);
+    await Promise.all(joinSources.map(async (state) => {
+      try {
+        const rows = await fetchNeighbors(state.recordings.at(-1)!, Math.max(24, Math.min(64, options.neighborLimit ?? 48)));
+        // Touching matching rows is enough: the cache-first provider persists
+        // them, and lookupEdge below applies the validated point-edge policy.
+        rows.some((row) => rightKeys.has(row.key));
+      } catch { /* bounded join discovery is best-effort */ }
+    }));
+    queryCount += joinSources.length;
+  }
 
   let best: { path: GradientRecordingPath; rank: number } | null = null;
   let candidatesEvaluated = 0;
@@ -306,7 +313,7 @@ export async function searchBalancedFixedHopPath(
         recordings,
         edges,
         cost: edges.reduce((sum, edge) => sum + edgeCost(edge.similarity, edge.confidence), 0),
-        queryCount: left.queryCount + right.queryCount,
+        queryCount,
         nodesVisited: left.states.length + right.states.length,
         forwardFrontierSize: left.states.length,
         backwardFrontierSize: right.states.length,
@@ -316,9 +323,5 @@ export async function searchBalancedFixedHopPath(
     }
   }
 
-  return {
-    path: best?.path ?? null,
-    queryCount: left.queryCount + right.queryCount,
-    candidatesEvaluated,
-  };
+  return { path: best?.path ?? null, queryCount, candidatesEvaluated };
 }
