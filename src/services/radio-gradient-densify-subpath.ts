@@ -736,7 +736,12 @@ async function addFixedLengthSpacingRepair(
   const remaining = Math.max(0, totalBudget - result.queryCount);
   if (!remaining) return result;
   const repaired = await repairFixedLengthSpacing(result.path, requestedLength, provider, options, remaining);
-  if (!repaired.queryCount && !repaired.operations.length) return result;
+  // Cached exact-hop minimax can succeed with zero live queries and no local
+  // insert/replace operations. Treat a changed recording sequence as success;
+  // the previous queryCount/operations gate discarded that accepted path.
+  const pathChanged = repaired.path.recordings.length !== result.path.recordings.length
+    || repaired.path.recordings.some((row, index) => row.key !== result.path.recordings[index]?.key);
+  if (!pathChanged) return result;
   return {
     path: repaired.path,
     positioned: positionGradientRecordingPath(repaired.path),
