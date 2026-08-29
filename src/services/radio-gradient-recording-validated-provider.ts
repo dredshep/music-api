@@ -1,3 +1,4 @@
+import { getDb } from "../db/database";
 import type {
   GradientRecordingNeighbor,
   GradientRecordingNeighborProvider,
@@ -40,36 +41,45 @@ export function createValidatedGradientRecordingProvider(): ValidatedGradientRec
   let catastrophicRejectedEdges = 0;
   const catastrophicReasons: Record<string, number> = {};
 
-  const validateRows = async (source: GradientRecording, rows: GradientRecordingNeighbor[], limit: number) => {
+  const validateRow = (
+    source: { artist: string; title: string },
+    row: GradientRecordingNeighbor,
+  ): GradientRecordingNeighbor | null => {
+    acousticAssessments++;
+    let assessment;
+    const startedAt = performance.now();
+    try {
+      assessment = assessCachedAcousticTransition(source, row);
+    } catch {
+      assessment = null;
+    } finally {
+      acousticValidationMs += performance.now() - startedAt;
+    }
+    if (assessment?.evidenceCount) acousticEvidenceEdges++;
+    if (assessment?.catastrophic) {
+      catastrophicRejectedEdges++;
+      for (const reason of assessment.reasons) catastrophicReasons[reason] = (catastrophicReasons[reason] ?? 0) + 1;
+      return null;
+    }
+
+    let confidence = row.confidence ?? 0.75;
+    if (assessment && assessment.evidenceCount >= 3 && assessment.score != null) {
+      if (assessment.score < 0.35) {
+        confidence *= clamp(assessment.score / 0.35, 0.35, 1);
+        acousticPenaltyEdges++;
+      } else if (assessment.score >= 0.72) {
+        confidence = clamp(confidence + 0.06, 0.05, 1);
+      }
+    }
+    return { ...row, confidence };
+  };
+
+  const validateRows = (source: { artist: string; title: string }, rows: GradientRecordingNeighbor[], limit: number) => {
     const accepted: GradientRecordingNeighbor[] = [];
     for (const row of rows) {
-      acousticAssessments++;
-      let assessment;
-      const startedAt = performance.now();
-      try {
-        assessment = assessCachedAcousticTransition(source, row);
-      } catch {
-        assessment = null;
-      } finally {
-        acousticValidationMs += performance.now() - startedAt;
-      }
-      if (assessment?.evidenceCount) acousticEvidenceEdges++;
-      if (assessment?.catastrophic) {
-        catastrophicRejectedEdges++;
-        for (const reason of assessment.reasons) catastrophicReasons[reason] = (catastrophicReasons[reason] ?? 0) + 1;
-        continue;
-      }
-
-      let confidence = row.confidence ?? 0.75;
-      if (assessment && assessment.evidenceCount >= 3 && assessment.score != null) {
-        if (assessment.score < 0.35) {
-          confidence *= clamp(assessment.score / 0.35, 0.35, 1);
-          acousticPenaltyEdges++;
-        } else if (assessment.score >= 0.72) {
-          confidence = clamp(confidence + 0.06, 0.05, 1);
-        }
-      }
-      accepted.push({ ...row, confidence });
+      const validated = validateRow(source, row);
+      if (!validated) continue;
+      accepted.push(validated);
       if (accepted.length >= limit) break;
     }
     return accepted;
@@ -85,7 +95,13 @@ export function createValidatedGradientRecordingProvider(): ValidatedGradientRec
       return validateRows(source, rows, limit);
     },
     lookupEdge(sourceKey, targetKey) {
-      return base.lookupEdge(sourceKey, targetKey);
+      const row = base.lookupEdge(sourceKey, targetKey);
+      if (!row) return null;
+      const source = getDb().query<{ artist: string; title: string }, [string]>(
+        "SELECT artist,title FROM recording_similarity_nodes WHERE canonical_key=?",
+      ).get(sourceKey);
+      if (!source) return null;
+      return validateRow(source, row);
     },
     diagnostics() {
       return {
