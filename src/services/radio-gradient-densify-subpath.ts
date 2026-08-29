@@ -1,4 +1,5 @@
 import { normalizeForComparison } from "../domain/normalization";
+import { searchBalancedFixedHopPath } from "./radio-gradient-balanced-hop-search";
 import {
   densifyGradientRecordingPath,
   gradientFamiliarityTarget,
@@ -54,9 +55,9 @@ export function gradientMaxEdgeShare(path: GradientRecordingPath) {
 function spacingRepairThreshold(path: GradientRecordingPath) {
   const ideal = gradientSpacingProfile(path).idealShare;
   // Fixed-length routes should spend their slots across the journey. For ten
-  // tracks the natural step is 1/9 ~= 11.1%; trigger repair around 19.4%
-  // rather than tolerating a single transition consuming ~30% of the route.
-  return Math.max(0.10, Math.min(0.28, ideal * 1.75));
+  // tracks the natural step is 1/9 ~= 11.1%; start repairing near ~17.8% so
+  // 15-17% remains plausible variation but 20%+ transitions are suspect.
+  return Math.max(0.095, Math.min(0.26, ideal * 1.6));
 }
 
 function worstGap(path: GradientRecordingPath) {
@@ -395,8 +396,6 @@ async function findBalancedGapNodeReplacement(
       const candidate = withPathCost({ ...path, recordings, edges });
       const after = gradientSpacingProfile(candidate);
 
-      // Prevent denominator games: the actual worst transition cost must fall,
-      // not merely its percentage after making other parts of the route worse.
       if (after.maxCost >= before.maxCost * 0.96) continue;
       if (after.maxShare >= before.maxShare - 0.005) continue;
       if (after.imbalance >= before.imbalance) continue;
@@ -415,13 +414,6 @@ type AlternateGapPathResult = {
   queryCount: number;
 };
 
-/**
- * The cheap one/two-interior spacing probes can miss a real bridge when the
- * collaborative graph only connects the weak edge after three or four hops.
- * Force a small bidirectional recording search away from the existing direct
- * edge, block recordings already used elsewhere in the route, and only accept
- * an alternate whose worst transition is materially better than the cliff.
- */
 async function findAlternateGapPath(
   gap: GradientRecordingPath,
   fullPath: GradientRecordingPath,
@@ -503,15 +495,6 @@ type SpacingRepairResult = {
   queryCount: number;
 };
 
-/**
- * Fixed-length route resampling. Edge costs should roughly share the journey:
- * ten tracks imply nine transitions, so the natural step is about 11% each.
- * First try a one-for-one interior-node replacement around the dominant cliff;
- * if that fails, temporarily insert a validated subpath and reclaim slots using
- * validated skip edges. Acceptance requires the absolute worst transition cost
- * AND the normalized spacing distribution to improve, preventing denominator
- * inflation from masquerading as a smoother route.
- */
 async function repairFixedLengthSpacing(
   original: GradientRecordingPath,
   requestedLength: number,
@@ -530,6 +513,50 @@ async function repairFixedLengthSpacing(
   let current = original;
   let queryCount = 0;
   const operations: GradientDensificationOperation[] = [];
+
+  // First solve the problem we actually have: exactly N tracks means exactly
+  // N-1 musical transitions. Search that layered state space directly instead
+  // of assuming the arbitrary-length cheapest path is the right skeleton.
+  const exactHopBudget = Math.min(44, Math.floor(maxQueries * 0.55));
+  if (exactHopBudget >= 12 && provider.lookupEdge) {
+    const balanced = await searchBalancedFixedHopPath(
+      original.recordings[0]!,
+      original.recordings.at(-1)!,
+      provider,
+      {
+        requestedLength,
+        maxQueries: exactHopBudget,
+        neighborLimit: options.neighborLimit,
+        beamWidth: 18,
+        minSimilarity: Math.min(0.10, options.minBridgeSimilarity ?? 0.12),
+        endpointArtists: options.endpointArtists,
+        familiarity: options.familiarity,
+      },
+    );
+    queryCount += balanced.queryCount;
+    if (balanced.path) {
+      const before = gradientSpacingProfile(original);
+      const after = gradientSpacingProfile(balanced.path);
+      const accepted = after.maxCost < before.maxCost * 0.96
+        && after.maxShare < before.maxShare - 0.01
+        && after.imbalance < before.imbalance;
+      console.log(JSON.stringify({
+        level: "debug",
+        event: "spacing_repair_exact_hop",
+        accepted,
+        candidatesEvaluated: balanced.candidatesEvaluated,
+        queries: balanced.queryCount,
+        maxShareBefore: before.maxShare,
+        maxShareAfter: after.maxShare,
+        maxCostBefore: before.maxCost,
+        maxCostAfter: after.maxCost,
+        imbalanceBefore: before.imbalance,
+        imbalanceAfter: after.imbalance,
+        idealShare: before.idealShare,
+      }));
+      if (accepted) current = balanced.path;
+    }
+  }
 
   for (let attempt = 0; attempt < 4 && queryCount < maxQueries; attempt++) {
     const worst = worstGap(current);
@@ -661,9 +688,6 @@ async function repairFixedLengthSpacing(
       provider,
       options,
       maxQueries - queryCount,
-      // Only inserted bridge nodes and true segment endpoints are protected.
-      // Incidental nodes that happened to form the old cliff may be removed if
-      // a real validated skip edge makes the route smoother.
       new Set([...insertedKeys]),
     );
     if (!compression) break;
@@ -722,12 +746,6 @@ async function addFixedLengthSpacingRepair(
   };
 }
 
-/**
- * Normal densification prefers a single bottleneck-safe common neighbor. If it
- * exhausts that option, probe a few weak gaps for a bounded C→D connector and
- * then resume normal densification. `maxQueries` is a hard total budget across
- * all phases, including fixed-length spacing repair.
- */
 export async function densifyGradientRecordingPathWithSubpathFallback(
   original: GradientRecordingPath,
   requestedLength: number,
