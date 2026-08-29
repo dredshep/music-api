@@ -1,4 +1,5 @@
 import { normalizeForComparison } from "../domain/normalization";
+import { searchBalancedFixedHopPath } from "./radio-gradient-balanced-hop-search";
 import {
   densifyGradientRecordingPath,
   gradientFamiliarityTarget,
@@ -27,11 +28,36 @@ function edgeCost(edge: GradientRecordingPathEdge) {
   return gradientRecordingEdgeCost(edge.similarity, edge.confidence);
 }
 
-export function gradientMaxEdgeShare(path: GradientRecordingPath) {
-  if (!path.edges.length) return 0;
+export function gradientSpacingProfile(path: GradientRecordingPath) {
+  if (!path.edges.length) {
+    return { idealShare: 0, maxShare: 0, maxCost: 0, imbalance: 0, shares: [] as number[] };
+  }
   const costs = path.edges.map(edgeCost);
   const total = Math.max(0.000001, costs.reduce((sum, value) => sum + value, 0));
-  return Math.max(...costs.map((value) => value / total));
+  const shares = costs.map((value) => value / total);
+  const idealShare = 1 / path.edges.length;
+  const imbalance = shares.reduce((sum, share) => sum + Math.abs(share - idealShare), 0)
+    / path.edges.length
+    / idealShare;
+  return {
+    idealShare,
+    maxShare: Math.max(...shares),
+    maxCost: Math.max(...costs),
+    imbalance,
+    shares,
+  };
+}
+
+export function gradientMaxEdgeShare(path: GradientRecordingPath) {
+  return gradientSpacingProfile(path).maxShare;
+}
+
+function spacingRepairThreshold(path: GradientRecordingPath) {
+  const ideal = gradientSpacingProfile(path).idealShare;
+  // Fixed-length routes should spend their slots across the journey. For ten
+  // tracks the natural step is 1/9 ~= 11.1%; start repairing near ~17.8% so
+  // 15-17% remains plausible variation but 20%+ transitions are suspect.
+  return Math.max(0.095, Math.min(0.26, ideal * 1.6));
 }
 
 function worstGap(path: GradientRecordingPath) {
@@ -42,7 +68,7 @@ function worstGap(path: GradientRecordingPath) {
   for (let i = 1; i < costs.length; i++) {
     if (costs[i]! > costs[index]!) index = i;
   }
-  return { index, share: costs[index]! / total };
+  return { index, share: costs[index]! / total, cost: costs[index]! };
 }
 
 function withPathCost(path: GradientRecordingPath): GradientRecordingPath {
@@ -237,20 +263,15 @@ async function compressFixedLengthBalanced(
     }
 
     let best: { index: number; edge: GradientRecordingPathEdge; score: number } | null = null;
-    const compressionCandidates: Array<{ index: number; current: string; prev: string; next: string; matchFound: boolean; matchSim?: number }> = [];
     for (let index = 1; index < recordings.length - 1; index++) {
       const current = recordings[index]!;
       if (protectedSet.has(current.key)) continue;
       const prev = recordings[index - 1]!;
       const next = recordings[index + 1]!;
       const rows = await neighbors(prev);
-      if (rows == null) {
-        console.log(JSON.stringify({ level: "debug", event: "compression_budget_exhausted", index, prev: prev.key }));
-        return null;
-      }
+      if (rows == null) return null;
       const match = rows.find((row) => row.key === next.key)
         ?? provider.lookupEdge?.(prev.key, next.key) ?? null;
-      compressionCandidates.push({ index, current: current.key, prev: prev.key, next: next.key, matchFound: !!match, matchSim: match?.similarity });
       if (!match || match.similarity < 0.08) continue;
 
       const skipEdge: GradientRecordingPathEdge = {
@@ -271,10 +292,7 @@ async function compressFixedLengthBalanced(
       if (!best || score < best.score) best = { index, edge: skipEdge, score };
     }
 
-    if (!best) {
-      console.log(JSON.stringify({ level: "debug", event: "compression_no_candidate", candidates: compressionCandidates }));
-      return null;
-    }
+    if (!best) return null;
     const [removedRecording] = recordings.splice(best.index, 1);
     edges.splice(best.index - 1, 2, best.edge);
     if (removedRecording) removed.push(removedRecording);
@@ -287,18 +305,115 @@ async function compressFixedLengthBalanced(
   };
 }
 
+type BalancedReplacementResult = {
+  path: GradientRecordingPath | null;
+  queryCount: number;
+  removed: GradientRecording | null;
+  inserted: GradientRecording | null;
+};
+
+/**
+ * Before growing an exact-length route, try a one-for-one replacement around
+ * the dominant cliff. Interior route nodes are not user constraints, so a
+ * recording such as Psychosocial may be replaced when another real recording
+ * connects both adjacent sides more evenly. Segment endpoints remain sacred.
+ */
+async function findBalancedGapNodeReplacement(
+  path: GradientRecordingPath,
+  gapIndex: number,
+  provider: GradientRecordingNeighborProvider,
+  options: GradientDensifyOptions,
+  maxQueries: number,
+): Promise<BalancedReplacementResult> {
+  if (maxQueries < 2 || path.recordings.length < 4) {
+    return { path: null, queryCount: 0, removed: null, inserted: null };
+  }
+  const before = gradientSpacingProfile(path);
+  const minBridge = clamp(options.minBridgeSimilarity ?? 0.12, 0.01, 0.95);
+  const neighborLimit = Math.max(24, Math.min(64, options.neighborLimit ?? 48));
+  const used = new Set(path.recordings.map((row) => row.key));
+  const biNeighbors = provider.bidirectionalNeighbors?.bind(provider);
+  const cache = new Map<string, GradientRecordingNeighbor[]>();
+  let queryCount = 0;
+
+  const neighbors = async (recording: GradientRecording) => {
+    const cached = cache.get(recording.key);
+    if (cached) return cached;
+    if (queryCount >= maxQueries) return [] as GradientRecordingNeighbor[];
+    queryCount++;
+    const rows = await (biNeighbors?.(recording, neighborLimit) ?? provider.neighbors(recording, neighborLimit))
+      .catch(() => [] as GradientRecordingNeighbor[]);
+    cache.set(recording.key, rows);
+    return rows;
+  };
+
+  let best: { path: GradientRecordingPath; removed: GradientRecording; inserted: GradientRecording; score: number } | null = null;
+  const candidateIndices = [...new Set([gapIndex, gapIndex + 1])]
+    .filter((index) => index > 0 && index < path.recordings.length - 1);
+
+  for (const index of candidateIndices) {
+    if (queryCount + 2 > maxQueries) break;
+    const prev = path.recordings[index - 1]!;
+    const current = path.recordings[index]!;
+    const next = path.recordings[index + 1]!;
+    const [leftRows, rightRows] = await Promise.all([neighbors(prev), neighbors(next)]);
+    const rightByKey = neighborMap(rightRows);
+    const position = index / Math.max(1, path.recordings.length - 1);
+
+    for (const leftMatch of leftRows) {
+      if (leftMatch.key === current.key || leftMatch.key === prev.key || leftMatch.key === next.key) continue;
+      if (used.has(leftMatch.key)) continue;
+      const rightMatch = rightByKey.get(leftMatch.key);
+      if (!rightMatch) continue;
+      if (leftMatch.similarity < minBridge || rightMatch.similarity < minBridge) continue;
+      if (sameEndpointArtist(leftMatch, position, options.endpointArtists)) continue;
+
+      const replacement: GradientRecording = {
+        key: leftMatch.key,
+        artist: leftMatch.artist,
+        title: leftMatch.title,
+        mbid: leftMatch.mbid ?? rightMatch.mbid ?? null,
+      };
+      const leftEdge: GradientRecordingPathEdge = {
+        from: prev,
+        to: replacement,
+        similarity: leftMatch.similarity,
+        confidence: leftMatch.confidence ?? 0.8,
+        provider: leftMatch.provider ?? "recording_similarity",
+      };
+      const rightEdge: GradientRecordingPathEdge = {
+        from: replacement,
+        to: next,
+        similarity: rightMatch.similarity,
+        confidence: rightMatch.confidence ?? 0.8,
+        provider: rightMatch.provider ?? "recording_similarity",
+      };
+      const recordings = [...path.recordings];
+      const edges = [...path.edges];
+      recordings[index] = replacement;
+      edges[index - 1] = leftEdge;
+      edges[index] = rightEdge;
+      const candidate = withPathCost({ ...path, recordings, edges });
+      const after = gradientSpacingProfile(candidate);
+
+      if (after.maxCost >= before.maxCost * 0.96) continue;
+      if (after.maxShare >= before.maxShare - 0.005) continue;
+      if (after.imbalance >= before.imbalance) continue;
+      const score = after.maxShare + after.imbalance * 0.12;
+      if (!best || score < best.score) best = { path: candidate, removed: current, inserted: replacement, score };
+    }
+  }
+
+  return best
+    ? { path: best.path, queryCount, removed: best.removed, inserted: best.inserted }
+    : { path: null, queryCount, removed: null, inserted: null };
+}
+
 type AlternateGapPathResult = {
   path: GradientRecordingPath | null;
   queryCount: number;
 };
 
-/**
- * The cheap one/two-interior spacing probes can miss a real bridge when the
- * collaborative graph only connects the weak edge after three or four hops.
- * Force a small bidirectional recording search away from the existing direct
- * edge, block recordings already used elsewhere in the route, and only accept
- * an alternate whose worst transition is materially better than the cliff.
- */
 async function findAlternateGapPath(
   gap: GradientRecordingPath,
   fullPath: GradientRecordingPath,
@@ -380,13 +495,6 @@ type SpacingRepairResult = {
   queryCount: number;
 };
 
-/**
- * Fixed-length route resampling. If one edge consumes a disproportionate share
- * of total musical-route distance, temporarily insert a validated subpath into
- * that exact gap and reclaim the same number of slots elsewhere through
- * validated skip edges. This lets a 10-track route repair a 14%->50% cliff
- * instead of declaring success merely because it already has 10 nodes.
- */
 async function repairFixedLengthSpacing(
   original: GradientRecordingPath,
   requestedLength: number,
@@ -398,20 +506,88 @@ async function repairFixedLengthSpacing(
     return { path: original, operations: [], queryCount: 0 };
   }
 
-  const threshold = Math.max(0.24, Math.min(0.34, 2.4 / Math.max(4, requestedLength - 1)));
-  if (gradientMaxEdgeShare(original) <= threshold) return { path: original, operations: [], queryCount: 0 };
+  if (gradientMaxEdgeShare(original) <= spacingRepairThreshold(original)) {
+    return { path: original, operations: [], queryCount: 0 };
+  }
 
   let current = original;
   let queryCount = 0;
   const operations: GradientDensificationOperation[] = [];
 
-  for (let attempt = 0; attempt < 2 && queryCount < maxQueries; attempt++) {
+  // First solve the problem we actually have: exactly N tracks means exactly
+  // N-1 musical transitions. Search that layered state space directly instead
+  // of assuming the arbitrary-length cheapest path is the right skeleton.
+  const exactHopBudget = Math.min(44, Math.floor(maxQueries * 0.55));
+  if (exactHopBudget >= 12 && provider.lookupEdge) {
+    const balanced = await searchBalancedFixedHopPath(
+      original.recordings[0]!,
+      original.recordings.at(-1)!,
+      provider,
+      {
+        requestedLength,
+        maxQueries: exactHopBudget,
+        neighborLimit: options.neighborLimit,
+        beamWidth: 18,
+        minSimilarity: Math.min(0.10, options.minBridgeSimilarity ?? 0.12),
+        endpointArtists: options.endpointArtists,
+        familiarity: options.familiarity,
+      },
+    );
+    queryCount += balanced.queryCount;
+    if (balanced.path) {
+      const before = gradientSpacingProfile(original);
+      const after = gradientSpacingProfile(balanced.path);
+      const accepted = after.maxCost < before.maxCost * 0.96
+        && after.maxShare < before.maxShare - 0.01
+        && after.imbalance < before.imbalance;
+      console.log(JSON.stringify({
+        level: "debug",
+        event: "spacing_repair_exact_hop",
+        accepted,
+        candidatesEvaluated: balanced.candidatesEvaluated,
+        queries: balanced.queryCount,
+        maxShareBefore: before.maxShare,
+        maxShareAfter: after.maxShare,
+        maxCostBefore: before.maxCost,
+        maxCostAfter: after.maxCost,
+        imbalanceBefore: before.imbalance,
+        imbalanceAfter: after.imbalance,
+        idealShare: before.idealShare,
+      }));
+      if (accepted) current = balanced.path;
+    }
+  }
+
+  for (let attempt = 0; attempt < 4 && queryCount < maxQueries; attempt++) {
     const worst = worstGap(current);
+    const threshold = spacingRepairThreshold(current);
     if (!worst || worst.share <= threshold) break;
+    const beforeProfile = gradientSpacingProfile(current);
     const gap = makeGapPath(current, worst.index);
     const gapLeft = current.recordings[worst.index]!;
     const gapRight = current.recordings[worst.index + 1]!;
-    console.log(JSON.stringify({ level: "debug", event: "spacing_repair_attempt", attempt, worstIndex: worst.index, worstShare: worst.share, threshold, gapLeft: `${gapLeft.artist} — ${gapLeft.title}`, gapRight: `${gapRight.artist} — ${gapRight.title}`, budgetRemaining: maxQueries - queryCount }));
+    console.log(JSON.stringify({ level: "debug", event: "spacing_repair_attempt", attempt, worstIndex: worst.index, worstShare: worst.share, idealShare: beforeProfile.idealShare, threshold, gapLeft: `${gapLeft.artist} — ${gapLeft.title}`, gapRight: `${gapRight.artist} — ${gapRight.title}`, budgetRemaining: maxQueries - queryCount }));
+
+    const replacementBudget = Math.min(8, maxQueries - queryCount);
+    if (replacementBudget >= 2) {
+      const replacement = await findBalancedGapNodeReplacement(
+        current, worst.index, provider, options, replacementBudget,
+      );
+      queryCount += replacement.queryCount;
+      if (replacement.path) {
+        console.log(JSON.stringify({
+          level: "debug",
+          event: "spacing_repair_node_replaced",
+          removed: replacement.removed ? `${replacement.removed.artist} — ${replacement.removed.title}` : null,
+          inserted: replacement.inserted ? `${replacement.inserted.artist} — ${replacement.inserted.title}` : null,
+          maxShareBefore: beforeProfile.maxShare,
+          maxShareAfter: gradientSpacingProfile(replacement.path).maxShare,
+        }));
+        current = replacement.path;
+        continue;
+      }
+    }
+
     let bridgePath: GradientRecordingPath | null = null;
     let bridgeOperations: GradientDensificationOperation[] = [];
     let insertedKeys = new Set<string>();
@@ -434,9 +610,6 @@ async function repairFixedLengthSpacing(
         bridgeOperations = single.operations;
         insertedKeys = new Set(singleInserted.map((row) => row.key));
         bridgeMethod = "single";
-        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_bridge_found", method: "single", queries: single.queryCount, inserted: singleInserted.map((r) => `${r.artist} — ${r.title}`) }));
-      } else {
-        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_single_failed", queries: single.queryCount, duplicate: hasDuplicate }));
       }
     }
 
@@ -446,7 +619,6 @@ async function repairFixedLengthSpacing(
       queryCount += found.queries;
       if (found.bridge && !routeKeys.has(found.bridge.c.key) && !routeKeys.has(found.bridge.d.key)) {
         bridgeMethod = "two_interior";
-        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_bridge_found", method: "two_interior", queries: found.queries, c: `${found.bridge.c.artist} — ${found.bridge.c.title}`, d: `${found.bridge.d.artist} — ${found.bridge.d.title}`, bottleneck: found.bridge.bottleneck }));
         const left = gap.recordings[0]!;
         const right = gap.recordings[1]!;
         const newEdges = bridgeEdges(left, right, found.bridge);
@@ -487,7 +659,6 @@ async function repairFixedLengthSpacing(
 
     if (!bridgePath && maxQueries - queryCount > 16) {
       const alternateBudget = Math.min(36, maxQueries - queryCount - 16);
-      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_alternate_attempt", budget: alternateBudget, queryCountSoFar: queryCount }));
       const alternate = await findAlternateGapPath(gap, current, provider, options, alternateBudget);
       queryCount += alternate.queryCount;
       if (alternate.path) {
@@ -495,18 +666,10 @@ async function repairFixedLengthSpacing(
         bridgeOperations = alternatePathOperations(alternate.path);
         insertedKeys = new Set(alternate.path.recordings.slice(1, -1).map((row) => row.key));
         bridgeMethod = "alternate_path";
-        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_bridge_found", method: "alternate_path", queries: alternate.queryCount, pathLength: alternate.path.recordings.length, inserted: alternate.path.recordings.slice(1, -1).map((r) => `${r.artist} — ${r.title}`) }));
-      } else {
-        console.log(JSON.stringify({ level: "debug", event: "spacing_repair_alternate_failed", queries: alternate.queryCount }));
       }
-    } else if (!bridgePath) {
-      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_alternate_skipped", budgetRemaining: maxQueries - queryCount, reason: maxQueries - queryCount <= 16 ? "insufficient_budget" : "bridge_already_found" }));
     }
 
-    if (!bridgePath || !insertedKeys.size) {
-      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_no_bridge", queryCount }));
-      break;
-    }
+    if (!bridgePath || !insertedKeys.size) break;
 
     const recordings = [...current.recordings];
     const edges = [...current.edges];
@@ -519,32 +682,39 @@ async function repairFixedLengthSpacing(
       queryCount: current.queryCount + queryCount,
     });
 
-    console.log(JSON.stringify({ level: "debug", event: "spacing_repair_expanding", bridgeMethod, expandedLength: expanded.recordings.length, expandedTracks: expanded.recordings.map((r) => `${r.artist} — ${r.title}`), insertedKeys: [...insertedKeys], protectedKeys: [...insertedKeys, gap.recordings[0]!.key, gap.recordings[1]!.key] }));
-
     const compression = await compressFixedLengthBalanced(
       expanded,
       requestedLength,
       provider,
       options,
       maxQueries - queryCount,
-      new Set([
-        ...insertedKeys,
-        gap.recordings[0]!.key,
-        gap.recordings[1]!.key,
-      ]),
+      new Set([...insertedKeys]),
     );
-    if (!compression) {
-      console.log(JSON.stringify({ level: "debug", event: "spacing_repair_compression_failed", budgetRemaining: maxQueries - queryCount }));
-      break;
-    }
+    if (!compression) break;
     queryCount += compression.queryCount;
 
-    const after = gradientMaxEdgeShare(compression.path);
-    console.log(JSON.stringify({ level: "debug", event: "spacing_repair_result", bridgeMethod, worstShareBefore: worst.share, worstShareAfter: after, threshold, accepted: after < worst.share - 0.01, compressionQueries: compression.queryCount, removedTracks: compression.removed.map((r) => `${r.artist} — ${r.title}`), finalTracks: compression.path.recordings.map((r) => `${r.artist} — ${r.title}`) }));
-    if (after >= worst.share - 0.01) break;
+    const afterProfile = gradientSpacingProfile(compression.path);
+    const accepted = afterProfile.maxCost < beforeProfile.maxCost * 0.96
+      && afterProfile.maxShare < beforeProfile.maxShare - 0.005
+      && afterProfile.imbalance < beforeProfile.imbalance;
+    console.log(JSON.stringify({
+      level: "debug",
+      event: "spacing_repair_result",
+      bridgeMethod,
+      maxShareBefore: beforeProfile.maxShare,
+      maxShareAfter: afterProfile.maxShare,
+      maxCostBefore: beforeProfile.maxCost,
+      maxCostAfter: afterProfile.maxCost,
+      imbalanceBefore: beforeProfile.imbalance,
+      imbalanceAfter: afterProfile.imbalance,
+      idealShare: beforeProfile.idealShare,
+      threshold,
+      accepted,
+      compressionQueries: compression.queryCount,
+      removedTracks: compression.removed.map((r) => `${r.artist} — ${r.title}`),
+    }));
+    if (!accepted) break;
 
-    // Translate the gap-local operation index back to the full route so
-    // diagnostics still identify the repaired transition.
     operations.push(...bridgeOperations.map((operation) => ({
       ...operation,
       gapIndex: worst.index + operation.gapIndex,
@@ -566,7 +736,12 @@ async function addFixedLengthSpacingRepair(
   const remaining = Math.max(0, totalBudget - result.queryCount);
   if (!remaining) return result;
   const repaired = await repairFixedLengthSpacing(result.path, requestedLength, provider, options, remaining);
-  if (!repaired.queryCount && !repaired.operations.length) return result;
+  // Cached exact-hop minimax can succeed with zero live queries and no local
+  // insert/replace operations. Treat a changed recording sequence as success;
+  // the previous queryCount/operations gate discarded that accepted path.
+  const pathChanged = repaired.path.recordings.length !== result.path.recordings.length
+    || repaired.path.recordings.some((row, index) => row.key !== result.path.recordings[index]?.key);
+  if (!pathChanged) return result;
   return {
     path: repaired.path,
     positioned: positionGradientRecordingPath(repaired.path),
@@ -576,12 +751,6 @@ async function addFixedLengthSpacingRepair(
   };
 }
 
-/**
- * Normal densification prefers a single bottleneck-safe common neighbor. If it
- * exhausts that option, probe a few weak gaps for a bounded C→D connector and
- * then resume normal densification. `maxQueries` is a hard total budget across
- * all phases, including fixed-length spacing repair.
- */
 export async function densifyGradientRecordingPathWithSubpathFallback(
   original: GradientRecordingPath,
   requestedLength: number,
