@@ -1,4 +1,5 @@
 import { normalizeForComparison } from "../domain/normalization";
+import { searchCachedBalancedFixedHopPath } from "./radio-gradient-cached-minimax-hop-search";
 import {
   gradientRecordingEdgeCost,
   type GradientRecording,
@@ -164,9 +165,12 @@ async function buildLayeredBeam(input: {
   options: BalancedFixedHopSearchOptions;
   queryBudget: number;
 }) {
-  const neighborLimit = Math.max(8, Math.min(64, input.options.neighborLimit ?? 48));
-  const beamWidth = Math.max(4, Math.min(32, input.options.beamWidth ?? 24));
-  const expandWidth = Math.max(3, Math.min(10, Math.ceil(beamWidth / 3)));
+  // The real graph study found useful bridge edges at bidirectional ranks 40-78.
+  // This is only the cold-cache fallback; the primary cached minimax DP below
+  // traverses the full persisted adjacency without a top-N cutoff.
+  const neighborLimit = Math.max(80, Math.min(100, input.options.neighborLimit ?? 96));
+  const beamWidth = Math.max(4, Math.min(48, input.options.beamWidth ?? 24));
+  const expandWidth = Math.max(3, Math.min(12, Math.ceil(beamWidth / 3)));
   const fetchNeighbors = input.provider.bidirectionalNeighbors?.bind(input.provider)
     ?? input.provider.neighbors.bind(input.provider);
   let queryCount = 0;
@@ -246,6 +250,31 @@ export async function searchBalancedFixedHopPath(
   const requestedLength = Math.max(2, Math.floor(options.requestedLength));
   const totalEdges = requestedLength - 1;
   const maxQueries = Math.max(2, options.maxQueries ?? 48);
+
+  // Prefer the graph we already possess. The production graph research showed
+  // that a smooth 9-edge Poppy→Marduk path is present in cache, but six of its
+  // nine edges are below the normal top-48 neighbor window. Exact-hop minimax DP
+  // over the bounded persisted graph sees those edges without thousands of live
+  // provider calls and directly optimizes the actual bottleneck.
+  try {
+    const cached = searchCachedBalancedFixedHopPath(start, end, {
+      requestedLength,
+      minSimilarity: options.minSimilarity,
+      endpointArtists: options.endpointArtists,
+      familiarity: options.familiarity,
+    });
+    if (cached.path) {
+      return {
+        path: cached.path,
+        queryCount: 0,
+        candidatesEvaluated: cached.candidatesEvaluated,
+      };
+    }
+  } catch {
+    // A missing/oversized cache is not fatal; fall through to bounded online
+    // discovery and then the existing local spacing repair.
+  }
+
   if (!provider.lookupEdge) return { path: null, queryCount: 0, candidatesEvaluated: 0 };
 
   const leftDepth = Math.floor((totalEdges - 1) / 2);
@@ -260,11 +289,6 @@ export async function searchBalancedFixedHopPath(
 
   let queryCount = left.queryCount + right.queryCount;
 
-  // The last layer on each side has been discovered as neighbors but has not
-  // itself necessarily been expanded. A pure point-cache join therefore misses
-  // legitimate bridges on a cold graph. Spend whatever exact-hop budget remains
-  // expanding the best left-side terminal states once, so their edges to the
-  // right terminal layer are actually observed and validated before joining.
   const remainingJoinQueries = Math.max(0, maxQueries - queryCount);
   if (remainingJoinQueries && left.states.length && right.states.length) {
     const rightKeys = new Set(right.states.map((state) => state.recordings.at(-1)!.key));
@@ -274,9 +298,7 @@ export async function searchBalancedFixedHopPath(
       .slice(0, remainingJoinQueries);
     await Promise.all(joinSources.map(async (state) => {
       try {
-        const rows = await fetchNeighbors(state.recordings.at(-1)!, Math.max(24, Math.min(64, options.neighborLimit ?? 48)));
-        // Touching matching rows is enough: the cache-first provider persists
-        // them, and lookupEdge below applies the validated point-edge policy.
+        const rows = await fetchNeighbors(state.recordings.at(-1)!, Math.max(80, Math.min(100, options.neighborLimit ?? 96)));
         rows.some((row) => rightKeys.has(row.key));
       } catch { /* bounded join discovery is best-effort */ }
     }));
