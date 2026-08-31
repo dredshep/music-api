@@ -1,5 +1,5 @@
 import { getGenerationTracks, listGenerations } from "../db/repositories/radio";
-import { normalizeForComparison } from "../domain/normalization";
+import { radioArtistCooldownKey } from "./radio-artist-credit";
 
 export type RadioHistoryPenalties = {
   tracks: Map<string, number>;
@@ -36,8 +36,8 @@ export function buildRadioHistoryPenalties(
       const sequenceDecay = Math.exp(-observed / Math.max(8, horizon / 3));
       const pressure = Math.max(0, Math.min(1, timeDecay * sequenceDecay));
       tracks.set(track.canonical_key, Math.max(tracks.get(track.canonical_key) ?? 0, pressure));
-      const artistKey = normalizeForComparison(track.artist);
-      artists.set(artistKey, Math.max(artists.get(artistKey) ?? 0, pressure * 0.55));
+      const artistKey = radioArtistCooldownKey(track.artist);
+      if (artistKey) artists.set(artistKey, Math.max(artists.get(artistKey) ?? 0, pressure * 0.55));
       observed++;
     }
   }

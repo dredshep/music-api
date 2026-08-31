@@ -149,4 +149,18 @@ describe("validated cached Gradient path", () => {
     expect(path!.recordings.map((row) => row.artist)).toEqual(["A", "C", "B"]);
     expect(path!.edges.some((row) => row.provider === "tempting")).toBe(false);
   });
+
+  test("excludes a noncompliant bridge while preserving hard endpoints", () => {
+    const a = node("A", "a");
+    const b = node("B", "b");
+    const hit = node("Global Hit", "hit");
+    const rare = node("Rare", "rare");
+    edge(a, hit, "cached", 0.95, 0.9);
+    edge(hit, b, "cached", 0.95, 0.9);
+    edge(a, rare, "cached", 0.7, 0.9);
+    edge(rare, b, "cached", 0.7, 0.9);
+
+    const path = discoverValidatedCachedRecordingPath([a], [b], { excludedKeys: new Set([hit.key, a.key]) });
+    expect(path?.recordings.map((row) => row.artist)).toEqual(["A", "Rare", "B"]);
+  });
 });

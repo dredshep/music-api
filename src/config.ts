@@ -36,6 +36,7 @@ const configSchema = z.object({
   CATALOG_CACHE_HOURS: z.coerce.number().default(24),
   ARTIST_CACHE_DAYS: z.coerce.number().default(30),
   LIBRARY_CACHE_MINUTES: z.coerce.number().default(10),
+  LIBRARY_SNAPSHOT_TTL_HOURS: z.coerce.number().default(24),
   /** Host path to the music library root, mounted read-only for disk usage stats. */
   LIBRARY_MUSIC_PATH: z.string().default(""),
   LIBRARY_DISK_CACHE_MINUTES: z.coerce.number().default(60),

@@ -1,4 +1,5 @@
 import { getDb } from "../db/database";
+import { normalizeForComparison } from "../domain/normalization";
 import { assessCachedAcousticTransition } from "./radio-transition-quality";
 import {
   gradientRecording,
@@ -30,6 +31,11 @@ type CachedNeighbor = {
 export type ValidatedCachedPathOptions = {
   maxExpanded?: number;
   neighborLimit?: number;
+  excludedKeys?: Set<string>;
+  popularityBias?: number;
+  releaseAgeBias?: number;
+  endpointArtists?: [string, string] | null;
+  maxNeighborsPerArtist?: number;
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -89,6 +95,7 @@ export function discoverValidatedCachedRecordingPath(
   const neighborLimit = Math.max(4, Math.min(100, options.neighborLimit ?? 40));
   const supplied = new Map([...starts, ...ends].map((row) => [row.key, row]));
   const endKeys = new Set(ends.map((row) => row.key));
+  const endpointKeys = new Set([...starts, ...ends].map((row) => row.key));
   const overlap = starts.find((row) => endKeys.has(row.key));
   if (overlap) {
     return {
@@ -102,6 +109,33 @@ export function discoverValidatedCachedRecordingPath(
       intersection: overlap.key,
     };
   }
+
+  const popBias = options.popularityBias ?? 0;
+  const wantsRarity = popBias < -0.3;
+  const endpointArtistNorms = new Set(
+    (options.endpointArtists ?? []).map(normalizeForComparison),
+  );
+  const maxNeighborsPerArtist = options.maxNeighborsPerArtist ?? (wantsRarity ? 4 : undefined);
+
+  const degreeQuery = db.prepare(
+    `SELECT (SELECT COUNT(*) FROM recording_similarity_edges WHERE source_key = ?1)
+          + (SELECT COUNT(*) FROM recording_similarity_edges WHERE target_key = ?1)`,
+  );
+  const degreeCache = new Map<string, number>();
+  const nodeDegree = (key: string): number => {
+    const cached = degreeCache.get(key);
+    if (cached !== undefined) return cached;
+    const row = degreeQuery.get(key) as { [key: string]: number } | undefined;
+    const degree = row ? Object.values(row)[0] ?? 0 : 0;
+    degreeCache.set(key, degree);
+    return degree;
+  };
+  const hubPenalty = (key: string): number => {
+    if (!wantsRarity || endpointKeys.has(key)) return 0;
+    const degree = nodeDegree(key);
+    const normalized = Math.max(0, (degree - 60) / 160);
+    return Math.abs(popBias) * normalized * 3.5;
+  };
 
   const outgoing = db.prepare(`SELECT
       e.target_key AS neighbor_key,
@@ -149,6 +183,7 @@ export function discoverValidatedCachedRecordingPath(
 
     const accepted: CachedNeighbor[] = [];
     for (const [neighborKey, evidenceRows] of grouped) {
+      if (options.excludedKeys?.has(neighborKey) && !endpointKeys.has(neighborKey)) continue;
       const first = evidenceRows[0]!;
       const target = loadNode(neighborKey)
         ?? gradientRecording(first.artist, first.title, first.recording_mbid);
@@ -183,8 +218,21 @@ export function discoverValidatedCachedRecordingPath(
       });
     }
 
+    const artistCountMap = new Map<string, number>();
     return accepted
       .sort((a, b) => strength(b.similarity, b.confidence) - strength(a.similarity, a.confidence))
+      .filter((neighbor) => {
+        if (!endpointArtistNorms.size) return true;
+        if (endpointKeys.has(neighbor.recording.key)) return true;
+        return !endpointArtistNorms.has(normalizeForComparison(neighbor.recording.artist));
+      })
+      .filter((neighbor) => {
+        if (!maxNeighborsPerArtist) return true;
+        const norm = normalizeForComparison(neighbor.recording.artist);
+        const count = (artistCountMap.get(norm) ?? 0) + 1;
+        artistCountMap.set(norm, count);
+        return count <= maxNeighborsPerArtist;
+      })
       .slice(0, neighborLimit);
   };
 
@@ -202,6 +250,7 @@ export function discoverValidatedCachedRecordingPath(
   let reachedEnd: string | null = null;
   while (heap.length && expanded.size < maxExpanded) {
     const current = heapPop(heap)!;
+    if (options.excludedKeys?.has(current.key) && !endpointKeys.has(current.key)) continue;
     if (expanded.has(current.key)) continue;
     if (current.cost > (distances.get(current.key) ?? Infinity) + 1e-9) continue;
     const source = loadNode(current.key);
@@ -215,7 +264,8 @@ export function discoverValidatedCachedRecordingPath(
     for (const neighbor of loadNeighbors(source)) {
       if (expanded.has(neighbor.recording.key)) continue;
       const edgeCost = gradientRecordingEdgeCost(neighbor.similarity, neighbor.confidence);
-      const candidateCost = current.cost + edgeCost;
+      const penalty = hubPenalty(neighbor.recording.key);
+      const candidateCost = current.cost + edgeCost + penalty;
       if (candidateCost + 1e-9 >= (distances.get(neighbor.recording.key) ?? Infinity)) continue;
       distances.set(neighbor.recording.key, candidateCost);
       parents.set(neighbor.recording.key, {

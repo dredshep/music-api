@@ -162,4 +162,43 @@ describe("Radio DJ sequencer", () => {
       expect(Math.abs(trajectory - index / 5)).toBeLessThanOrEqual(0.4);
     }
   });
+
+  test("does not clump the same primary artist when alternatives exist", () => {
+    const station = createStation({
+      name: "DJ spacing",
+      seeds: [{ type: "artist", artist: "Draconian", label: "Draconian" }],
+      settings: {
+        length: 6,
+        djFlow: 1,
+        artistCooldown: 5,
+        repeatStrength: 0.8,
+        djWeights: { tempo: 1, key: 0, energy: 0, timbre: 0, introOutro: 0, semantic: 0.15, artistSpacing: 0.45 },
+      },
+    });
+    const generation = createGeneration({
+      stationId: station.id,
+      requestedLength: 6,
+      generatorVersion: "test",
+      randomSeed: "spacing",
+      settingsSnapshot: parseRadioSettings(station.settings_json),
+    });
+    replaceGenerationTracks(generation.id, [
+      { ...makeTrack("text:draconian|a", "A", 0), artist: "Draconian" },
+      { ...makeTrack("text:draconian|b", "B", 1), artist: "Draconian feat. Guest" },
+      { ...makeTrack("text:other1|c", "C", 2), artist: "Other1" },
+      { ...makeTrack("text:other2|d", "D", 3), artist: "Other2" },
+      { ...makeTrack("text:other3|e", "E", 4), artist: "Other3" },
+      { ...makeTrack("text:other4|f", "F", 5), artist: "Other4" },
+    ]);
+    // Compatible tempos across the board so spacing, not BPM, decides.
+    ["text:draconian|a", "text:draconian|b", "text:other1|c", "text:other2|d", "text:other3|e", "text:other4|f"]
+      .forEach((key) => addTempo(key, 120));
+
+    resequenceRadioGeneration(generation.id);
+    const artists = getGenerationTracks(generation.id).map((track) => track.artist);
+    const primary = artists.map((artist) => artist.replace(/\s+feat\..*$/i, "").trim().toLowerCase());
+    for (let i = 1; i < primary.length; i++) {
+      expect(primary[i]).not.toBe(primary[i - 1]);
+    }
+  });
 });

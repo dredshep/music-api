@@ -195,6 +195,8 @@ radioRoutes.post("/radio/generations/:id/resolve", async (c) => {
     isrc: z.string().nullable().optional(),
     album: z.string().nullable().optional(),
     durationMs: z.number().int().nonnegative().nullable().optional(),
+    popularity: z.number().min(0).max(1).nullable().optional(),
+    releaseYear: z.number().int().min(1900).max(2200).nullable().optional(),
   })).max(500) }).parse(await c.req.json());
   const generation = resolveGenerationTracks(c.req.param("id"), body.resolutions);
   if (!generation) throw new AppError("RADIO_GENERATION_NOT_FOUND", "Radio generation not found", 404);

@@ -8,6 +8,8 @@ import {
 } from "../db/repositories/radio";
 import { normalizeForComparison } from "../domain/normalization";
 import { assessAcousticTransition } from "./radio-transition-quality";
+import { radioArtistCooldownKey } from "./radio-artist-credit";
+import { artistWithinCooldown } from "./radio-sequence";
 
 interface AnalysisRow {
   bpm: number | null;
@@ -146,11 +148,15 @@ export function introOutroCompatibility(outro?: Record<string, number>, intro?: 
  * Semantic evidence is independent of Gradient route placement. A planner
  * coordinate is a constraint/result, not evidence that two recordings sound or
  * mean similar things; counting it here would be circular.
+ *
+ * Same-artist / same-album adjacency is handled as spacing pressure, not as a
+ * semantic reward — rewarding it here was undoing artistCooldown.
  */
 function semanticCompatibility(a: RadioTrackRow, b: RadioTrackRow, af: TrackFeatures, bf: TrackFeatures): number | null {
-  if (a.album && b.album && normalizeForComparison(a.album) === normalizeForComparison(b.album)) return 1;
+  const sameArtist = radioArtistCooldownKey(a.artist) === radioArtistCooldownKey(b.artist);
+  if (sameArtist) return null;
+  if (a.album && b.album && normalizeForComparison(a.album) === normalizeForComparison(b.album)) return 0.9;
   if (af.genreSeed && bf.genreSeed && normalizeForComparison(af.genreSeed) === normalizeForComparison(bf.genreSeed)) return 0.95;
-  if (normalizeForComparison(a.artist) === normalizeForComparison(b.artist)) return 0.82;
   return null;
 }
 
@@ -181,8 +187,8 @@ export function radioTransitionScore(
   }
   let result = activeWeight > 0 ? weightedTotal / activeWeight : 0;
 
-  if (normalizeForComparison(a.artist) === normalizeForComparison(b.artist)) {
-    result -= (settings.djWeights.artistSpacing ?? 0) * settings.repeatStrength;
+  if (radioArtistCooldownKey(a.artist) === radioArtistCooldownKey(b.artist)) {
+    result -= (1.25 + (settings.djWeights.artistSpacing ?? 0)) * settings.repeatStrength;
   }
 
   const acoustic = assessAcousticTransition(af, bf);
@@ -218,28 +224,50 @@ function segmentOrder(
   const remaining = [...segment];
   const ordered: RadioTrackRow[] = [];
   let prev = previous;
+  const artistLast = new Map<string, number>();
+  if (previous) {
+    const key = radioArtistCooldownKey(previous.artist);
+    if (key) artistLast.set(key, segmentStart - 1);
+  }
 
   while (remaining.length) {
-    let bestIndex = 0;
-    let bestScore = -Infinity;
     const absolutePosition = segmentStart + ordered.length;
-    for (let i = 0; i < remaining.length; i++) {
-      const candidate = remaining[i]!;
-      const trajectory = trajectoryScore(candidate, absolutePosition, totalTracks);
-      if (trajectory === -Infinity) continue;
-      let score = radioTransitionScore(prev, candidate, settings, features) + trajectory;
-      if (remaining.length <= 3 && nextLocked) {
-        score += radioTransitionScore(candidate, nextLocked, settings, features) * 0.35;
+    const pick = (allowCooldownViolation: boolean) => {
+      let bestIndex = -1;
+      let bestScore = -Infinity;
+      for (let i = 0; i < remaining.length; i++) {
+        const candidate = remaining[i]!;
+        const artistKey = radioArtistCooldownKey(candidate.artist);
+        const onCooldown = artistWithinCooldown(artistKey, absolutePosition, artistLast, settings.artistCooldown);
+        if (!allowCooldownViolation && onCooldown) continue;
+        const trajectory = trajectoryScore(candidate, absolutePosition, totalTracks);
+        if (trajectory === -Infinity) continue;
+        const last = artistLast.get(artistKey);
+        const gap = last == null ? Number.POSITIVE_INFINITY : absolutePosition - last;
+        let score = radioTransitionScore(prev, candidate, settings, features) + trajectory;
+        if (remaining.length <= 3 && nextLocked) {
+          score += radioTransitionScore(candidate, nextLocked, settings, features) * 0.35;
+        }
+        if (allowCooldownViolation) {
+          score = (Number.isFinite(gap) ? gap : 1000) * 100 + score;
+        }
+        score -= candidate.position * 1e-6;
+        if (score > bestScore) {
+          bestScore = score;
+          bestIndex = i;
+        }
       }
-      score -= candidate.position * 1e-6;
-      if (score > bestScore) {
-        bestScore = score;
-        bestIndex = i;
-      }
-    }
+      return bestIndex;
+    };
+
+    let bestIndex = pick(false);
+    if (bestIndex < 0) bestIndex = pick(true);
+    if (bestIndex < 0) bestIndex = 0;
     const [chosen] = remaining.splice(bestIndex, 1);
     ordered.push(chosen!);
     prev = chosen!;
+    const artistKey = radioArtistCooldownKey(chosen!.artist);
+    if (artistKey) artistLast.set(artistKey, absolutePosition);
   }
 
   for (let pass = 0; pass < 2; pass++) {
@@ -253,6 +281,18 @@ function segmentOrder(
       const beforeTrajectory = trajectoryScore(a, absoluteA, totalTracks) + trajectoryScore(b, absoluteB, totalTracks);
       const afterTrajectory = trajectoryScore(b, absoluteA, totalTracks) + trajectoryScore(a, absoluteB, totalTracks);
       if (afterTrajectory === -Infinity) continue;
+
+      // Don't invent artist clumps the hard cooldown already avoided.
+      if (settings.artistCooldown > 0) {
+        const leftKey = leftContext ? radioArtistCooldownKey(leftContext.artist) : "";
+        const rightKey = rightContext ? radioArtistCooldownKey(rightContext.artist) : "";
+        const aKey = radioArtistCooldownKey(a.artist);
+        const bKey = radioArtistCooldownKey(b.artist);
+        if (leftKey && leftKey === bKey) continue;
+        if (rightKey && rightKey === aKey) continue;
+        if (aKey === bKey) continue;
+      }
+
       const before = radioTransitionScore(leftContext, a, settings, features)
         + radioTransitionScore(a, b, settings, features)
         + (rightContext ? radioTransitionScore(b, rightContext, settings, features) : 0)

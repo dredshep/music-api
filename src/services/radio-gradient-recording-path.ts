@@ -1,5 +1,7 @@
 import { normalizeForComparison } from "../domain/normalization";
 import { isBudgetExhausted, type GradientRouteBudget } from "./radio-gradient-budget";
+import type { RadioSettings } from "../db/repositories/radio";
+import { gradientProfileFit, type GradientTrackProfile } from "./radio-gradient-profile";
 
 export interface GradientRecording {
   key: string;
@@ -77,6 +79,8 @@ export interface GradientPathSearchOptions {
   frontierCap?: number;
   neighborLimit?: number;
   refineQueries?: number;
+  excludedKeys?: Set<string>;
+  maxNeighborsPerArtist?: number;
 }
 
 export interface GradientDensifyOptions {
@@ -86,6 +90,11 @@ export interface GradientDensifyOptions {
   endpointArtists?: [string, string] | null;
   familiarity?: (recording: GradientRecording) => number | null;
   familiarityWeight?: number;
+  familiarityTarget?: number;
+  skipExactHopRebalance?: boolean;
+  maxArtistRepeat?: number;
+  popularityBias?: number;
+  releaseAgeBias?: number;
 }
 
 type GraphEdge = {
@@ -275,9 +284,12 @@ async function expandSide(input: {
   remainingQueries: number;
   seedArtists?: Set<string>;
   depthFirst?: boolean;
+  excludedKeys?: Set<string>;
+  maxNeighborsPerArtist?: number;
 }) {
   const seedArtists = input.seedArtists;
   const depthFirst = input.depthFirst ?? false;
+  const maxPerArtist = input.maxNeighborsPerArtist ?? Infinity;
   const batch = input.frontier
     .filter((state) => !input.expanded.has(state.key))
     .sort((a, b) => {
@@ -310,10 +322,20 @@ async function expandSide(input: {
   const next = input.frontier.filter((state) => !input.expanded.has(state.key));
   for (const { state, neighbors } of rows) {
     const source = input.graph.nodes.get(state.key)!;
+    const perArtistCount = new Map<string, number>();
     for (const raw of neighbors) {
       const target = normalizeRecording(raw);
       if (!target || target.key === source.key) continue;
+      if (input.excludedKeys?.has(target.key)) continue;
       if (!input.graph.nodes.has(target.key) && input.graph.nodes.size >= input.maxNodes) continue;
+
+      if (maxPerArtist < Infinity) {
+        const tgtArtist = keyArtist(target.key);
+        const count = perArtistCount.get(tgtArtist) ?? 0;
+        if (count >= maxPerArtist) continue;
+        perArtistCount.set(tgtArtist, count + 1);
+      }
+
       const similarity = clamp(raw.similarity, 0.01, 1);
       const confidence = clamp(raw.confidence ?? 0.8, 0.05, 1);
       addEdge(input.graph, source, target, similarity, confidence, raw.provider ?? "recording_similarity");
@@ -395,11 +417,13 @@ export async function discoverGradientRecordingPath(
         graph, frontier: forwardFrontier, distances: forwardDistances, parents: forwardParent,
         expanded: forwardExpanded, provider, beam: leftBudget, frontierCap, neighborLimit, maxNodes,
         remainingQueries: leftBudget, seedArtists: forwardSeedArtists, depthFirst: useDepthFirst,
+        excludedKeys: options.excludedKeys, maxNeighborsPerArtist: options.maxNeighborsPerArtist,
       }),
       expandSide({
         graph, frontier: backwardFrontier, distances: backwardDistances, parents: backwardParent,
         expanded: backwardExpanded, provider, beam: rightBudget, frontierCap, neighborLimit, maxNodes,
         remainingQueries: rightBudget, seedArtists: backwardSeedArtists, depthFirst: useDepthFirst,
+        excludedKeys: options.excludedKeys, maxNeighborsPerArtist: options.maxNeighborsPerArtist,
       }),
     ]);
     forwardFrontier = left.frontier;
@@ -480,11 +504,13 @@ export async function searchGradientRecordingPath(
         graph, frontier: forwardFrontier, distances: forwardDistances, parents: forwardParent,
         expanded: forwardExpanded, provider, beam: leftBudget, frontierCap, neighborLimit, maxNodes,
         remainingQueries: leftBudget, seedArtists: forwardSeedArtists, depthFirst: useDepthFirst,
+        excludedKeys: options.excludedKeys, maxNeighborsPerArtist: options.maxNeighborsPerArtist,
       }),
       expandSide({
         graph, frontier: backwardFrontier, distances: backwardDistances, parents: backwardParent,
         expanded: backwardExpanded, provider, beam: rightBudget, frontierCap, neighborLimit, maxNodes,
         remainingQueries: rightBudget, seedArtists: backwardSeedArtists, depthFirst: useDepthFirst,
+        excludedKeys: options.excludedKeys, maxNeighborsPerArtist: options.maxNeighborsPerArtist,
       }),
     ]);
     forwardFrontier = left.frontier;
@@ -513,10 +539,12 @@ function harmonicMean(a: number, b: number) {
   return (2 * a * b) / Math.max(0.000001, a + b);
 }
 
-export function gradientFamiliarityTarget(position: number) {
+export function gradientFamiliarityTarget(position: number, desiredFamiliarity = 0) {
   const t = clamp(position, 0, 1);
-  // U-shaped target: familiar at both ends, deliberately novel in the middle.
-  return Math.pow(Math.abs(t * 2 - 1), 0.72);
+  const desired = clamp(desiredFamiliarity, 0, 1);
+  // Exact endpoint seeds stay anchors; the interior honors the user's chosen
+  // familiarity instead of silently forcing every Gradient into deep discovery.
+  return desired + (1 - desired) * Math.pow(Math.abs(t * 2 - 1), 0.72);
 }
 
 export function positionGradientRecordingPath(path: GradientRecordingPath): PositionedGradientRecording[] {
@@ -561,6 +589,7 @@ export async function refinePathNovelty(
     mandatoryKeys?: Set<string>;
     endpointArtists?: [string, string] | null;
     minTransitionSimilarity?: number;
+    desiredFamiliarity?: number;
   },
 ): Promise<GradientNoveltyRefinementResult> {
   const maxQueries = Math.max(0, options.maxQueries ?? 24);
@@ -604,7 +633,7 @@ export async function refinePathNovelty(
 
     const currentFamiliarity = options.familiarity(rec);
     if (currentFamiliarity == null) continue;
-    const target = gradientFamiliarityTarget(position);
+    const target = gradientFamiliarityTarget(position, options.desiredFamiliarity);
     if (currentFamiliarity <= target + 0.15) continue;
 
     const prev = recordings[i - 1]!;
@@ -633,9 +662,10 @@ export async function refinePathNovelty(
 
       const candidateRec = gradientRecording(leftCandidate.artist, leftCandidate.title, leftCandidate.mbid);
       const candidateFamiliarity = options.familiarity(candidateRec);
-      const familiarityImprovement = candidateFamiliarity != null
-        ? (currentFamiliarity - target) - Math.max(0, candidateFamiliarity - target)
-        : (currentFamiliarity - target) * 0.5;
+      // Unknown is not synonymous with undiscovered. Only explicit user
+      // evidence may claim that a replacement improves discovery compliance.
+      if (candidateFamiliarity == null) continue;
+      const familiarityImprovement = (currentFamiliarity - target) - Math.max(0, candidateFamiliarity - target);
       if (familiarityImprovement <= 0.05) continue;
 
       const bridge = harmonicMean(
@@ -681,6 +711,125 @@ export async function refinePathNovelty(
     path: { ...original, recordings, edges, cost },
     replacements,
     queryCount,
+  };
+}
+
+export async function refinePathPreferences(
+  original: GradientRecordingPath,
+  provider: GradientRecordingNeighborProvider,
+  options: {
+    settings: Pick<RadioSettings, "popularityBias" | "releaseAgeBias">;
+    profile: (recording: GradientRecording) => Promise<GradientTrackProfile>;
+    mandatoryKeys?: Set<string>;
+    endpointArtists?: [string, string] | null;
+    maxQueries?: number;
+    neighborLimit?: number;
+    maxProfilesPerSlot?: number;
+    minTransitionSimilarity?: number;
+  },
+) {
+  const strength = Math.abs(options.settings.popularityBias) + Math.abs(options.settings.releaseAgeBias);
+  if (strength < 0.35 || original.recordings.length < 4) {
+    return { path: original, replacements: 0, queryCount: 0, evaluatedProfiles: 0 };
+  }
+  const recordings = [...original.recordings];
+  const edges = [...original.edges];
+  const mandatory = new Set(options.mandatoryKeys ?? []);
+  mandatory.add(recordings[0]!.key);
+  mandatory.add(recordings.at(-1)!.key);
+  const endpointArtists = new Set((options.endpointArtists ?? []).map(normalizeForComparison));
+  const used = new Set(recordings.map((row) => row.key));
+  const artistCounts = new Map<string, number>();
+  for (const r of recordings) {
+    const a = normalizeForComparison(r.artist);
+    artistCounts.set(a, (artistCounts.get(a) ?? 0) + 1);
+  }
+  const neighborCache = new Map<string, Promise<GradientRecordingNeighbor[]>>();
+  const profileCache = new Map<string, Promise<GradientTrackProfile>>();
+  const maxQueries = Math.max(0, options.maxQueries ?? 24);
+  const neighborLimit = Math.max(8, options.neighborLimit ?? 48);
+  const maxProfiles = Math.max(2, options.maxProfilesPerSlot ?? 8);
+  const minSimilarity = clamp(options.minTransitionSimilarity ?? 0.1, 0.01, 0.95);
+  let queryCount = 0;
+  let evaluatedProfiles = 0;
+  let replacements = 0;
+
+  const neighbors = (recording: GradientRecording) => {
+    const cached = neighborCache.get(recording.key);
+    if (cached) return cached;
+    if (queryCount >= maxQueries) return Promise.resolve([] as GradientRecordingNeighbor[]);
+    queryCount++;
+    const pending = provider.neighbors(recording, neighborLimit).catch(() => [] as GradientRecordingNeighbor[]);
+    neighborCache.set(recording.key, pending);
+    return pending;
+  };
+  const profile = (recording: GradientRecording) => {
+    const cached = profileCache.get(recording.key);
+    if (cached) return cached;
+    evaluatedProfiles++;
+    const pending = options.profile(recording);
+    profileCache.set(recording.key, pending);
+    return pending;
+  };
+
+  for (let index = 1; index < recordings.length - 1; index++) {
+    if (mandatory.has(recordings[index]!.key) || queryCount >= maxQueries) continue;
+    const current = recordings[index]!;
+    const prev = recordings[index - 1]!;
+    const next = recordings[index + 1]!;
+    const [leftRows, rightRows, currentProfile] = await Promise.all([neighbors(prev), neighbors(next), profile(current)]);
+    const right = new Map(rightRows.map((row) => [row.key, row]));
+    const candidates = leftRows.flatMap((left) => {
+      const rightEdge = right.get(left.key);
+      if (!rightEdge || used.has(left.key)) return [];
+      if (left.similarity < minSimilarity || rightEdge.similarity < minSimilarity) return [];
+      const artist = normalizeForComparison(left.artist);
+      const playlistPosition = index / Math.max(1, recordings.length - 1);
+      if (playlistPosition > 0.001 && playlistPosition < 0.999 && endpointArtists.has(artist)) return [];
+      const currentArtist = normalizeForComparison(current.artist);
+      if (artist !== currentArtist && (artistCounts.get(artist) ?? 0) >= 1) return [];
+      const bridge = harmonicMean(left.similarity, rightEdge.similarity);
+      return [{ recording: gradientRecording(left.artist, left.title, left.mbid), left, right: rightEdge, bridge }];
+    }).sort((a, b) => b.bridge - a.bridge).slice(0, maxProfiles);
+    if (!candidates.length) continue;
+    const candidateProfiles = await Promise.all(candidates.map((row) => profile(row.recording)));
+    const currentFit = gradientProfileFit(currentProfile, options.settings);
+    const currentBridge = harmonicMean(edges[index - 1]!.similarity, edges[index]!.similarity);
+    const bridgeFloor = strength >= 1.2 ? 0.35 : strength >= 0.7 ? 0.48 : 0.62;
+    const fitThreshold = strength >= 1.2 ? 0.04 : 0.1;
+    let best: typeof candidates[number] & { fit: number; score: number } | null = null;
+    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex++) {
+      const row = candidates[candidateIndex]!;
+      if (row.bridge < currentBridge * bridgeFloor) continue;
+      const fit = gradientProfileFit(candidateProfiles[candidateIndex]!, options.settings);
+      const improvement = fit - currentFit;
+      if (improvement < fitThreshold) continue;
+      const score = improvement * Math.min(1.8, strength) + row.bridge * 0.18;
+      if (!best || score > best.score) best = { ...row, fit, score };
+    }
+    if (!best) continue;
+    const oldArtist = normalizeForComparison(current.artist);
+    const newArtist = normalizeForComparison(best.recording.artist);
+    artistCounts.set(oldArtist, (artistCounts.get(oldArtist) ?? 1) - 1);
+    artistCounts.set(newArtist, (artistCounts.get(newArtist) ?? 0) + 1);
+    used.delete(current.key);
+    used.add(best.recording.key);
+    recordings[index] = best.recording;
+    edges[index - 1] = {
+      from: prev, to: best.recording, similarity: best.left.similarity,
+      confidence: best.left.confidence ?? 0.8, provider: best.left.provider ?? "recording_similarity",
+    };
+    edges[index] = {
+      from: best.recording, to: next, similarity: best.right.similarity,
+      confidence: best.right.confidence ?? 0.8, provider: best.right.provider ?? "recording_similarity",
+    };
+    replacements++;
+  }
+  return {
+    path: { ...original, recordings, edges, cost: edges.reduce((sum, edge) => sum + gradientRecordingEdgeCost(edge.similarity, edge.confidence), 0) },
+    replacements,
+    queryCount,
+    evaluatedProfiles,
   };
 }
 
@@ -857,7 +1006,7 @@ export async function densifyGradientRecordingPath(
       const leftPosition = positioned[gapIndex]?.routePosition ?? gapIndex / Math.max(1, recordings.length - 1);
       const rightPosition = positioned[gapIndex + 1]?.routePosition ?? (gapIndex + 1) / Math.max(1, recordings.length - 1);
       const midpoint = (leftPosition + rightPosition) / 2;
-      const targetFamiliarity = gradientFamiliarityTarget(midpoint);
+      const targetFamiliarity = gradientFamiliarityTarget(midpoint, options.familiarityTarget);
 
       for (const [candidateKey, left] of leftMap) {
         const right = rightMap.get(candidateKey);
@@ -867,13 +1016,16 @@ export async function densifyGradientRecordingPath(
         const bottleneck = Math.min(clamp(left.similarity, 0, 1), clamp(right.similarity, 0, 1));
         if (bottleneck < minBridgeSimilarity) continue;
         const candidateArtist = normalizeForComparison(candidate.artist);
-        if (options.endpointArtists && midpoint >= 0.22 && midpoint <= 0.78) {
+        if (options.endpointArtists && midpoint > 0.001 && midpoint < 0.999) {
           const [a, b] = options.endpointArtists.map(normalizeForComparison) as [string, string];
           if (candidateArtist === a || candidateArtist === b) continue;
         }
+        const currentArtistCount = artistCounts.get(candidateArtist) ?? 0;
+        const artistRepeatLimit = options.maxArtistRepeat ?? Infinity;
+        if (currentArtistCount >= artistRepeatLimit) continue;
         const familiarityActual = options.familiarity?.(candidate) ?? null;
         const familiarityFit = familiarityActual == null ? 0.5 : 1 - Math.abs(familiarityActual - targetFamiliarity);
-        const repeatPenalty = Math.max(0, (artistCounts.get(candidateArtist) ?? 0) - 0.25) * 0.07;
+        const repeatPenalty = Math.max(0, currentArtistCount - 0.25) * 0.15;
         const bridge = harmonicMean(clamp(left.similarity, 0, 1), clamp(right.similarity, 0, 1));
         const currentWeakness = 1 - (edges[gapIndex]?.similarity ?? 0.5);
         const score = bottleneck * 0.62 + bridge * 0.2 + familiarityFit * familiarityWeight + currentWeakness * 0.08 - repeatPenalty;

@@ -3,8 +3,12 @@ import { z } from "zod";
 import { getConfig } from "../config";
 import { getCache, setCache } from "../db/repositories/cache";
 import { normalizeForComparison } from "../domain/normalization";
-import { matchLibraryTrack } from "../domain/track-ownership";
-import * as navidrome from "../services/navidrome";
+import {
+  getLibraryOwnershipIndex,
+  getLibrarySnapshot,
+  getOrBuildLibrarySnapshot,
+  type LibrarySnapshot,
+} from "../services/library-snapshot";
 
 export const libraryOwnershipRoutes = new Hono();
 
@@ -17,7 +21,8 @@ const trackSchema = z.object({
 });
 
 const bodySchema = z.object({
-  tracks: z.array(trackSchema).min(1).max(100),
+  tracks: z.array(trackSchema).min(1).max(500),
+  refresh_library_snapshot: z.boolean().optional().default(false),
 });
 
 type InputTrack = z.infer<typeof trackSchema>;
@@ -28,6 +33,8 @@ type OwnershipResponse = {
   confidence: number;
   match: {
     navidrome_id: string;
+    navidrome_artist_id: string;
+    navidrome_album_id: string;
     artist: string;
     title: string;
     album: string;
@@ -36,10 +43,11 @@ type OwnershipResponse = {
   } | null;
 };
 
-function cacheKey(track: InputTrack) {
+function cacheKey(track: InputTrack, snapshotVersion: string) {
   const durationBucket = track.duration_ms ? Math.round(track.duration_ms / 5000) : 0;
   return [
-    "lib:track-ownership:v1",
+    "lib:track-ownership:v3",
+    snapshotVersion,
     normalizeForComparison(track.artist),
     normalizeForComparison(track.title),
     normalizeForComparison(track.album ?? ""),
@@ -47,54 +55,20 @@ function cacheKey(track: InputTrack) {
   ].join(":");
 }
 
-function mergeSongs<T extends { id: string }>(...groups: T[][]): T[] {
-  const byId = new Map<string, T>();
-  for (const group of groups) for (const item of group) byId.set(item.id, item);
-  return [...byId.values()];
-}
-
-async function lookupTrack(track: InputTrack): Promise<OwnershipResponse> {
-  const key = cacheKey(track);
+function lookupTrack(track: InputTrack, snapshot: LibrarySnapshot): OwnershipResponse {
+  const key = cacheKey(track, snapshot.version);
   const cached = getCache<OwnershipResponse>(key);
   if (cached) return { ...cached, id: track.id };
 
   try {
-    const first = await navidrome.search3(`${track.artist} ${track.title}`, {
-      artistCount: 0,
-      albumCount: 0,
-      songCount: 25,
-    });
-
-    let songs = first.songs;
-    let result = matchLibraryTrack(
+    const result = getLibraryOwnershipIndex(snapshot).lookup(
       {
         artist: track.artist,
         title: track.title,
         album: track.album,
         durationMs: track.duration_ms,
-      },
-      songs
+      }
     );
-
-    // Navidrome search can occasionally rank a title-only query better than
-    // artist+title. Only pay for the fallback when the first pass is not owned.
-    if (result.status !== "owned") {
-      const fallback = await navidrome.search3(track.title, {
-        artistCount: 0,
-        albumCount: 0,
-        songCount: 50,
-      });
-      songs = mergeSongs(songs, fallback.songs);
-      result = matchLibraryTrack(
-        {
-          artist: track.artist,
-          title: track.title,
-          album: track.album,
-          durationMs: track.duration_ms,
-        },
-        songs
-      );
-    }
 
     const response: OwnershipResponse = {
       id: track.id,
@@ -103,6 +77,8 @@ async function lookupTrack(track: InputTrack): Promise<OwnershipResponse> {
       match: result.match
         ? {
             navidrome_id: result.match.navidromeId,
+            navidrome_artist_id: result.match.artistId,
+            navidrome_album_id: result.match.albumId,
             artist: result.match.artist,
             title: result.match.title,
             album: result.match.album,
@@ -123,28 +99,6 @@ async function lookupTrack(track: InputTrack): Promise<OwnershipResponse> {
   }
 }
 
-async function mapWithConcurrency<T, R>(
-  items: T[],
-  concurrency: number,
-  fn: (item: T) => Promise<R>
-): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let cursor = 0;
-
-  async function worker() {
-    for (;;) {
-      const index = cursor++;
-      if (index >= items.length) return;
-      results[index] = await fn(items[index]!);
-    }
-  }
-
-  await Promise.all(
-    Array.from({ length: Math.min(concurrency, items.length) }, () => worker())
-  );
-  return results;
-}
-
 libraryOwnershipRoutes.post("/library/ownership/tracks", async (c) => {
   const parsed = bodySchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
@@ -160,7 +114,20 @@ libraryOwnershipRoutes.post("/library/ownership/tracks", async (c) => {
     );
   }
 
-  const results = await mapWithConcurrency(parsed.data.tracks, 8, lookupTrack);
+  const previous = getLibrarySnapshot();
+  let snapshot: LibrarySnapshot | null = null;
+  let snapshotError: string | null = null;
+  try {
+    snapshot = await getOrBuildLibrarySnapshot(parsed.data.refresh_library_snapshot);
+    snapshotError = snapshot.lastError;
+  } catch (error) {
+    snapshotError = error instanceof Error ? error.message : String(error);
+    snapshot = previous;
+  }
+
+  const results: OwnershipResponse[] = snapshot
+    ? parsed.data.tracks.map((track) => lookupTrack(track, snapshot!))
+    : parsed.data.tracks.map((track) => ({ id: track.id, status: "unknown" as const, confidence: 0, match: null }));
   const summary = {
     owned: results.filter((r) => r.status === "owned").length,
     uncertain: results.filter((r) => r.status === "uncertain").length,
@@ -168,5 +135,22 @@ libraryOwnershipRoutes.post("/library/ownership/tracks", async (c) => {
     unknown: results.filter((r) => r.status === "unknown").length,
   };
 
-  return c.json({ results, summary });
+  return c.json({
+    results,
+    summary,
+    snapshot_version: snapshot?.version ?? null,
+    snapshot_built_at: snapshot?.builtAt ?? null,
+    snapshot_total: snapshot?.songCount ?? 0,
+    snapshot_stale: snapshot ? snapshot.stale : true,
+    snapshot_rebuild_error: snapshotError,
+    snapshot: snapshot
+      ? {
+          version: snapshot.version,
+          built_at: snapshot.builtAt,
+          total: snapshot.songCount,
+          stale: snapshot.stale,
+          last_error: snapshot.lastError,
+        }
+      : null,
+  });
 });

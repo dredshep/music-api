@@ -83,7 +83,7 @@ function sameEndpointArtist(
   midpoint: number,
   endpoints: [string, string] | null | undefined,
 ) {
-  if (!endpoints || midpoint < 0.22 || midpoint > 0.78) return false;
+  if (!endpoints || midpoint <= 0.001 || midpoint >= 0.999) return false;
   const artist = normalizeForComparison(recording.artist);
   return endpoints.map(normalizeForComparison).includes(artist);
 }
@@ -518,7 +518,7 @@ async function repairFixedLengthSpacing(
   // N-1 musical transitions. Search that layered state space directly instead
   // of assuming the arbitrary-length cheapest path is the right skeleton.
   const exactHopBudget = Math.min(44, Math.floor(maxQueries * 0.55));
-  if (exactHopBudget >= 12 && provider.lookupEdge) {
+  if (exactHopBudget >= 12 && provider.lookupEdge && !options.skipExactHopRebalance) {
     const balanced = await searchBalancedFixedHopPath(
       original.recordings[0]!,
       original.recordings.at(-1)!,
@@ -531,6 +531,9 @@ async function repairFixedLengthSpacing(
         minSimilarity: Math.min(0.10, options.minBridgeSimilarity ?? 0.12),
         endpointArtists: options.endpointArtists,
         familiarity: options.familiarity,
+        maxArtistRepeat: options.maxArtistRepeat,
+        popularityBias: options.popularityBias,
+        releaseAgeBias: options.releaseAgeBias,
       },
     );
     queryCount += balanced.queryCount;

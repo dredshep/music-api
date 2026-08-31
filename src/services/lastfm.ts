@@ -40,6 +40,13 @@ export interface LastFmRecentTrack {
   nowPlaying: boolean;
 }
 
+export interface LastFmTrackProfile {
+  listeners: number;
+  playcount: number;
+  releaseYear: number | null;
+  tags: string[];
+}
+
 export type LastFmPeriod = "7day" | "1month" | "3month" | "6month" | "12month" | "overall";
 
 async function lastfmFetch<T>(params: Record<string, string>): Promise<T> {
@@ -172,6 +179,57 @@ export async function getSimilarTracks(artist: string, track: string, limit = 30
     playcount: 0,
     rank: idx + 1,
   }));
+}
+
+function releaseYearFromTags(tags: string[]) {
+  const currentYear = new Date().getUTCFullYear();
+  for (const tag of tags) {
+    const exact = tag.trim().match(/^(19\d{2}|20\d{2})$/)?.[1];
+    if (exact) {
+      const year = Number(exact);
+      if (year >= 1900 && year <= currentYear + 1) return year;
+    }
+  }
+  for (const tag of tags) {
+    const decade = tag.toLowerCase().match(/\b(19\d|20\d)0s\b/)?.[1];
+    if (decade) return Number(`${decade}5`);
+  }
+  return null;
+}
+
+/** Independent global popularity and coarse release-era evidence for Radio. */
+export async function getTrackProfile(artist: string, track: string): Promise<LastFmTrackProfile> {
+  const data = await lastfmFetch<{
+    track?: {
+      listeners?: string;
+      playcount?: string;
+      album?: { title?: string };
+      toptags?: { tag?: Array<{ name?: string }> };
+    };
+  }>({ method: "track.getInfo", artist, track, autocorrect: "1" });
+  const tags = (data.track?.toptags?.tag ?? []).map((row) => row.name?.trim() ?? "").filter(Boolean);
+  let releaseYear = releaseYearFromTags(tags);
+
+  // Last.fm's wiki publication timestamp is an edit date, not a release date.
+  // Album tags often carry a useful year/decade, so use only those tags.
+  const album = data.track?.album?.title?.trim();
+  if (!releaseYear && album) {
+    try {
+      const albumData = await lastfmFetch<{ album?: { tags?: { tag?: Array<{ name?: string }> } } }>({
+        method: "album.getInfo", artist, album, autocorrect: "1",
+      });
+      const albumTags = (albumData.album?.tags?.tag ?? []).map((row) => row.name?.trim() ?? "").filter(Boolean);
+      tags.push(...albumTags.filter((tag) => !tags.includes(tag)));
+      releaseYear = releaseYearFromTags(albumTags);
+    } catch { /* popularity is still useful when album metadata is absent */ }
+  }
+
+  return {
+    listeners: Math.max(0, Number(data.track?.listeners ?? 0) || 0),
+    playcount: Math.max(0, Number(data.track?.playcount ?? 0) || 0),
+    releaseYear,
+    tags,
+  };
 }
 
 export async function getTagTopTracks(tag: string, limit = 30): Promise<LastFmTrack[]> {
