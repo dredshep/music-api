@@ -3,12 +3,15 @@ import { normalizeForComparison } from "../domain/normalization";
 import * as lastfm from "./lastfm";
 import { densifyGradientRecordingPathWithSubpathFallback } from "./radio-gradient-densify-subpath";
 import { discoverValidatedCachedRecordingPath } from "./radio-gradient-cached-path";
+import { searchCachedBalancedFixedHopPath } from "./radio-gradient-cached-minimax-hop-search";
 import {
   compressGradientRecordingPath,
   discoverGradientRecordingPath,
   gradientRecording,
   gradientRecordingEdgeCost,
+  positionGradientRecordingPath,
   refinePathNovelty,
+  refinePathPreferences,
   searchGradientRecordingPath,
   type GradientDensificationOperation,
   type GradientPathSearchOptions,
@@ -27,6 +30,7 @@ import {
   type GradientRouteBudgetSnapshot,
 } from "./radio-gradient-budget";
 import { log } from "../middleware/logging";
+import { createGradientTrackProfileResolver, gradientProfileFit, type GradientTrackProfile } from "./radio-gradient-profile";
 
 export type GradientSeedConstraint = "exact_track" | "artist" | "region";
 
@@ -299,6 +303,108 @@ function middleNovelty(
   };
 }
 
+async function pathProfileQuality(
+  path: GradientRecordingPath,
+  profile: (recording: GradientRecording) => Promise<GradientTrackProfile>,
+  settings: RadioSettings,
+) {
+  const interior = path.recordings.slice(1, -1);
+  const profiles = await Promise.all(interior.map(profile));
+  const rows = interior.map((recording, index) => ({
+    recording,
+    profile: profiles[index]!,
+    fit: gradientProfileFit(profiles[index]!, settings),
+  }));
+  return {
+    rows,
+    mean: rows.length ? rows.reduce((sum, row) => sum + row.fit, 0) / rows.length : 1,
+  };
+}
+
+/**
+ * A shortest coherent route can run through a global-hit superhighway. For
+ * strong rarity/era choices, reject the worst non-waypoint nodes and search
+ * alternate coherent corridors before any local densification takes place.
+ */
+async function rerouteForListeningProfile(input: {
+  initial: GradientRecordingPath;
+  fromCandidates: GradientRecording[];
+  toCandidates: GradientRecording[];
+  provider: GradientRecordingNeighborProvider;
+  settings: RadioSettings;
+  searchOptions: GradientPathSearchOptions;
+  profile: (recording: GradientRecording) => Promise<GradientTrackProfile>;
+  budget: GradientRouteBudget;
+  endpointArtists?: [string, string] | null;
+}) {
+  const strength = Math.abs(input.settings.popularityBias) + Math.abs(input.settings.releaseAgeBias);
+  if (strength < 0.7 || input.initial.recordings.length < 4) {
+    return { path: input.initial, attempts: 0, rejectedNodes: 0, initialMean: null, finalMean: null };
+  }
+  const endpointArtistPair: [string, string] | null = input.endpointArtists ?? null;
+  const floor = 0.5 + Math.min(0.14, strength * 0.07);
+  const excluded = new Set<string>();
+  let best = input.initial;
+  let bestQuality = await pathProfileQuality(best, input.profile, input.settings);
+  const initialMean = bestQuality.mean;
+  let attempts = 0;
+  const maxPasses = bestQuality.mean < floor ? 10 : 6;
+
+  for (let pass = 0; pass < maxPasses && !isBudgetExhausted(input.budget); pass++) {
+    if (bestQuality.mean >= floor) break;
+    const batchSize = pass === 0 && strength >= 1.2 ? Infinity : 5;
+    const worst = [...bestQuality.rows]
+      .filter((row) => row.fit < floor && !excluded.has(row.recording.key))
+      .sort((a, b) => a.fit - b.fit)
+      .slice(0, batchSize);
+    if (!worst.length) break;
+    for (const row of worst) excluded.add(row.recording.key);
+    const maxQueries = Math.min(128, budgetRemaining(input.budget));
+    if (maxQueries <= 0) break;
+    attempts++;
+    const cachedAlternative = discoverValidatedCachedRecordingPath(
+      input.fromCandidates,
+      input.toCandidates,
+      {
+        maxExpanded: 16_000,
+        neighborLimit: 52,
+        excludedKeys: excluded,
+        popularityBias: input.settings.popularityBias,
+        releaseAgeBias: input.settings.releaseAgeBias,
+        endpointArtists: endpointArtistPair,
+        maxNeighborsPerArtist: input.settings.popularityBias < -0.3 ? 3 : undefined,
+      },
+    );
+    const alternative = cachedAlternative ? { path: cachedAlternative, queryCount: 0 } : await searchGradientRecordingPath(
+      input.fromCandidates,
+      input.toCandidates,
+      input.provider,
+      { ...input.searchOptions, maxQueries, excludedKeys: excluded },
+    );
+    input.budget.densificationQueries += alternative.queryCount;
+    if (!alternative.path) continue;
+    const quality = await pathProfileQuality(alternative.path, input.profile, input.settings);
+    const belowFloor = bestQuality.mean < floor;
+    const routeCostRatio = alternative.path.cost / Math.max(0.001, best.cost);
+    const maxCostRatio = belowFloor
+      ? 3.0 + strength
+      : 1.8 + Math.min(1.2, strength * 0.6);
+    const threshold = belowFloor ? 0 : 0.035;
+    if (quality.mean > bestQuality.mean + threshold && routeCostRatio <= maxCostRatio) {
+      best = alternative.path;
+      bestQuality = quality;
+    }
+  }
+
+  return {
+    path: best,
+    attempts,
+    rejectedNodes: excluded.size,
+    initialMean,
+    finalMean: bestQuality.mean,
+  };
+}
+
 /**
  * When recording-level pathfinding fails because the two endpoints are in
  * completely disjoint similarity regions, try an artist-level BFS through
@@ -483,6 +589,7 @@ export async function planGradientRecordingRoute(input: {
     : null;
   const scenic = algorithm === "scenic";
   const budget = createRouteBudget(scenic ? 600 : 480, 45_000);
+  const profile = createGradientTrackProfileResolver();
 
   for (let index = 0; index < regions.length - 1; index++) {
     const left = regions[index]!;
@@ -519,13 +626,15 @@ export async function planGradientRecordingRoute(input: {
     }
 
     const segmentSearchBudget = Math.min(scenic ? 160 : 128, budgetRemaining(budget));
-    const pathSearchOptions = {
+    const wantsRarity = settings.popularityBias < -0.3;
+    const pathSearchOptions: GradientPathSearchOptions = {
       maxQueries: segmentSearchBudget,
       maxNodes: scenic ? 6000 : 4000,
       beamPerSide: scenic ? 6 : 5,
       frontierCap: scenic ? 400 : 300,
-      neighborLimit: scenic ? 44 : 36,
+      neighborLimit: wantsRarity ? (scenic ? 56 : 48) : (scenic ? 44 : 36),
       refineQueries: scenic ? 18 : 12,
+      maxNeighborsPerArtist: wantsRarity ? 3 : undefined,
     };
     const pathStartedAt = performance.now();
     const initialResult = await searchGradientRecordingPath(fromCandidates, toCandidates, provider, pathSearchOptions);
@@ -535,7 +644,12 @@ export async function planGradientRecordingRoute(input: {
 
     if (!raw && !isBudgetExhausted(budget)) {
       try {
-        const cachedPath = discoverValidatedCachedRecordingPath(fromCandidates, toCandidates);
+        const cachedPath = discoverValidatedCachedRecordingPath(fromCandidates, toCandidates, {
+          popularityBias: settings.popularityBias,
+          releaseAgeBias: settings.releaseAgeBias,
+          endpointArtists: overallEndpointArtists,
+          maxNeighborsPerArtist: wantsRarity ? 3 : undefined,
+        });
         if (cachedPath) {
           budget.cachedGraphNodesExpanded += cachedPath.nodesVisited;
           log("info", "gradient_cached_path_found", {
@@ -585,6 +699,71 @@ export async function planGradientRecordingRoute(input: {
       }
     }
 
+    if (raw && !isBudgetExhausted(budget)) {
+      const rerouted = await rerouteForListeningProfile({
+        initial: raw,
+        fromCandidates,
+        toCandidates,
+        provider,
+        settings,
+        searchOptions: pathSearchOptions,
+        profile,
+        budget,
+        endpointArtists: overallEndpointArtists,
+      });
+      if (rerouted.path !== raw) {
+        log("info", "gradient_profile_reroute_selected", {
+          from: left.label,
+          to: right.label,
+          attempts: rerouted.attempts,
+          rejectedNodes: rerouted.rejectedNodes,
+          initialMean: rerouted.initialMean,
+          finalMean: rerouted.finalMean,
+          initialArtists: raw.recordings.map((row) => row.artist),
+          selectedArtists: rerouted.path.recordings.map((row) => row.artist),
+        });
+      }
+      raw = rerouted.path;
+    }
+
+    if (raw && (Math.abs(settings.popularityBias) + Math.abs(settings.releaseAgeBias) >= 0.7) && !isBudgetExhausted(budget)) {
+      const dpTargetLength = (allocation[index] ?? 1) + 1;
+      if (dpTargetLength >= 4) {
+        try {
+          const dpResult = searchCachedBalancedFixedHopPath(
+            fromCandidates[0]!, toCandidates[0]!,
+            {
+              requestedLength: dpTargetLength,
+              endpointArtists: overallEndpointArtists,
+              maxArtistRepeat: 1,
+              popularityBias: settings.popularityBias,
+              releaseAgeBias: settings.releaseAgeBias,
+              minSimilarity: 0.06,
+            },
+          );
+          if (dpResult.path) {
+            const dpQuality = await pathProfileQuality(dpResult.path, profile, settings);
+            const rawQuality = await pathProfileQuality(raw, profile, settings);
+            if (dpQuality.mean > rawQuality.mean + 0.02) {
+              log("info", "gradient_dp_fullroute_selected", {
+                from: left.label,
+                to: right.label,
+                dpMean: dpQuality.mean,
+                rawMean: rawQuality.mean,
+                dpArtists: dpResult.path.recordings.map((r) => r.artist),
+                rawArtists: raw.recordings.map((r) => r.artist),
+              });
+              raw = dpResult.path;
+            }
+          }
+        } catch (err) {
+          log("warn", "gradient_dp_fullroute_error", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+
     const pathSearchMs = elapsedMs(pathStartedAt);
     if (!raw) {
       segments.push({
@@ -609,7 +788,8 @@ export async function planGradientRecordingRoute(input: {
       if (!compressed.compressed) compressionPartial = compressed.partialReason;
     }
 
-    if (input.familiarity && pathForDensification.recordings.length >= 4 && !isBudgetExhausted(budget)) {
+    const strongProfileControls = Math.abs(settings.popularityBias) + Math.abs(settings.releaseAgeBias) >= 0.7;
+    if (!strongProfileControls && input.familiarity && pathForDensification.recordings.length >= 4 && !isBudgetExhausted(budget)) {
       const noveltyBudget = Math.min(scenic ? 16 : 10, budgetRemaining(budget));
       const mandatoryKeys = new Set<string>();
       if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
@@ -621,6 +801,25 @@ export async function planGradientRecordingRoute(input: {
         mandatoryKeys,
         endpointArtists: overallEndpointArtists,
         minTransitionSimilarity: scenic ? 0.09 : 0.12,
+        desiredFamiliarity: settings.familiarity,
+      });
+      pathForDensification = refined.path;
+      budget.densificationQueries += refined.queryCount;
+    }
+
+    if ((Math.abs(settings.popularityBias) + Math.abs(settings.releaseAgeBias)) >= 0.35 && !isBudgetExhausted(budget)) {
+      const mandatoryKeys = new Set<string>();
+      if (left.constraint !== "region") for (const r of left.recordings) mandatoryKeys.add(r.key);
+      if (right.constraint !== "region") for (const r of right.recordings) mandatoryKeys.add(r.key);
+      const refined = await refinePathPreferences(pathForDensification, provider, {
+        settings,
+        profile,
+        mandatoryKeys,
+        endpointArtists: overallEndpointArtists,
+        maxQueries: Math.min(scenic ? 30 : 24, budgetRemaining(budget)),
+        neighborLimit: scenic ? 56 : 48,
+        maxProfilesPerSlot: scenic ? 10 : 8,
+        minTransitionSimilarity: scenic ? 0.08 : 0.1,
       });
       pathForDensification = refined.path;
       budget.densificationQueries += refined.queryCount;
@@ -634,11 +833,40 @@ export async function planGradientRecordingRoute(input: {
       endpointArtists: overallEndpointArtists,
       familiarity: input.familiarity,
       familiarityWeight: scenic ? 0.26 : 0.18,
+      familiarityTarget: settings.familiarity,
+      skipExactHopRebalance: false,
+      maxArtistRepeat: 1,
+      popularityBias: settings.popularityBias,
+      releaseAgeBias: settings.releaseAgeBias,
     });
     budget.densificationQueries += dense.queryCount;
     const densificationMs = elapsedMs(densificationStartedAt);
     queryCount += dense.queryCount;
-    const scaled = dense.positioned.map((recording) => ({
+
+    let finalPath = dense.path;
+    let finalPositioned = dense.positioned;
+    if (strongProfileControls && finalPath.recordings.length >= 4 && !isBudgetExhausted(budget)) {
+      const postMandatoryKeys = new Set<string>();
+      if (left.constraint !== "region") for (const r of left.recordings) postMandatoryKeys.add(r.key);
+      if (right.constraint !== "region") for (const r of right.recordings) postMandatoryKeys.add(r.key);
+      const postDensify = await refinePathPreferences(finalPath, provider, {
+        settings,
+        profile,
+        mandatoryKeys: postMandatoryKeys,
+        endpointArtists: overallEndpointArtists,
+        maxQueries: Math.min(scenic ? 20 : 16, budgetRemaining(budget)),
+        neighborLimit: scenic ? 56 : 48,
+        maxProfilesPerSlot: scenic ? 10 : 8,
+        minTransitionSimilarity: scenic ? 0.08 : 0.1,
+      });
+      if (postDensify.replacements > 0) {
+        finalPath = postDensify.path;
+        finalPositioned = positionGradientRecordingPath(finalPath);
+      }
+      budget.densificationQueries += postDensify.queryCount;
+    }
+
+    const scaled = finalPositioned.map((recording) => ({
       ...recording,
       routePosition: left.position + (right.position - left.position) * recording.routePosition,
     }));
@@ -654,14 +882,14 @@ export async function planGradientRecordingRoute(input: {
       densificationMs,
       rawRecordings: raw.recordings,
       recordings: scaled,
-      edges: dense.path.edges,
+      edges: finalPath.edges,
       densificationOperations: dense.operations,
       densificationStoppedReason: dense.stoppedReason,
-      fallbackReason: dense.path.recordings.length < targetNodes ? "densification_exhausted_before_target_length" : null,
+      fallbackReason: finalPath.recordings.length < targetNodes ? "densification_exhausted_before_target_length" : null,
       compressionPartial,
     });
 
-    previousWaypoint = dense.path.recordings.at(-1) ?? null;
+    previousWaypoint = finalPath.recordings.at(-1) ?? null;
     for (let rowIndex = 0; rowIndex < scaled.length; rowIndex++) {
       const recording = scaled[rowIndex]!;
       const isLeftWaypoint = rowIndex === 0;

@@ -37,6 +37,9 @@ import {
   type GradientHardEndpointExpectation,
   type StoredGradientTrack,
 } from "./radio-gradient-tail-merge";
+import { auditGradientRoute, deriveRouteIntent, formatComplianceReport, type GradientRouteCompliance } from "./radio-gradient-compliance";
+import { createGradientTrackProfileResolver } from "./radio-gradient-profile";
+import { log } from "../middleware/logging";
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
@@ -213,10 +216,12 @@ function waypointRegion(plan: GradientRecordingRoutePlan, seedId: string | undef
 function storedRouteTracks(
   plan: GradientRecordingRoutePlan,
   familiarity: (recording: GradientRecording) => number | null,
+  desiredFamiliarity: number,
 ): StoredGradientTrack[] {
-  return plan.recordings.map((row) => {
+  return plan.recordings.map((row, index) => {
     const region = waypointRegion(plan, row.waypointSeedId);
-    const routePosition = row.routePosition == null ? null : clamp(row.routePosition, 0, 1);
+    const routeDistance = row.routePosition == null ? null : clamp(row.routePosition, 0, 1);
+    const routePosition = routeDistance == null ? null : plan.recordings.length <= 1 ? 0 : index / (plan.recordings.length - 1);
     const familiarityActual = familiarity(row);
     const metadata: Record<string, unknown> = {
       gradientRouteModel: "recording_path_v1",
@@ -229,8 +234,9 @@ function storedRouteTracks(
         gradientRouteUnsupported: true,
       } : {
         gradientRoutePosition: routePosition,
+        gradientRouteDistance: routeDistance,
         trajectoryCoordinateKind: "musical_route",
-        familiarityTarget: gradientFamiliarityTarget(routePosition),
+        familiarityTarget: gradientFamiliarityTarget(routePosition, desiredFamiliarity),
       }),
       ...(row.waypointSeedId ? {
         gradientWaypoint: true,
@@ -349,6 +355,7 @@ function finishRecordingGeneration(
   storedCount: number,
   actualEndpoints: ReturnType<typeof actualEndpointStatus> | null,
   extra: Record<string, unknown> = {},
+  compliance: GradientRouteCompliance | null = null,
 ) {
   const selected = getGenerationTracks(generationId);
   const lengthComplete = storedCount === plan.requestedLength;
@@ -359,6 +366,14 @@ function finishRecordingGeneration(
   const timing = routeTiming(plan);
   finishGeneration(generationId, status, {
     gradient_route: routeDiagnostics(plan, providerDiagnostics),
+    gradient_compliance: compliance ? {
+      overall_pass: compliance.overallPass,
+      diversity: compliance.diversity,
+      discovery: compliance.discovery,
+      rarity: compliance.rarity,
+      recency: compliance.recency,
+      transitions: compliance.transitions,
+    } : null,
     gradient_route_candidate_count: plan.recordings.length,
     gradient_route_positioned_count: plan.recordings.filter((row) => row.routePosition != null).length,
     gradient_route_positioned_ratio: plan.recordings.length
@@ -397,7 +412,44 @@ async function planForStation(stationId: string, requestedLength: number, tasteP
   const familiarity = buildGradientFamiliarityScorer(stationId, tasteProfile);
   const started = performance.now();
   const plan = await planGradientRecordingRoute({ seeds, settings, requestedLength, provider, familiarity });
-  return { station, settings, seeds, provider, familiarity, plan, routeSearchMs: elapsedMs(started) };
+  const routeSearchMs = elapsedMs(started);
+
+  let compliance: GradientRouteCompliance | null = null;
+  if (plan.state !== "no_route" && plan.recordings.length >= 2) {
+    const endpointArtists: [string, string] | null = seeds.length >= 2 && seeds[0]?.artist && seeds.at(-1)?.artist
+      ? [seeds[0]!.artist, seeds.at(-1)!.artist]
+      : null;
+    const intent = deriveRouteIntent(settings, endpointArtists, requestedLength);
+    const profileResolver = createGradientTrackProfileResolver();
+    const allEdges = plan.segments.flatMap((s) => s.edges);
+    compliance = await auditGradientRoute({
+      recordings: plan.recordings,
+      edges: allEdges,
+      intent,
+      settings,
+      profile: profileResolver,
+      familiarity,
+      stationId,
+    });
+    log("info", "gradient_compliance_audit", {
+      station: stationId,
+      overall: compliance.overallPass,
+      diversity: compliance.diversity.pass,
+      discovery: compliance.discovery.pass,
+      rarity: compliance.rarity.pass,
+      recency: compliance.recency.pass,
+      transitions: compliance.transitions.pass,
+      uniqueArtistRatio: compliance.diversity.uniqueArtistRatio,
+      endpointArtistInterior: compliance.diversity.endpointArtistInteriorCount,
+      genuinelyNewRatio: compliance.discovery.genuinelyNewRatio,
+      medianPopularity: compliance.rarity.medianPopularity,
+      medianDegree: compliance.rarity.medianGraphDegree,
+      recentFraction: compliance.recency.recentFraction,
+    });
+    log("info", "gradient_compliance_report", { report: formatComplianceReport(compliance, intent) });
+  }
+
+  return { station, settings, seeds, provider, familiarity, plan, routeSearchMs, compliance };
 }
 
 export async function generateRadioStationWithRecordingGradient(
@@ -445,7 +497,7 @@ export async function generateRadioStationWithRecordingGradient(
     randomSeed: crypto.randomUUID(),
     settingsSnapshot: { ...settings, length: requestedLength },
   });
-  const stored = storedRouteTracks(planned.plan, planned.familiarity);
+  const stored = storedRouteTracks(planned.plan, planned.familiarity, planned.settings.familiarity);
   replaceGenerationTracks(generation.id, stored);
   finishRecordingGeneration(
     generation.id,
@@ -455,6 +507,7 @@ export async function generateRadioStationWithRecordingGradient(
     stored.length,
     actualEndpointStatus(planned.plan, stored),
     { gradient_fallback_radio: false },
+    planned.compliance,
   );
   return presentGeneration(generation.id)!;
 }
@@ -496,7 +549,7 @@ export async function regenerateRadioTailWithRecordingGradient(
     return presentGeneration(generationId)!;
   }
 
-  const routeTracks = storedRouteTracks(planned.plan, planned.familiarity);
+  const routeTracks = storedRouteTracks(planned.plan, planned.familiarity, planned.settings.familiarity);
   const merged = mergeGradientPlannedTail(existing, routeTracks, generation.requested_length, Math.max(0, fromPosition));
   replaceGenerationTracks(generationId, merged);
   getDb().query("UPDATE radio_generations SET generator_version=? WHERE id=?")
@@ -514,6 +567,7 @@ export async function regenerateRadioTailWithRecordingGradient(
       gradient_regenerated_from: Math.max(0, fromPosition),
       ...(endpoints.conflict ? { gradient_endpoint_lock_conflict_reason: "locked_track_prevented_hard_endpoint" } : {}),
     },
+    planned.compliance,
   );
   return presentGeneration(generationId)!;
 }

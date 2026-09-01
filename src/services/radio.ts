@@ -9,6 +9,8 @@ import { buildLastFmTasteMap } from "./radio-lastfm-taste";
 import { radioGenreAffinity } from "./radio-genre-affinity";
 import { getMusicBrainzRadioCandidates } from "./radio-musicbrainz";
 import { buildRadioHistoryPenalties, type RadioHistoryPenalties } from "./radio-repeat-history";
+import { radioArtistCooldownKey } from "./radio-artist-credit";
+import { selectRadioSequence } from "./radio-sequence";
 import { normalizeForComparison } from "../domain/normalization";
 import { getDb } from "../db/database";
 import {
@@ -443,29 +445,12 @@ function loadAudioAnalysis(candidates: Candidate[]): void {
   }
 }
 
-function targetSeedWeights(seeds: ReturnType<typeof getSeeds>, t: number): Record<string, number> {
-  if (seeds.length === 1) return { [seeds[0]!.id]: 1 };
-  const positions = seeds.map((seed, index) => ({
-    id: seed.id,
-    pos: seed.position == null ? index / Math.max(1, seeds.length - 1) : Math.min(1, Math.max(0, seed.position)),
-    weight: seed.weight,
-  }));
-  const values: Record<string, number> = {};
-  let total = 0;
-  for (const row of positions) {
-    const value = row.weight / Math.max(0.08, Math.abs(t - row.pos) + 0.08);
-    values[row.id] = value;
-    total += value;
-  }
-  for (const key of Object.keys(values)) values[key] = values[key]! / Math.max(0.0001, total);
-  return values;
-}
-
 function feedbackAdjustment(candidate: Candidate, feedback: ReturnType<typeof listFeedback>) {
   let score = 0;
   for (const row of feedback) {
     const matchTrack = row.entity_type === "track" && row.entity_key === candidate.key;
-    const matchArtist = row.entity_type === "artist" && normalizeForComparison(row.entity_key) === normalizeForComparison(candidate.artist);
+    const matchArtist = row.entity_type === "artist"
+      && radioArtistCooldownKey(row.entity_key) === radioArtistCooldownKey(candidate.artist);
     if (!matchTrack && !matchArtist) continue;
     if (["ban_station", "ban_track_global", "ban_artist_global"].includes(row.action)) return { banned: true, score: -100 };
     if (row.action === "more_like") score += 0.35 * row.strength;
@@ -485,7 +470,7 @@ function scoreCandidates(
   randomSeed: string,
   history: RadioHistoryPenalties,
 ): Candidate[] {
-  const seedArtists = new Set(seeds.map((s) => normalizeForComparison(s.artist ?? "")).filter(Boolean));
+  const seedArtists = new Set(seeds.map((s) => radioArtistCooldownKey(s.artist ?? "")).filter(Boolean));
   const currentYear = new Date().getUTCFullYear();
 
   for (const candidate of candidates) {
@@ -513,7 +498,7 @@ function scoreCandidates(
     const ownedScore = settings.ownedBias >= 0
       ? owned * settings.ownedBias
       : (1 - owned) * -settings.ownedBias;
-    const sameArtist = seedArtists.has(normalizeForComparison(candidate.artist)) ? settings.sameArtistBias : 0;
+    const sameArtist = seedArtists.has(radioArtistCooldownKey(candidate.artist)) ? settings.sameArtistBias : 0;
     const tasteScore =
       taste.spotify * (settings.providerWeights.spotify_taste ?? 1) +
       taste.local * (settings.providerWeights.local_history ?? 0.7) +
@@ -523,11 +508,11 @@ function scoreCandidates(
     const popularity = typeof candidate.metadata.popularity === "number" ? candidate.metadata.popularity : 0.5;
     const popularityScore = (popularity - 0.5) * 2 * settings.popularityBias;
     const releaseYear = typeof candidate.metadata.releaseYear === "number" ? candidate.metadata.releaseYear : null;
-    const recency = releaseYear ? Math.max(0, Math.min(1, 1 - (currentYear - releaseYear) / 30)) : 0.5;
+    const recency = releaseYear ? Math.max(0, Math.min(1, Math.exp(-Math.max(0, currentYear - releaseYear) / 7))) : 0.5;
     const releaseAgeScore = (recency - 0.5) * 2 * settings.releaseAgeBias;
     const genreScore = radioGenreAffinity(candidate.seedScores, seeds) * settings.genreSimilarity * 0.25;
     const historyTrackPenalty = (history.tracks.get(candidate.key) ?? 0) * settings.repeatStrength * 0.65;
-    const historyArtistPenalty = (history.artists.get(normalizeForComparison(candidate.artist)) ?? 0) * settings.repeatStrength * 0.35;
+    const historyArtistPenalty = (history.artists.get(radioArtistCooldownKey(candidate.artist)) ?? 0) * settings.repeatStrength * 0.35;
     const negativeFeedbackPenalty = negativeNeighborhood.get(candidate.key) ?? 0;
     const surprise = seededUnit(randomSeed, candidate.key) * settings.surprise;
 
@@ -538,86 +523,6 @@ function scoreCandidates(
   }
 
   return candidates.filter((c) => c.selectionScore > -100).sort((a, b) => b.selectionScore - a.selectionScore);
-}
-
-/** Coarse selection-time flow; final DJ ordering uses the richer cached-feature sequencer. */
-function transitionScore(a: Candidate | null, b: Candidate, settings: RadioSettings): number {
-  if (!a) return 0;
-  let score = 0;
-  const sameArtist = normalizeForComparison(a.artist) === normalizeForComparison(b.artist);
-  if (sameArtist) score -= settings.repeatStrength * (0.5 + (settings.djWeights.artistSpacing ?? 0));
-  if (a.album && b.album && normalizeForComparison(a.album) === normalizeForComparison(b.album)) score -= 0.12;
-
-  const aMeta = a.metadata as { bpm?: number; energy?: number; key?: string; loudness?: number };
-  const bMeta = b.metadata as { bpm?: number; energy?: number; key?: string; loudness?: number };
-  if (aMeta.bpm && bMeta.bpm) score += Math.max(0, 1 - Math.abs(aMeta.bpm - bMeta.bpm) / 60) * (settings.djWeights.tempo ?? 0);
-  if (aMeta.energy != null && bMeta.energy != null) score += Math.max(0, 1 - Math.abs(aMeta.energy - bMeta.energy)) * (settings.djWeights.energy ?? 0);
-  if (aMeta.key && bMeta.key) score += (aMeta.key === bMeta.key ? 1 : 0) * (settings.djWeights.key ?? 0);
-  if (aMeta.loudness != null && bMeta.loudness != null) score += Math.max(0, 1 - Math.abs(aMeta.loudness - bMeta.loudness) / 12) * (settings.djWeights.timbre ?? 0) * 0.5;
-  return score * settings.djFlow;
-}
-
-function selectSequence(
-  scored: Candidate[],
-  length: number,
-  settings: RadioSettings,
-  seeds: ReturnType<typeof getSeeds>,
-  stationType: RadioStationType,
-  randomSeed: string,
-): Candidate[] {
-  const selected: Candidate[] = [];
-  const used = new Set<string>();
-  const artistLast = new Map<string, number>();
-  const seedArtists = new Set(seeds.map((s) => normalizeForComparison(s.artist ?? "")).filter(Boolean));
-  let seedArtistCount = 0;
-
-  for (let position = 0; position < length && used.size < scored.length; position++) {
-    const t = length <= 1 ? 0 : position / (length - 1);
-    const targets = stationType === "gradient" ? targetSeedWeights(seeds, t) : null;
-    let best: Candidate | null = null;
-    let bestScore = -Infinity;
-
-    for (const candidate of scored.slice(0, Math.max(120, length * 8))) {
-      if (used.has(candidate.key)) continue;
-      const artistKey = normalizeForComparison(candidate.artist);
-      const last = artistLast.get(artistKey);
-      let repeatPenalty = 0;
-      if (last != null) {
-        const gap = position - last;
-        repeatPenalty = Math.max(0, (settings.artistCooldown - gap + 1) / Math.max(1, settings.artistCooldown)) * settings.repeatStrength;
-      }
-
-      const trajectory = targets
-        ? Object.entries(targets).reduce((sum, [seedId, weight]) => sum + (candidate.seedScores[seedId] ?? 0) * weight, 0) * 2
-        : 0;
-      const previous = selected.at(-1) ?? null;
-      const flow = transitionScore(previous, candidate, settings);
-      const isSeedArtist = seedArtists.has(artistKey);
-      const currentRatio = position === 0 ? 0 : seedArtistCount / position;
-      const frequencyAdjustment = isSeedArtist
-        ? (settings.seedArtistFrequency - currentRatio) * 0.75
-        : Math.max(0, currentRatio - settings.seedArtistFrequency) * 0.25;
-      const jitter = seededUnit(randomSeed, `${position}:${candidate.key}`) * 0.025;
-      const score = candidate.selectionScore + trajectory + flow - repeatPenalty + frequencyAdjustment + jitter;
-
-      if (score > bestScore) {
-        best = candidate;
-        bestScore = score;
-      }
-    }
-
-    if (!best) break;
-    used.add(best.key);
-    artistLast.set(normalizeForComparison(best.artist), position);
-    if (seedArtists.has(normalizeForComparison(best.artist))) seedArtistCount++;
-    selected.push({
-      ...best,
-      selectionScore: bestScore,
-      metadata: { ...best.metadata, trajectoryTarget: stationType === "gradient" ? t : null },
-    });
-  }
-
-  return selected;
 }
 
 async function generateCandidates(
@@ -836,7 +741,7 @@ export async function generateStation(
 
   try {
     const { scored, seeds, errors } = await generateCandidates(stationId, settings, input.tasteProfile, randomSeed);
-    const sequence = selectSequence(scored, length, settings, seeds, station.type, randomSeed);
+    const sequence = selectRadioSequence(scored, length, settings, seeds, station.type, randomSeed);
     replaceGenerationTracks(generation.id, sequence.map((candidate, index) => toStoredTrack(
       candidate,
       station.type === "gradient" ? (length <= 1 ? 0 : index / (length - 1)) : null,
@@ -871,7 +776,7 @@ export async function regenerateTail(generationId: string, fromPosition: number,
   const randomSeed = crypto.randomUUID();
   const { scored, seeds, errors } = await generateCandidates(station.id, settings, tasteProfile, randomSeed);
   const used = new Set([...prefix, ...pinned].map((t) => t.canonical_key));
-  const replacement = selectSequence(
+  const replacement = selectRadioSequence(
     scored.filter((c) => !used.has(c.key)),
     generation.requested_length,
     settings,
@@ -941,20 +846,31 @@ export function resolveGenerationTracks(
     isrc?: string | null;
     album?: string | null;
     durationMs?: number | null;
+    popularity?: number | null;
+    releaseYear?: number | null;
   }>,
 ) {
+  const select = getDb().query<{ metadata_json: string | null }, [string, string]>(
+    "SELECT metadata_json FROM radio_generation_tracks WHERE generation_id=? AND id=?",
+  );
   const stmt = getDb().query(`UPDATE radio_generation_tracks
     SET spotify_id=COALESCE(?,spotify_id),
         isrc=COALESCE(?,isrc),
         album=COALESCE(?,album),
         duration_ms=COALESCE(?,duration_ms),
         playback_source=CASE WHEN navidrome_id IS NOT NULL THEN 'navidrome' WHEN COALESCE(?,spotify_id) IS NOT NULL THEN 'spotify' ELSE playback_source END,
-        availability_status=CASE WHEN navidrome_id IS NOT NULL THEN 'local' WHEN COALESCE(?,spotify_id) IS NOT NULL THEN 'spotify' ELSE availability_status END
+        availability_status=CASE WHEN navidrome_id IS NOT NULL THEN 'local' WHEN COALESCE(?,spotify_id) IS NOT NULL THEN 'spotify' ELSE availability_status END,
+        metadata_json=?
     WHERE generation_id=? AND id=?`);
   getDb().transaction(() => {
     for (const row of resolutions) {
+      const current = select.get(generationId, row.trackId);
+      let metadata: Record<string, unknown> = {};
+      try { metadata = current?.metadata_json ? JSON.parse(current.metadata_json) as Record<string, unknown> : {}; } catch { /* empty */ }
+      if (row.popularity != null) metadata.popularity = Math.max(0, Math.min(1, row.popularity));
+      if (row.releaseYear != null) metadata.releaseYear = row.releaseYear;
       stmt.run(row.spotifyId ?? null, row.isrc ?? null, row.album ?? null, row.durationMs ?? null,
-        row.spotifyId ?? null, row.spotifyId ?? null, generationId, row.trackId);
+        row.spotifyId ?? null, row.spotifyId ?? null, JSON.stringify(metadata), generationId, row.trackId);
     }
   })();
   return presentGeneration(generationId);

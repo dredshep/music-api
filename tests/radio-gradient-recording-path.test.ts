@@ -7,6 +7,7 @@ import {
   gradientRecording,
   gradientRecordingEdgeCost,
   refinePathNovelty,
+  refinePathPreferences,
   type GradientRecording,
   type GradientRecordingNeighborProvider,
   type GradientRecordingPath,
@@ -75,6 +76,24 @@ describe("recording-level Gradient path search", () => {
     expect(path).not.toBeNull();
     expect(path!.recordings.map((row) => row.artist)).toEqual(["A", "Bridge", "Bridge", "B"]);
     expect(path!.recordings.map((row) => row.key)).not.toContain(trap2.key);
+  });
+
+  test("search can exclude a known noncompliant bridge and find an alternate corridor", async () => {
+    const a = gradientRecording("A", "a");
+    const b = gradientRecording("B", "b");
+    const hit = gradientRecording("Global Hit", "hit");
+    const rare = gradientRecording("Rare", "rare");
+    const graph = provider({
+      [a.key]: [[hit.artist, hit.title, 0.95], [rare.artist, rare.title, 0.7]],
+      [hit.key]: [[a.artist, a.title, 0.95], [b.artist, b.title, 0.95]],
+      [rare.key]: [[a.artist, a.title, 0.7], [b.artist, b.title, 0.7]],
+      [b.key]: [[hit.artist, hit.title, 0.95], [rare.artist, rare.title, 0.7]],
+    });
+    const result = await discoverGradientRecordingPath([a], [b], graph, {
+      maxQueries: 16,
+      excludedKeys: new Set([hit.key]),
+    });
+    expect(result?.recordings.map((row) => row.artist)).toEqual(["A", "Rare", "B"]);
   });
 
   test("artist endpoint regions still yield recordings by the requested artists", async () => {
@@ -159,6 +178,11 @@ describe("recording-level Gradient densification", () => {
     expect(gradientFamiliarityTarget(0.5)).toBeCloseTo(0, 8);
     expect(gradientFamiliarityTarget(0.25)).toBeGreaterThan(gradientFamiliarityTarget(0.5));
     expect(gradientFamiliarityTarget(0.75)).toBeGreaterThan(gradientFamiliarityTarget(0.5));
+  });
+
+  test("familiarity target honors the station preference in the middle", () => {
+    expect(gradientFamiliarityTarget(0.5, 0.8)).toBeCloseTo(0.8, 8);
+    expect(gradientFamiliarityTarget(0, 0.2)).toBeCloseTo(1, 8);
   });
 });
 
@@ -366,6 +390,64 @@ describe("novelty refinement", () => {
       expect(result.path.edges[i]!.from.key).toBe(result.path.recordings[i]!.key);
       expect(result.path.edges[i]!.to.key).toBe(result.path.recordings[i + 1]!.key);
       expect(result.path.edges[i]!.similarity).toBeGreaterThan(0);
+    }
+  });
+
+  test("does not fabricate novelty when the replacement has no familiarity evidence", async () => {
+    const path = makePath(["A", "B", "Familiar", "D", "E"]);
+    const p = provider({
+      [key("B", "B-song")]: [["Unknown", "Unknown-song", 0.8]],
+      [key("D", "D-song")]: [["Unknown", "Unknown-song", 0.8]],
+    });
+    const fam = familiarityMap({ [key("Familiar", "Familiar-song")]: 0.95 });
+    const result = await refinePathNovelty(path, p, { familiarity: fam });
+    expect(result.replacements).toBe(0);
+    expect(result.path.recordings[2]!.artist).toBe("Familiar");
+  });
+});
+
+describe("listening-profile refinement", () => {
+  test("replaces a mainstream old bridge with a rare recent compatible bridge", async () => {
+    const path = makePath(["A", "B", "Mainstream", "D", "E"]);
+    const rare = gradientRecording("Rare", "Rare-song");
+    const p = provider({
+      [key("B", "B-song")]: [[rare.artist, rare.title, 0.65]],
+      [key("D", "D-song")]: [[rare.artist, rare.title, 0.65]],
+    });
+    const profiles = new Map([
+      [key("Mainstream", "Mainstream-song"), { popularity: 0.96, releaseYear: 1982, listeners: 2_000_000, source: "lastfm" as const }],
+      [rare.key, { popularity: 0.08, releaseYear: 2025, listeners: 900, source: "lastfm" as const }],
+    ]);
+    const result = await refinePathPreferences(path, p, {
+      settings: { popularityBias: -1, releaseAgeBias: 1 },
+      profile: async (recording) => profiles.get(recording.key)
+        ?? { popularity: null, releaseYear: null, listeners: null, source: "unknown" },
+    });
+    expect(result.replacements).toBe(1);
+    expect(result.path.recordings[2]!.key).toBe(rare.key);
+  });
+
+  test("famous-old-bridge loses to rare-recent only when both adjacent links stay valid", async () => {
+    const path = makePath(["A", "B", "Famous Old", "D", "E"]);
+    const rareRecent = gradientRecording("Rare Recent", "Rare-song");
+    const p = provider({
+      [key("B", "B-song")]: [[rareRecent.artist, rareRecent.title, 0.5]],
+      [key("D", "D-song")]: [[rareRecent.artist, rareRecent.title, 0.5]],
+    });
+    const profiles = new Map([
+      [key("Famous Old", "Famous Old-song"), { popularity: 0.95, releaseYear: 1975, listeners: 5_000_000, source: "lastfm" as const }],
+      [rareRecent.key, { popularity: 0.05, releaseYear: 2025, listeners: 400, source: "lastfm" as const }],
+    ]);
+    const result = await refinePathPreferences(path, p, {
+      settings: { popularityBias: -1, releaseAgeBias: 1 },
+      profile: async (recording) => profiles.get(recording.key)
+        ?? { popularity: null, releaseYear: null, listeners: null, source: "unknown" },
+      minTransitionSimilarity: 0.4,
+    });
+    expect(result.replacements).toBe(1);
+    expect(result.path.recordings[2]!.key).toBe(rareRecent.key);
+    for (const edge of result.path.edges) {
+      expect(edge.similarity).toBeGreaterThanOrEqual(0.4);
     }
   });
 });

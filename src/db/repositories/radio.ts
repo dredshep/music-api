@@ -72,7 +72,7 @@ export const DEFAULT_RADIO_SETTINGS: RadioSettings = {
     timbre: 0.15,
     introOutro: 0.1,
     semantic: 0.15,
-    artistSpacing: 0.05,
+    artistSpacing: 0.45,
   },
 };
 

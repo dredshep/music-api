@@ -64,7 +64,9 @@ export function buildGradientFamiliarityScorer(
   return (recording) => {
     const exactValue = exact.get(canonicalRadioTrackKey(recording.artist, recording.title));
     const artistValue = artist.get(normalizeForComparison(recording.artist));
-    if (exactValue == null && artistValue == null) return 0;
+    // Absence from a bounded taste/history sample is not proof that a globally
+    // famous recording is new to the listener. Keep unknown evidence neutral.
+    if (exactValue == null && artistValue == null) return null;
     return clamp(Math.max(exactValue ?? 0, artistValue ?? 0), 0, 1);
   };
 }

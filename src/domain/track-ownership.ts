@@ -12,6 +12,8 @@ export type TrackOwnershipQuery = {
 
 export type TrackOwnershipMatch = {
   navidromeId: string;
+  artistId: string;
+  albumId: string;
   artist: string;
   title: string;
   album: string;
@@ -68,6 +70,8 @@ function scoreSong(query: TrackOwnershipQuery, song: LibrarySong): TrackOwnershi
   const confidence = Math.max(0, Math.min(1, score));
   return {
     navidromeId: song.id,
+    artistId: song.artistId,
+    albumId: song.albumId,
     artist: song.artist,
     title: song.title,
     album: song.album,

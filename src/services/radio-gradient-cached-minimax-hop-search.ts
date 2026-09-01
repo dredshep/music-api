@@ -14,7 +14,7 @@ import {
   type CachedAcousticFeatures,
 } from "./radio-transition-quality";
 
-const ALGORITHM_VERSION = 2;
+const ALGORITHM_VERSION = 3;
 const SOLUTION_CACHE_MAX = 64;
 
 const minimaxSemaphore = new Semaphore(2, "minimax search");
@@ -27,8 +27,8 @@ type SolutionCacheEntry = {
 
 const solutionCache = new Map<string, SolutionCacheEntry>();
 
-function solutionCacheKey(startKey: string, endKey: string, length: number, minSimilarity: number): string {
-  return `${startKey}|${endKey}|${length}|${minSimilarity.toFixed(4)}|v${ALGORITHM_VERSION}`;
+function solutionCacheKey(startKey: string, endKey: string, length: number, minSimilarity: number, maxArtistRepeat: number, popBias: number, relBias: number): string {
+  return `${startKey}|${endKey}|${length}|${minSimilarity.toFixed(4)}|ar${maxArtistRepeat}|pb${popBias.toFixed(2)}|rb${relBias.toFixed(2)}|v${ALGORITHM_VERSION}`;
 }
 
 function graphVersion(): string {
@@ -57,6 +57,9 @@ export type CachedBalancedHopSearchOptions = {
   maxGraphNodes?: number;
   maxGraphEdges?: number;
   statesPerNode?: number;
+  maxArtistRepeat?: number;
+  popularityBias?: number;
+  releaseAgeBias?: number;
 };
 
 export type CachedBalancedHopSearchResult = {
@@ -109,6 +112,9 @@ type DPState = {
   sumSquares: number;
   repeatedArtistPenalty: number;
   familiarityPenalty: number;
+  artistRepeatCount: number;
+  profilePenalty: number;
+  profileViolations: number;
   edgeSimilarity: number;
   edgeConfidence: number;
   edgeProvider: string;
@@ -120,23 +126,6 @@ function clamp(value: number, min: number, max: number) {
 
 function strength(similarity: number, confidence: number) {
   return clamp(similarity, 0.01, 1) * clamp(confidence, 0.05, 1);
-}
-
-function normalizedArtist(recording: GradientRecording) {
-  return normalizeForComparison(recording.artist);
-}
-
-function endpointArtistBlocked(
-  recording: GradientRecording,
-  depth: number,
-  totalEdges: number,
-  endpoints: [string, string] | null | undefined,
-) {
-  if (!endpoints || totalEdges <= 1) return false;
-  const position = depth / totalEdges;
-  if (position < 0.22 || position > 0.78) return false;
-  const artist = normalizedArtist(recording);
-  return endpoints.map(normalizeForComparison).includes(artist);
 }
 
 function spacingMetrics(edges: GradientRecordingPathEdge[]) {
@@ -162,13 +151,18 @@ function partialVarianceFromScalars(totalCost: number, sumSquares: number, count
 
 function comparePartialScalars(
   aMax: number, aTotalCost: number, aSumSq: number, aRepeat: number, aFam: number,
+  aArtistRepeat: number, aProfileViolations: number, aProfilePenalty: number,
   bMax: number, bTotalCost: number, bSumSq: number, bRepeat: number, bFam: number,
+  bArtistRepeat: number, bProfileViolations: number, bProfilePenalty: number,
   depth: number,
 ): number {
+  if (aArtistRepeat !== bArtistRepeat) return aArtistRepeat - bArtistRepeat;
+  if (aProfileViolations !== bProfileViolations) return aProfileViolations - bProfileViolations;
   if (Math.abs(aMax - bMax) > 1e-9) return aMax - bMax;
   const aVar = partialVarianceFromScalars(aTotalCost, aSumSq, depth);
   const bVar = partialVarianceFromScalars(bTotalCost, bSumSq, depth);
   if (Math.abs(aVar - bVar) > 1e-9) return aVar - bVar;
+  if (Math.abs(aProfilePenalty - bProfilePenalty) > 1e-9) return aProfilePenalty - bProfilePenalty;
   if (Math.abs(aRepeat - bRepeat) > 1e-9) return aRepeat - bRepeat;
   if (Math.abs(aFam - bFam) > 1e-9) return aFam - bFam;
   return aTotalCost - bTotalCost;
@@ -210,9 +204,12 @@ function searchCachedBalancedFixedHopPathInner(
   const requestedLength = Math.max(2, Math.floor(options.requestedLength));
   const totalEdges = requestedLength - 1;
   const minSimilarity = clamp(options.minSimilarity ?? 0.08, 0.01, 0.95);
+  const popBias = options.popularityBias ?? 0;
+  const relBias = options.releaseAgeBias ?? 0;
+  const profileStrength = Math.abs(popBias) + Math.abs(relBias);
 
   // Solution cache: return previous result if graph hasn't changed
-  const cacheKey = solutionCacheKey(start.key, end.key, requestedLength, minSimilarity);
+  const cacheKey = solutionCacheKey(start.key, end.key, requestedLength, minSimilarity, options.maxArtistRepeat ?? 1, popBias, relBias);
   const gv = graphVersion();
   const cached = solutionCache.get(cacheKey);
   if (cached && cached.graphVersion === gv) return cached.result;
@@ -338,6 +335,82 @@ function searchCachedBalancedFixedHopPathInner(
 
   aggMap.clear();
 
+  // ── Pre-compute per-node profile penalty for profile-aware search ──
+  // When popularity/release-age settings are strong, each node gets a penalty
+  // reflecting how badly it violates the desired listening profile. This is
+  // computed once from persisted metadata and graph structure so the DP inner
+  // loop has zero async overhead.
+  const nodeProfilePenalty = new Float32Array(nodeCount);
+  const nodeProfileViolation = new Uint8Array(nodeCount); // 1 = hard violation
+  if (profileStrength >= 0.35) {
+    // Degrees already computed from adjacency
+    const nodeDegree = new Uint16Array(nodeCount);
+    for (let i = 0; i < nodeCount; i++) nodeDegree[i] = adj[i]!.length;
+
+    // Batch-load stored popularity/year metadata from generation tracks
+    const storedPop = new Float32Array(nodeCount).fill(-1);
+    const storedYear = new Int16Array(nodeCount).fill(0);
+    try {
+      const metaRows = db.query<{ canonical_key: string; metadata_json: string }, []>(
+        `SELECT canonical_key, metadata_json FROM radio_generation_tracks
+         WHERE metadata_json IS NOT NULL
+         GROUP BY canonical_key
+         HAVING MAX(created_at)`,
+      ).all();
+      for (const row of metaRows) {
+        const nid = nodeIndex.get(row.canonical_key);
+        if (nid == null) continue;
+        try {
+          const meta = JSON.parse(row.metadata_json) as Record<string, unknown>;
+          if (typeof meta.popularity === "number" && Number.isFinite(meta.popularity)) {
+            storedPop[nid] = clamp(meta.popularity as number, 0, 1);
+          }
+          if (typeof meta.releaseYear === "number" && Number.isFinite(meta.releaseYear)) {
+            storedYear[nid] = meta.releaseYear as number;
+          }
+        } catch { /* corrupt metadata row */ }
+      }
+    } catch { /* DB unavailable in test environments */ }
+
+    const currentYear = new Date().getUTCFullYear();
+    const wantsRare = popBias < -0.3;
+    const wantsRecent = relBias > 0.3;
+    const wantsOld = relBias < -0.3;
+    const profileFloor = 0.25;
+
+    for (let i = 0; i < nodeCount; i++) {
+      if (i === startId || i === endId) continue; // endpoints exempt
+      let penalty = 0;
+
+      // Popularity axis
+      const pop = storedPop[i]!;
+      if (pop >= 0 && popBias !== 0) {
+        const fit = popBias < 0 ? 1 - pop : pop;
+        penalty += (1 - fit) * Math.abs(popBias) * 0.4;
+      }
+
+      // Hub penalty: graph degree indicates genre centrality
+      if (wantsRare && nodeDegree[i]! > 0) {
+        const hubness = clamp(Math.log1p(nodeDegree[i]!) / Math.log1p(200), 0, 1);
+        penalty += hubness * Math.abs(popBias) * 0.3;
+      }
+
+      // Release-year axis
+      const year = storedYear[i]!;
+      if (year > 0 && relBias !== 0) {
+        const age = Math.max(0, currentYear - year);
+        const recency = clamp(Math.exp(-age / 7), 0, 1);
+        const fit = relBias < 0 ? 1 - recency : recency;
+        penalty += (1 - fit) * Math.abs(relBias) * 0.4;
+      } else if (year === 0 && (wantsRecent || wantsOld)) {
+        penalty += 0.15; // unknown year is not evidence of compliance
+      }
+
+      nodeProfilePenalty[i] = penalty;
+      nodeProfileViolation[i] = penalty > profileFloor ? 1 : 0;
+    }
+  }
+
   // ── Backward reachability: min hops from each node to endId ──
   const minHopsToEnd = new Int8Array(nodeCount).fill(-1);
   minHopsToEnd[endId] = 0;
@@ -383,6 +456,8 @@ function searchCachedBalancedFixedHopPathInner(
   {
     let current = startId;
     const visited = new Set<number>([startId]);
+    const greedyArtistCounts = new Map<string, number>();
+    greedyArtistCounts.set(normArtists[startId]!, 1);
     let greedyMax = 0;
     let ok = true;
     for (let d = 1; d <= totalEdges; d++) {
@@ -396,7 +471,7 @@ function searchCachedBalancedFixedHopPathInner(
       }
       const pos = d / totalEdges;
       const blockEndpoint = endpointArtistSet && totalEdges > 1
-        && pos >= 0.22 && pos <= 0.78;
+        && pos >= 0.001 && pos <= 0.999;
       let picked: CompactEdge | null = null;
       for (const e of adj[current]!) {
         if (visited.has(e.targetId)) continue;
@@ -404,12 +479,16 @@ function searchCachedBalancedFixedHopPathInner(
         const hops = minHopsToEnd[e.targetId];
         if (hops === -1 || hops > remaining) continue;
         if (blockEndpoint && endpointArtistSet!.has(normArtists[e.targetId]!)) continue;
+        const tgtArtist = normArtists[e.targetId]!;
+        if ((greedyArtistCounts.get(tgtArtist) ?? 0) >= (options.maxArtistRepeat ?? 1)) continue;
         picked = e;
         break;
       }
       if (!picked) { ok = false; break; }
       greedyMax = Math.max(greedyMax, picked.cost);
       visited.add(picked.targetId);
+      const pickedArtist = normArtists[picked.targetId]!;
+      greedyArtistCounts.set(pickedArtist, (greedyArtistCounts.get(pickedArtist) ?? 0) + 1);
       current = picked.targetId;
     }
     if (ok) upperBound = greedyMax;
@@ -417,6 +496,7 @@ function searchCachedBalancedFixedHopPathInner(
 
   // ── Layered DP with parent-pointer states ──
   const statePool: DPState[] = [];
+  const maxArtistRepeat = Math.max(1, options.maxArtistRepeat ?? 1);
   statePool.push({
     nodeId: startId,
     parentIdx: -1,
@@ -425,6 +505,9 @@ function searchCachedBalancedFixedHopPathInner(
     sumSquares: 0,
     repeatedArtistPenalty: 0,
     familiarityPenalty: 0,
+    artistRepeatCount: 0,
+    profilePenalty: 0,
+    profileViolations: 0,
     edgeSimilarity: 0,
     edgeConfidence: 0,
     edgeProvider: "",
@@ -439,6 +522,16 @@ function searchCachedBalancedFixedHopPathInner(
     return false;
   }
 
+  function countArtistInChain(stateIdx: number, artistNorm: string): number {
+    let count = 0;
+    let idx = stateIdx;
+    while (idx >= 0) {
+      if (normArtists[statePool[idx]!.nodeId] === artistNorm) count++;
+      idx = statePool[idx]!.parentIdx;
+    }
+    return count;
+  }
+
   let layer = new Map<number, number[]>();
   layer.set(startId, [0]);
   let candidatesEvaluated = 0;
@@ -449,8 +542,8 @@ function searchCachedBalancedFixedHopPathInner(
     const remainingAfterThis = totalEdges - depth;
     const isLastDepth = depth === totalEdges;
     const checkEndpointBlock = !isLastDepth && endpointArtistSet && totalEdges > 1;
-    const endpointBlockMin = 0.22;
-    const endpointBlockMax = 0.78;
+    const endpointBlockMin = 0.001;
+    const endpointBlockMax = 0.999;
     const position = depth / totalEdges;
     const positionInRange = position >= endpointBlockMin && position <= endpointBlockMax;
     const checkFamiliarity = !isLastDepth && options.familiarity != null;
@@ -477,13 +570,18 @@ function searchCachedBalancedFixedHopPathInner(
           const newSumSq = st.sumSquares + e.cost * e.cost;
           const endArtist = normArtists[endId]!;
           const newRepeat = st.repeatedArtistPenalty + (srcArtist === endArtist ? 0.08 : 0);
+          const newArtistRepeat = st.artistRepeatCount;
+          const newProfilePenalty = st.profilePenalty;
+          const newProfileViolations = st.profileViolations;
 
           const bucket = next.get(endId);
           if (bucket && bucket.length >= statesPerNode) {
             const worst = statePool[bucket[bucket.length - 1]!]!;
             const cmp = comparePartialScalars(
               newMaxCost, newTotalCost, newSumSq, newRepeat, st.familiarityPenalty,
+              newArtistRepeat, newProfileViolations, newProfilePenalty,
               worst.maxCost, worst.totalCost, worst.sumSquares, worst.repeatedArtistPenalty, worst.familiarityPenalty,
+              worst.artistRepeatCount, worst.profileViolations, worst.profilePenalty,
               depth,
             );
             if (cmp >= 0) continue;
@@ -498,6 +596,9 @@ function searchCachedBalancedFixedHopPathInner(
             sumSquares: newSumSq,
             repeatedArtistPenalty: newRepeat,
             familiarityPenalty: st.familiarityPenalty,
+            artistRepeatCount: newArtistRepeat,
+            profilePenalty: newProfilePenalty,
+            profileViolations: newProfileViolations,
             edgeSimilarity: e.similarity,
             edgeConfidence: e.confidence,
             edgeProvider: e.provider,
@@ -510,7 +611,9 @@ function searchCachedBalancedFixedHopPathInner(
             bucket.push(poolIdx);
             bucket.sort((a, b) => comparePartialScalars(
               statePool[a]!.maxCost, statePool[a]!.totalCost, statePool[a]!.sumSquares, statePool[a]!.repeatedArtistPenalty, statePool[a]!.familiarityPenalty,
+              statePool[a]!.artistRepeatCount, statePool[a]!.profileViolations, statePool[a]!.profilePenalty,
               statePool[b]!.maxCost, statePool[b]!.totalCost, statePool[b]!.sumSquares, statePool[b]!.repeatedArtistPenalty, statePool[b]!.familiarityPenalty,
+              statePool[b]!.artistRepeatCount, statePool[b]!.profileViolations, statePool[b]!.profilePenalty,
               depth,
             ));
             if (bucket.length > statesPerNode) bucket.length = statesPerNode;
@@ -546,10 +649,26 @@ function searchCachedBalancedFixedHopPathInner(
           // Duplicate check via parent-pointer walk
           if (isVisited(stateIdx, tgtId)) continue;
 
+          const tgtArtist = normArtists[tgtId]!;
+
+          // Hard artist diversity: count how many times this artist already
+          // appears in the partial path. Prune if it would exceed the limit.
+          const artistOccurrences = countArtistInChain(stateIdx, tgtArtist);
+          if (artistOccurrences >= maxArtistRepeat) continue;
+
           const newTotalCost = st.totalCost + e.cost;
           const newSumSq = st.sumSquares + e.cost * e.cost;
-          const tgtArtist = normArtists[tgtId]!;
           const newRepeat = st.repeatedArtistPenalty + (srcArtist === tgtArtist ? 0.08 : 0);
+          const newArtistRepeat = st.artistRepeatCount + (artistOccurrences > 0 ? 1 : 0);
+
+          const newProfilePenalty = st.profilePenalty + nodeProfilePenalty[tgtId]!;
+          const newProfileViolations = st.profileViolations + nodeProfileViolation[tgtId]!;
+
+          // Quota pruning: if we already have too many profile violations to
+          // possibly meet quotas, prune early. Allow up to ~30% of interior
+          // slots to be violations. Remaining hops can't fix existing violations.
+          const maxAllowedViolations = Math.ceil((totalEdges - 1) * 0.35);
+          if (profileStrength >= 0.7 && newProfileViolations > maxAllowedViolations) continue;
 
           let newFam = st.familiarityPenalty;
           if (checkFamiliarity) {
@@ -563,7 +682,9 @@ function searchCachedBalancedFixedHopPathInner(
             const worst = statePool[bucket[bucket.length - 1]!]!;
             const cmp = comparePartialScalars(
               candidateMax, newTotalCost, newSumSq, newRepeat, newFam,
+              newArtistRepeat, newProfileViolations, newProfilePenalty,
               worst.maxCost, worst.totalCost, worst.sumSquares, worst.repeatedArtistPenalty, worst.familiarityPenalty,
+              worst.artistRepeatCount, worst.profileViolations, worst.profilePenalty,
               depth,
             );
             if (cmp >= 0) continue;
@@ -578,6 +699,9 @@ function searchCachedBalancedFixedHopPathInner(
             sumSquares: newSumSq,
             repeatedArtistPenalty: newRepeat,
             familiarityPenalty: newFam,
+            artistRepeatCount: newArtistRepeat,
+            profilePenalty: newProfilePenalty,
+            profileViolations: newProfileViolations,
             edgeSimilarity: e.similarity,
             edgeConfidence: e.confidence,
             edgeProvider: e.provider,
@@ -590,7 +714,9 @@ function searchCachedBalancedFixedHopPathInner(
             bucket.push(poolIdx);
             bucket.sort((a, b) => comparePartialScalars(
               statePool[a]!.maxCost, statePool[a]!.totalCost, statePool[a]!.sumSquares, statePool[a]!.repeatedArtistPenalty, statePool[a]!.familiarityPenalty,
+              statePool[a]!.artistRepeatCount, statePool[a]!.profileViolations, statePool[a]!.profilePenalty,
               statePool[b]!.maxCost, statePool[b]!.totalCost, statePool[b]!.sumSquares, statePool[b]!.repeatedArtistPenalty, statePool[b]!.familiarityPenalty,
+              statePool[b]!.artistRepeatCount, statePool[b]!.profileViolations, statePool[b]!.profilePenalty,
               depth,
             ));
             if (bucket.length > statesPerNode) bucket.length = statesPerNode;
@@ -639,6 +765,9 @@ function searchCachedBalancedFixedHopPathInner(
   const bestMax = Math.min(...finals.map((f) => f.state.maxCost));
   const eligible = finals.filter((f) => f.state.maxCost <= bestMax * 1.02 + 1e-9);
   eligible.sort((a, b) => {
+    if (a.state.artistRepeatCount !== b.state.artistRepeatCount) return a.state.artistRepeatCount - b.state.artistRepeatCount;
+    if (a.state.profileViolations !== b.state.profileViolations) return a.state.profileViolations - b.state.profileViolations;
+    if (Math.abs(a.state.profilePenalty - b.state.profilePenalty) > 1e-9) return a.state.profilePenalty - b.state.profilePenalty;
     const am = spacingMetrics(a.edges);
     const bm = spacingMetrics(b.edges);
     if (Math.abs(am.maxShare - bm.maxShare) > 1e-9) return am.maxShare - bm.maxShare;

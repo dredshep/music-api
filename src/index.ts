@@ -48,8 +48,10 @@ app.onError((err, c) => {
 
 app.use("*", failBanMiddleware());
 app.use("*", bodyLimit({
-  maxSize: 128 * 1024,
-  onError: (c) => c.json({ error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 128KB limit", retryable: false } }, 413),
+  // Ownership refresh batches contain up to 500 track descriptors. Keep the
+  // limit bounded while allowing even long-but-valid metadata fields.
+  maxSize: 1024 * 1024,
+  onError: (c) => c.json({ error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 1MB limit", retryable: false } }, 413),
 }));
 app.use("*", errorHandler());
 

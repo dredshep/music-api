@@ -17,6 +17,9 @@ export type BalancedFixedHopSearchOptions = {
   minSimilarity?: number;
   endpointArtists?: [string, string] | null;
   familiarity?: (recording: GradientRecording) => number | null;
+  maxArtistRepeat?: number;
+  popularityBias?: number;
+  releaseAgeBias?: number;
 };
 
 export type BalancedFixedHopSearchResult = {
@@ -105,7 +108,7 @@ function endpointArtistBlocked(
 ) {
   if (!endpoints || totalEdges <= 1) return false;
   const position = absoluteDepth / totalEdges;
-  if (position < 0.22 || position > 0.78) return false;
+  if (position <= 0.001 || position >= 0.999) return false;
   const artist = normalizedArtist(recording);
   return endpoints.map((value) => normalizeForComparison(value)).includes(artist);
 }
@@ -262,6 +265,9 @@ export async function searchBalancedFixedHopPath(
       minSimilarity: options.minSimilarity,
       endpointArtists: options.endpointArtists,
       familiarity: options.familiarity,
+      maxArtistRepeat: options.maxArtistRepeat,
+      popularityBias: options.popularityBias,
+      releaseAgeBias: options.releaseAgeBias,
     });
     if (cached.path) {
       return {

@@ -16,6 +16,11 @@ export function primaryRadioArtistCredit(value: string) {
   return splitRadioArtistCredit(value)[0] ?? value.trim();
 }
 
+/** Stable key for artist cooldown / spacing (`Draconian feat. X` → `draconian`). */
+export function radioArtistCooldownKey(value: string) {
+  return normalizeForComparison(primaryRadioArtistCredit(value));
+}
+
 export function radioArtistCreditMatches(source: string, candidate: string) {
   const sourceFull = normalizeForComparison(source);
   const candidateFull = normalizeForComparison(candidate);

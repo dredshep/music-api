@@ -366,4 +366,20 @@ export const MIGRATIONS = [
         ON search_variants(semantic_search_id, query_fingerprint);
     `,
   },
+  {
+    version: 12,
+    sql: `
+      -- Durable whole-library ownership source. Expiration marks a snapshot
+      -- stale for background scheduling but never makes it unservable.
+      CREATE TABLE IF NOT EXISTS library_snapshots (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        version TEXT NOT NULL,
+        songs_json TEXT NOT NULL,
+        song_count INTEGER NOT NULL DEFAULT 0,
+        built_at DATETIME NOT NULL,
+        expires_at DATETIME NOT NULL,
+        last_error TEXT
+      );
+    `,
+  },
 ];
