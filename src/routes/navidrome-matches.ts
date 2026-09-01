@@ -43,6 +43,28 @@ type NavidromeMatchResponse = {
   } | null;
 };
 
+type TrackMatchPayload = {
+  results: NavidromeMatchResponse[];
+  summary: {
+    matched: number;
+    possible_match: number;
+    not_found: number;
+    unchecked: number;
+  };
+  snapshot_version: string | null;
+  snapshot_built_at: string | null;
+  snapshot_total: number;
+  snapshot_stale: boolean;
+  snapshot_rebuild_error: string | null;
+  snapshot: {
+    version: string;
+    built_at: string;
+    total: number;
+    stale: boolean;
+    last_error: string | null;
+  } | null;
+};
+
 function cacheKey(track: InputTrack, snapshotVersion: string) {
   const durationBucket = track.duration_ms ? Math.round(track.duration_ms / 5000) : 0;
   return [
@@ -99,26 +121,12 @@ function lookupTrack(track: InputTrack, snapshot: LibrarySnapshot): NavidromeMat
   }
 }
 
-async function handleTrackMatchRequest(c: { req: { json: () => Promise<unknown> }; json: (body: unknown, status?: number) => Response }) {
-  const parsed = bodySchema.safeParse(await c.req.json().catch(() => ({})));
-  if (!parsed.success) {
-    return c.json(
-      {
-        error: {
-          code: "VALIDATION_ERROR",
-          message: parsed.error.issues.map((issue) => issue.message).join("; "),
-          retryable: false,
-        },
-      },
-      400
-    );
-  }
-
+async function buildTrackMatchPayload(tracks: InputTrack[], refreshLibrarySnapshot: boolean): Promise<TrackMatchPayload> {
   const previous = getLibrarySnapshot();
   let snapshot: LibrarySnapshot | null = null;
   let snapshotError: string | null = null;
   try {
-    snapshot = await getOrBuildLibrarySnapshot(parsed.data.refresh_library_snapshot);
+    snapshot = await getOrBuildLibrarySnapshot(refreshLibrarySnapshot);
     snapshotError = snapshot.lastError;
   } catch (error) {
     snapshotError = error instanceof Error ? error.message : String(error);
@@ -126,8 +134,8 @@ async function handleTrackMatchRequest(c: { req: { json: () => Promise<unknown> 
   }
 
   const results: NavidromeMatchResponse[] = snapshot
-    ? parsed.data.tracks.map((track) => lookupTrack(track, snapshot!))
-    : parsed.data.tracks.map((track) => ({ id: track.id, status: "unchecked" as const, confidence: 0, match: null }));
+    ? tracks.map((track) => lookupTrack(track, snapshot!))
+    : tracks.map((track) => ({ id: track.id, status: "unchecked" as const, confidence: 0, match: null }));
   const summary = {
     matched: results.filter((r) => r.status === "matched").length,
     possible_match: results.filter((r) => r.status === "possible_match").length,
@@ -135,7 +143,7 @@ async function handleTrackMatchRequest(c: { req: { json: () => Promise<unknown> 
     unchecked: results.filter((r) => r.status === "unchecked").length,
   };
 
-  return c.json({
+  return {
     results,
     summary,
     snapshot_version: snapshot?.version ?? null,
@@ -152,8 +160,68 @@ async function handleTrackMatchRequest(c: { req: { json: () => Promise<unknown> 
           last_error: snapshot.lastError,
         }
       : null,
-  });
+  };
 }
 
-navidromeMatchRoutes.post("/navidrome/matches/tracks", handleTrackMatchRequest);
-navidromeMatchRoutes.post("/library/ownership/tracks", handleTrackMatchRequest);
+export function toLegacyOwnershipPayload(payload: TrackMatchPayload) {
+  const statusMap = {
+    matched: "owned",
+    possible_match: "uncertain",
+    not_found: "missing",
+    unchecked: "unknown",
+  } as const;
+
+  return {
+    ...payload,
+    results: payload.results.map((result) => ({
+      ...result,
+      status: statusMap[result.status],
+    })),
+    summary: {
+      owned: payload.summary.matched,
+      uncertain: payload.summary.possible_match,
+      missing: payload.summary.not_found,
+      unknown: payload.summary.unchecked,
+    },
+  };
+}
+
+async function parseTrackMatchRequest(c: { req: { json: () => Promise<unknown> }; json: (body: unknown, status?: number) => Response }) {
+  const parsed = bodySchema.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) {
+    return {
+      response: c.json(
+        {
+          error: {
+            code: "VALIDATION_ERROR",
+            message: parsed.error.issues.map((issue) => issue.message).join("; "),
+            retryable: false,
+          },
+        },
+        400
+      ),
+      data: null,
+    };
+  }
+  return { response: null, data: parsed.data };
+}
+
+navidromeMatchRoutes.post("/navidrome/matches/tracks", async (c) => {
+  const parsed = await parseTrackMatchRequest(c);
+  if (parsed.response) return parsed.response;
+  const payload = await buildTrackMatchPayload(
+    parsed.data!.tracks,
+    parsed.data!.refresh_library_snapshot
+  );
+  return c.json(payload);
+});
+
+navidromeMatchRoutes.post("/library/ownership/tracks", async (c) => {
+  const parsed = await parseTrackMatchRequest(c);
+  if (parsed.response) return parsed.response;
+  const payload = await buildTrackMatchPayload(
+    parsed.data!.tracks,
+    parsed.data!.refresh_library_snapshot
+  );
+  return c.json(toLegacyOwnershipPayload(payload));
+});

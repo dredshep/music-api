@@ -159,12 +159,20 @@ export interface RadioFeedbackRow {
   created_at: string;
 }
 
-export function parseRadioSettings(value?: string | null): RadioSettings {
-  let patch: Partial<RadioSettings> & { ownedBias?: number } = {};
-  try { if (value) patch = JSON.parse(value) as Partial<RadioSettings> & { ownedBias?: number }; } catch { /* use defaults */ }
-  if (patch.navidromeBias == null && patch.ownedBias != null) {
-    patch.navidromeBias = patch.ownedBias;
+export type LegacyRadioSettingsPatch = Partial<RadioSettings> & { ownedBias?: number };
+
+export function normalizeRadioSettingsPatch(input: LegacyRadioSettingsPatch): Partial<RadioSettings> {
+  const { ownedBias, ...patch } = input;
+  if (patch.navidromeBias == null && ownedBias != null) {
+    patch.navidromeBias = ownedBias;
   }
+  return patch;
+}
+
+export function parseRadioSettings(value?: string | null): RadioSettings {
+  let rawPatch: LegacyRadioSettingsPatch = {};
+  try { if (value) rawPatch = JSON.parse(value) as LegacyRadioSettingsPatch; } catch { /* use defaults */ }
+  const patch = normalizeRadioSettingsPatch(rawPatch);
   return {
     ...DEFAULT_RADIO_SETTINGS,
     ...patch,

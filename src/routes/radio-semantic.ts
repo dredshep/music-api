@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { z } from "zod";
 import { AppError } from "../middleware/errors";
+import { normalizeRadioSettingsPatch } from "../db/repositories/radio";
 import {
   createRadio,
   listRadioStations,
@@ -35,6 +36,7 @@ const partialSettingsSchema = z.object({
   familiarity: z.number().min(0).max(1).optional(),
   knownBias: z.number().min(-1).max(1).optional(),
   navidromeBias: z.number().min(-1).max(1).optional(),
+  ownedBias: z.number().min(-1).max(1).optional(),
   sameArtistBias: z.number().min(-1).max(1).optional(),
   popularityBias: z.number().min(-1).max(1).optional(),
   releaseAgeBias: z.number().min(-1).max(1).optional(),
@@ -50,7 +52,7 @@ const partialSettingsSchema = z.object({
   gradientRouteWidth: z.number().min(0.05).max(0.6).optional(),
   providerWeights: z.record(z.number().min(0).max(5)).optional(),
   djWeights: z.record(z.number().min(0).max(5)).optional(),
-});
+}).transform(normalizeRadioSettingsPatch);
 
 const createSchema = z.object({
   name: z.string().min(1).max(200),
