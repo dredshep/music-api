@@ -15,8 +15,8 @@ function makeCandidate(overrides: Partial<CanonicalCandidate> = {}): CanonicalCa
     artistName: "Test Artist",
     releaseTitle: null,
     firstReleaseDate: null,
-    ownershipState: "missing",
-    ownershipConfidence: 0.9,
+    navidromeMatchStatus: "not_found",
+    navidromeMatchConfidence: 0.9,
     evidence: [
       {
         source: "lastfm_similar",
@@ -144,17 +144,17 @@ describe("recommendation scoring", () => {
     expect(scored.scoreBreakdown.recency).toBe(0.5);
   });
 
-  test("artist type with missing ownership gets max novelty", () => {
-    const candidate = makeCandidate({ type: "artist", ownershipState: "missing" });
+  test("artist type with not found in Navidrome gets max novelty", () => {
+    const candidate = makeCandidate({ type: "artist", navidromeMatchStatus: "not_found" });
     const scored = scoreCandidate(candidate);
     expect(scored.scoreBreakdown.novelty).toBe(1.0);
   });
 
-  test("release_group with missing ownership gets high novelty", () => {
+  test("release_group with not found in Navidrome gets high novelty", () => {
     const candidate = makeCandidate({
       type: "release_group",
       releaseGroupMbid: "rg-1",
-      ownershipState: "missing",
+      navidromeMatchStatus: "not_found",
     });
     const scored = scoreCandidate(candidate);
     expect(scored.scoreBreakdown.novelty).toBe(0.9);

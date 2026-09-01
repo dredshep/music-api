@@ -25,7 +25,7 @@ export interface GradientTrackEvidence {
   isEndpoint: boolean;
   routePosition: number | null;
 
-  ownedExact: boolean;
+  navidromeExact: boolean;
   knownExact: boolean;
   knownArtist: boolean;
   familiarityValue: number | null;
@@ -61,7 +61,7 @@ export interface GradientRouteCompliance {
   };
 
   discovery: {
-    ownedInteriorCount: number;
+    navidromeInteriorCount: number;
     knownExactInteriorCount: number;
     knownArtistInteriorCount: number;
     unknownInteriorCount: number;
@@ -171,25 +171,25 @@ function loadGraphDegrees(): Map<string, number> {
 
 // ─── Library / familiarity evidence ─────────────────────────────────
 
-interface OwnershipEvidence {
-  ownedKeys: Set<string>;
-  ownedArtists: Set<string>;
+interface NavidromePresenceEvidence {
+  navidromeKeys: Set<string>;
+  navidromeArtists: Set<string>;
   knownKeys: Set<string>;
   knownArtists: Set<string>;
 }
 
-function loadOwnershipEvidence(stationId: string | null): OwnershipEvidence {
-  const result: OwnershipEvidence = {
-    ownedKeys: new Set(),
-    ownedArtists: new Set(),
+function loadNavidromePresenceEvidence(stationId: string | null): NavidromePresenceEvidence {
+  const result: NavidromePresenceEvidence = {
+    navidromeKeys: new Set(),
+    navidromeArtists: new Set(),
     knownKeys: new Set(),
     knownArtists: new Set(),
   };
   try {
     const db = getDb();
-    const rows = db.query<{ canonical_key: string; artist: string; locally_owned: number }, [string]>(
+    const rows = db.query<{ canonical_key: string; artist: string; in_navidrome: number }, [string]>(
       `SELECT t.canonical_key, t.artist,
-              MAX(CASE WHEN t.navidrome_id IS NOT NULL THEN 1 ELSE 0 END) AS locally_owned
+              MAX(CASE WHEN t.navidrome_id IS NOT NULL THEN 1 ELSE 0 END) AS in_navidrome
        FROM radio_generation_tracks t
        JOIN radio_generations g ON g.id = t.generation_id
        WHERE g.station_id = ?
@@ -198,19 +198,19 @@ function loadOwnershipEvidence(stationId: string | null): OwnershipEvidence {
     for (const row of rows) {
       result.knownKeys.add(row.canonical_key);
       result.knownArtists.add(normalizeForComparison(row.artist));
-      if (row.locally_owned) {
-        result.ownedKeys.add(row.canonical_key);
-        result.ownedArtists.add(normalizeForComparison(row.artist));
+      if (row.in_navidrome) {
+        result.navidromeKeys.add(row.canonical_key);
+        result.navidromeArtists.add(normalizeForComparison(row.artist));
       }
     }
-    // Also check tracks with navidrome_id across all stations (truly owned)
-    const owned = db.query<{ canonical_key: string; artist: string }, []>(
+    // Also check tracks with navidrome_id across all stations (truly in Navidrome)
+    const inNavidrome = db.query<{ canonical_key: string; artist: string }, []>(
       `SELECT DISTINCT canonical_key, artist FROM radio_generation_tracks
        WHERE navidrome_id IS NOT NULL`,
     ).all();
-    for (const row of owned) {
-      result.ownedKeys.add(row.canonical_key);
-      result.ownedArtists.add(normalizeForComparison(row.artist));
+    for (const row of inNavidrome) {
+      result.navidromeKeys.add(row.canonical_key);
+      result.navidromeArtists.add(normalizeForComparison(row.artist));
     }
   } catch { /* tests / missing DB */ }
   return result;
@@ -230,7 +230,7 @@ export async function auditGradientRoute(input: {
   const { recordings, edges, intent, settings } = input;
   const endpointArtistsNorm = intent.endpointArtists?.map(normalizeForComparison) ?? [];
   const graphDegrees = loadGraphDegrees();
-  const ownership = loadOwnershipEvidence(input.stationId ?? null);
+  const navidromePresence = loadNavidromePresenceEvidence(input.stationId ?? null);
 
   const currentYear = new Date().getUTCFullYear();
   const recentWindow = 8;
@@ -251,12 +251,12 @@ export async function auditGradientRoute(input: {
     const profile = trackProfiles[i]!;
     const famVal = input.familiarity?.(rec) ?? null;
 
-    const ownedExact = ownership.ownedKeys.has(canonKey);
-    const knownExact = ownership.knownKeys.has(canonKey);
-    const knownArtist = ownership.knownArtists.has(artistNorm) || ownership.ownedArtists.has(artistNorm);
+    const navidromeExact = navidromePresence.navidromeKeys.has(canonKey);
+    const knownExact = navidromePresence.knownKeys.has(canonKey);
+    const knownArtist = navidromePresence.knownArtists.has(artistNorm) || navidromePresence.navidromeArtists.has(artistNorm);
 
     let familiaritySource = "unknown";
-    if (famVal != null) familiaritySource = ownedExact ? "owned" : knownExact ? "history" : knownArtist ? "artist" : "taste";
+    if (famVal != null) familiaritySource = navidromeExact ? "in_navidrome" : knownExact ? "history" : knownArtist ? "artist" : "taste";
 
     const degree = graphDegrees.get(rec.key) ?? graphDegrees.get(canonKey) ?? 0;
     const pop = profile.popularity ?? (profile.listeners ? normalizeGlobalPopularity(profile.listeners) : null);
@@ -272,7 +272,7 @@ export async function auditGradientRoute(input: {
       title: rec.title,
       isEndpoint,
       routePosition: rec.routePosition ?? null,
-      ownedExact,
+      navidromeExact,
       knownExact,
       knownArtist,
       familiarityValue: famVal,
@@ -307,14 +307,14 @@ export async function auditGradientRoute(input: {
   const diversityPass = endpointInterior === 0 && maxArtistOcc <= 1 && uniqueRatio >= 0.8;
 
   // ── Discovery ──
-  const owned = interior.filter((t) => t.ownedExact).length;
+  const inNavidromeInterior = interior.filter((t) => t.navidromeExact).length;
   const knownExact = interior.filter((t) => t.knownExact).length;
   const knownArtist = interior.filter((t) => t.knownArtist).length;
   const unknownEvidence = interior.filter((t) => t.familiarityValue == null && !t.knownArtist && !t.knownExact).length;
-  const genuinelyNew = interior.filter((t) => !t.ownedExact && !t.knownExact && !t.knownArtist && t.familiarityValue == null).length;
+  const genuinelyNew = interior.filter((t) => !t.navidromeExact && !t.knownExact && !t.knownArtist && t.familiarityValue == null).length;
   // For "mostly new," unknown does NOT count as new. Only tracks with evidence of being outside library.
   // Since we can't prove positively-new easily, we count tracks where artist is NOT in library.
-  const positivelyUnknownArtist = interior.filter((t) => !t.knownArtist && !t.ownedExact).length;
+  const positivelyUnknownArtist = interior.filter((t) => !t.knownArtist && !t.navidromeExact).length;
   const discoveryRatio = interiorCount > 0 ? positivelyUnknownArtist / interiorCount : 1;
   const discoveryPass = intent.discoveryTarget > 0.5 ? discoveryRatio >= 0.6 : true;
 
@@ -377,7 +377,7 @@ export async function auditGradientRoute(input: {
       pass: diversityPass,
     },
     discovery: {
-      ownedInteriorCount: owned,
+      navidromeInteriorCount: inNavidromeInterior,
       knownExactInteriorCount: knownExact,
       knownArtistInteriorCount: knownArtist,
       unknownInteriorCount: unknownEvidence,
@@ -431,7 +431,7 @@ export function formatComplianceReport(c: GradientRouteCompliance, intent: Gradi
   lines.push(``);
 
   lines.push(`[${passIcon(c.discovery.pass)}] DISCOVERY (target: ${(intent.discoveryTarget * 100).toFixed(0)}% new)`);
-  lines.push(`  Owned interior: ${c.discovery.ownedInteriorCount}`);
+  lines.push(`  In Navidrome interior: ${c.discovery.navidromeInteriorCount}`);
   lines.push(`  Known exact: ${c.discovery.knownExactInteriorCount}`);
   lines.push(`  Known artist: ${c.discovery.knownArtistInteriorCount}`);
   lines.push(`  Unknown evidence: ${c.discovery.unknownInteriorCount}`);
@@ -472,7 +472,7 @@ export function formatComplianceReport(c: GradientRouteCompliance, intent: Gradi
     if (t.isEndpoint) flags.push("ENDPOINT");
     if (t.isDuplicateArtist) flags.push("DUP_ARTIST");
     if (t.isEndpointArtistInterior) flags.push("ENDPOINT_ARTIST_INTERIOR");
-    if (t.ownedExact) flags.push("OWNED");
+    if (t.navidromeExact) flags.push("IN_NAVIDROME");
     if (t.knownExact) flags.push("KNOWN");
     if (t.knownArtist) flags.push("KNOWN_ARTIST");
     lines.push(`  ${t.index.toString().padStart(2)}. ${t.artist} — ${t.title}`);

@@ -42,27 +42,27 @@ const mockAlbums: LibraryAlbum[] = [
 ];
 
 describe("matchLibraryAlbums", () => {
-  test("exact artist + title match is owned", () => {
+  test("exact artist + title match is matched", () => {
     const result = matchLibraryAlbums("Massive Attack", "Mezzanine", mockAlbums);
-    expect(result.owned).toBe(true);
+    expect(result.matched).toBe(true);
     expect(result.confidence).toBeGreaterThanOrEqual(0.9);
     expect(result.matches[0]?.navidromeId).toBe("nav-1");
   });
 
   test("deluxe edition satisfies base title", () => {
     const result = matchLibraryAlbums("Massive Attack", "Mezzanine", [mockAlbums[2]!]);
-    expect(result.owned).toBe(true);
+    expect(result.matched).toBe(true);
     expect(result.matches[0]?.matchReasons).toContain("title_edition_variant");
   });
 
   test("different artist does not match", () => {
     const result = matchLibraryAlbums("Radiohead", "Mezzanine", mockAlbums);
-    expect(result.owned).toBe(false);
+    expect(result.matched).toBe(false);
   });
 
   test("different title does not match", () => {
     const result = matchLibraryAlbums("Massive Attack", "Blue Lines", mockAlbums);
-    expect(result.owned).toBe(false);
+    expect(result.matched).toBe(false);
   });
 
   test("year match improves confidence", () => {
@@ -77,18 +77,18 @@ describe("matchLibraryAlbums", () => {
 });
 
 describe("classifyConfidence", () => {
-  test("high confidence is owned", () => {
-    expect(classifyConfidence(0.95)).toBe("owned");
-    expect(classifyConfidence(0.90)).toBe("owned");
+  test("high confidence is matched", () => {
+    expect(classifyConfidence(0.95)).toBe("matched");
+    expect(classifyConfidence(0.90)).toBe("matched");
   });
 
-  test("medium confidence is uncertain", () => {
-    expect(classifyConfidence(0.75)).toBe("uncertain");
-    expect(classifyConfidence(0.65)).toBe("uncertain");
+  test("medium confidence is possible_match", () => {
+    expect(classifyConfidence(0.75)).toBe("possible_match");
+    expect(classifyConfidence(0.65)).toBe("possible_match");
   });
 
-  test("low confidence is missing", () => {
-    expect(classifyConfidence(0.5)).toBe("missing");
-    expect(classifyConfidence(0.0)).toBe("missing");
+  test("low confidence is not_found", () => {
+    expect(classifyConfidence(0.5)).toBe("not_found");
+    expect(classifyConfidence(0.0)).toBe("not_found");
   });
 });

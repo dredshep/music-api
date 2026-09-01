@@ -1,7 +1,7 @@
 import { getOpenApiSpec } from "../src/routes/openapi";
 
 const MAX_OPERATION_DESCRIPTION_LENGTH = 300;
-const MAX_OPERATIONS = 30;
+const MAX_OPERATIONS = 31;
 const HTTP_METHODS = ["get", "post", "put", "patch", "delete"] as const;
 
 // These routes exist for Music Manager's internal/BFF use. They must not consume

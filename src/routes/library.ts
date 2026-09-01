@@ -56,10 +56,10 @@ libraryRoutes.post("/library/search", async (c) => {
   });
 
   // Match
-  const ownershipResult = matchLibraryAlbums(artist, title || artist, results.albums);
+  const matchResult = matchLibraryAlbums(artist, title || artist, results.albums);
 
   const matches = await Promise.all(
-    ownershipResult.matches.map(async (m) => {
+    matchResult.matches.map(async (m) => {
       const entry: Record<string, unknown> = {
         artist: m.artist,
         title: m.title,
@@ -73,7 +73,7 @@ libraryRoutes.post("/library/search", async (c) => {
       if (
         include_songs &&
         m.confidence >= 0.85 &&
-        ownershipResult.matches[0]?.navidromeId === m.navidromeId
+        matchResult.matches[0]?.navidromeId === m.navidromeId
       ) {
         try {
           const albumData = await navidrome.getAlbum(m.navidromeId);
@@ -130,21 +130,21 @@ libraryRoutes.post("/library/search", async (c) => {
 
   const response = {
     query: { artist, title: title || undefined, release_type },
-    owned: ownershipResult.owned,
-    confidence: Math.round(ownershipResult.confidence * 100) / 100,
-    indexed: ownershipResult.owned,
+    matched: matchResult.matched,
+    confidence: Math.round(matchResult.confidence * 100) / 100,
+    indexed: matchResult.matched,
     scan: scanStatus,
     matches,
     recent_downloads: recentDownloads,
     handoff_hint: buildHandoffHint({
-      owned: ownershipResult.owned,
+      matched: matchResult.matched,
       scanning: scanStatus?.scanning,
       recentDownloads,
       topMatch: matches[0],
     }),
   };
 
-  // Cache ownership match only (downloads/scan stay fresh on each request when include_downloads)
+  // Cache Navidrome match only (downloads/scan stay fresh on each request when include_downloads)
   if (!include_downloads) {
     setCache(cacheKey, response, config.LIBRARY_CACHE_MINUTES * 60 * 1000);
   }
@@ -153,22 +153,22 @@ libraryRoutes.post("/library/search", async (c) => {
 });
 
 function buildHandoffHint(params: {
-  owned: boolean;
+  matched: boolean;
   scanning?: boolean;
   recentDownloads?: Array<Record<string, unknown>>;
   topMatch?: Record<string, unknown>;
 }): string {
-  const { owned, scanning, recentDownloads, topMatch } = params;
+  const { matched, scanning, recentDownloads, topMatch } = params;
   const hasCompletedJob = recentDownloads?.some((j) => j.status === "completed");
 
-  if (owned && topMatch?.navidrome_id) {
+  if (matched && topMatch?.navidrome_id) {
     if (topMatch.songs) {
       return "Release indexed. Use navidrome_id from matches[0] with auditReleaseLyrics or fillMissingLyrics.";
     }
     return "Release indexed. Use matches[0].navidrome_id with auditReleaseLyrics or fillMissingLyrics.";
   }
 
-  if (hasCompletedJob && !owned) {
+  if (hasCompletedJob && !matched) {
     if (scanning) {
       return "Download completed but not indexed yet. Navidrome scan in progress — retry searchLibrary, then run lyrics audit/fill.";
     }

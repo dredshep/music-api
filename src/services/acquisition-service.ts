@@ -294,7 +294,7 @@ async function verifyCompletedAcquisition(
   job: JobRecord
 ): Promise<void> {
   // Track acquisitions use matched-only transfer semantics. For them,
-  // successful transfer completion is sufficient; album ownership matching is
+  // successful transfer completion is sufficient; album Navidrome matching is
   // intentionally release-oriented.
   if (acquisition.release_type === "track") {
     updateAcquisitionStatus(acquisition.id, "completed");
@@ -303,9 +303,9 @@ async function verifyCompletedAcquisition(
 
   const query = `${acquisition.artist} ${acquisition.title}`;
   const results = await navidrome.search3(query, { albumCount: 20, songCount: 0 });
-  const ownership = matchLibraryAlbums(acquisition.artist, acquisition.title, results.albums);
+  const matchResult = matchLibraryAlbums(acquisition.artist, acquisition.title, results.albums);
 
-  if (ownership.owned && ownership.confidence >= 0.9) {
+  if (matchResult.matched && matchResult.confidence >= 0.9) {
     updateAcquisitionStatus(acquisition.id, "completed");
     log("info", "acquisition_completed", {
       acquisition_id: acquisition.id,

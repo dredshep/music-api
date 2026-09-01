@@ -1,5 +1,6 @@
 import { getDb } from "../database";
 import { ulid } from "ulid";
+import type { NavidromeMatchStatus } from "../../domain/navidrome-matching";
 
 // --- Types ---
 
@@ -7,7 +8,7 @@ export type GenerationStatus = "running" | "completed" | "partial" | "failed";
 export type RecommendationType = "artist" | "release_group";
 export type RecommendationSource = "lastfm_similar" | "listenbrainz_cf" | "musicbrainz_new_release";
 export type RecommendationReason = "similar_to_recent" | "similar_to_favorite" | "collaborative" | "new_release" | "wildcard";
-export type OwnershipState = "owned" | "missing" | "uncertain" | "unknown";
+export type { NavidromeMatchStatus };
 export type FeedbackValue = "love" | "interested" | "meh" | "dislike" | "already_know";
 export type RecommendationStatus = "active" | "suppressed" | "dismissed";
 
@@ -36,8 +37,8 @@ export interface CandidateRecord {
   artist_name: string;
   release_title: string | null;
   first_release_date: string | null;
-  ownership_state: OwnershipState;
-  ownership_confidence: number;
+  navidrome_match_status: NavidromeMatchStatus | "unchecked";
+  navidrome_match_confidence: number;
   score: number;
   score_breakdown_json: string | null;
   primary_reason: RecommendationReason | null;
@@ -70,7 +71,7 @@ export interface RecommendationRecord {
   score: number;
   score_breakdown_json: string | null;
   primary_reason: RecommendationReason | null;
-  ownership_state: OwnershipState;
+  navidrome_match_status: NavidromeMatchStatus | "unchecked";
   first_seen_at: string;
   last_seen_at: string;
   last_recommended_at: string | null;
@@ -164,8 +165,8 @@ export function createCandidate(params: {
   artistName: string;
   releaseTitle: string | null;
   firstReleaseDate: string | null;
-  ownershipState: OwnershipState;
-  ownershipConfidence: number;
+  navidromeMatchStatus: NavidromeMatchStatus | "unchecked";
+  navidromeMatchConfidence: number;
   score: number;
   scoreBreakdown: Record<string, number> | null;
   primaryReason: RecommendationReason | null;
@@ -178,13 +179,13 @@ export function createCandidate(params: {
   db.query(`
     INSERT INTO recommendation_candidates
     (id, generation_id, type, artist_mbid, release_group_mbid, artist_name, release_title,
-     first_release_date, ownership_state, ownership_confidence, score, score_breakdown_json,
+     first_release_date, navidrome_match_status, navidrome_match_confidence, score, score_breakdown_json,
      primary_reason, selected, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, params.generationId, params.type, params.artistMbid, params.releaseGroupMbid,
     params.artistName, params.releaseTitle, params.firstReleaseDate,
-    params.ownershipState, params.ownershipConfidence, params.score,
+    params.navidromeMatchStatus, params.navidromeMatchConfidence, params.score,
     params.scoreBreakdown ? JSON.stringify(params.scoreBreakdown) : null,
     params.primaryReason, params.selected ? 1 : 0, now
   );
@@ -249,7 +250,7 @@ export function upsertRecommendation(params: {
   score: number;
   scoreBreakdown: Record<string, number> | null;
   primaryReason: RecommendationReason | null;
-  ownershipState: OwnershipState;
+  navidromeMatchStatus: NavidromeMatchStatus | "unchecked";
 }): string {
   const db = getDb();
   const now = new Date().toISOString();
@@ -260,7 +261,7 @@ export function upsertRecommendation(params: {
     db.query(`
       INSERT INTO recommendations
       (id, type, artist_mbid, release_group_mbid, artist_name, release_title,
-       first_release_date, score, score_breakdown_json, primary_reason, ownership_state,
+       first_release_date, score, score_breakdown_json, primary_reason, navidrome_match_status,
        first_seen_at, last_seen_at, last_recommended_at, times_seen, times_recommended,
        status, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)
@@ -268,7 +269,7 @@ export function upsertRecommendation(params: {
       id, params.type, params.artistMbid, params.releaseGroupMbid,
       params.artistName, params.releaseTitle, params.firstReleaseDate,
       params.score, params.scoreBreakdown ? JSON.stringify(params.scoreBreakdown) : null,
-      params.primaryReason, params.ownershipState, now, now, now, now, now
+      params.primaryReason, params.navidromeMatchStatus, now, now, now, now, now
     );
     return id;
   }
@@ -285,7 +286,7 @@ export function upsertRecommendation(params: {
     db.query(`
       UPDATE recommendations SET
         score = ?, score_breakdown_json = ?, primary_reason = ?,
-        ownership_state = ?, last_seen_at = ?, last_recommended_at = ?,
+        navidrome_match_status = ?, last_seen_at = ?, last_recommended_at = ?,
         times_seen = times_seen + 1, times_recommended = times_recommended + 1,
         artist_name = ?, release_title = COALESCE(?, release_title),
         first_release_date = COALESCE(?, first_release_date),
@@ -294,7 +295,7 @@ export function upsertRecommendation(params: {
       WHERE id = ?
     `).run(
       params.score, params.scoreBreakdown ? JSON.stringify(params.scoreBreakdown) : null,
-      params.primaryReason, params.ownershipState, now, now,
+      params.primaryReason, params.navidromeMatchStatus, now, now,
       params.artistName, params.releaseTitle, params.firstReleaseDate, now,
       existing.id
     );
@@ -305,7 +306,7 @@ export function upsertRecommendation(params: {
   db.query(`
     INSERT INTO recommendations
     (id, type, artist_mbid, release_group_mbid, artist_name, release_title,
-     first_release_date, score, score_breakdown_json, primary_reason, ownership_state,
+     first_release_date, score, score_breakdown_json, primary_reason, navidrome_match_status,
      first_seen_at, last_seen_at, last_recommended_at, times_seen, times_recommended,
      status, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 'active', ?, ?)
@@ -313,7 +314,7 @@ export function upsertRecommendation(params: {
     id, params.type, params.artistMbid, params.releaseGroupMbid,
     params.artistName, params.releaseTitle, params.firstReleaseDate,
     params.score, params.scoreBreakdown ? JSON.stringify(params.scoreBreakdown) : null,
-    params.primaryReason, params.ownershipState, now, now, now, now, now
+    params.primaryReason, params.navidromeMatchStatus, now, now, now, now, now
   );
   return id;
 }
@@ -329,8 +330,8 @@ export function listRecommendations(params?: {
   type?: RecommendationType;
   reason?: RecommendationReason;
   minScore?: number;
-  includeOwned?: boolean;
-  includeUncertain?: boolean;
+  includeMatched?: boolean;
+  includePossibleMatch?: boolean;
   status?: RecommendationStatus;
   limit?: number;
 }): RecommendationRecord[] {
@@ -354,12 +355,12 @@ export function listRecommendations(params?: {
     values.push(params.minScore);
   }
 
-  if (!params?.includeOwned) {
-    conditions.push("ownership_state != 'owned'");
+  if (!params?.includeMatched) {
+    conditions.push("navidrome_match_status != 'matched'");
   }
 
-  if (!params?.includeUncertain) {
-    conditions.push("ownership_state != 'uncertain'");
+  if (!params?.includePossibleMatch) {
+    conditions.push("navidrome_match_status != 'possible_match'");
   }
 
   if (params?.status) {

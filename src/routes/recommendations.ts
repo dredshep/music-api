@@ -22,7 +22,7 @@ export const recommendationRoutes = new Hono<{ Variables: AppVariables }>();
 const generateSchema = z.object({
   limit: z.number().int().min(1).max(200).optional(),
   sources: z.array(z.enum(["lastfm_similar", "listenbrainz_cf", "musicbrainz_new_release"])).max(3).optional(),
-  include_uncertain: z.boolean().optional(),
+  include_possible_match: z.boolean().optional(),
 }).optional();
 
 const feedbackSchema = z.object({
@@ -38,7 +38,7 @@ recommendationRoutes.post("/recommendations/generate", async (c) => {
     const options: GenerateOptions = {
       limit: parsed?.limit,
       sources: parsed?.sources as RecommendationSource[] | undefined,
-      includeUncertain: parsed?.include_uncertain,
+      includePossibleMatch: parsed?.include_possible_match,
     };
 
     const result = await runGeneration(options);
@@ -58,15 +58,15 @@ recommendationRoutes.get("/recommendations", (c) => {
   const type = c.req.query("type") as RecommendationType | undefined;
   const reason = c.req.query("reason") as RecommendationReason | undefined;
   const minScore = c.req.query("min_score") ? parseFloat(c.req.query("min_score")!) : undefined;
-  const includeOwned = c.req.query("include_owned") === "true";
-  const includeUncertain = c.req.query("include_uncertain") === "true";
+  const includeMatched = c.req.query("include_matched") === "true";
+  const includePossibleMatch = c.req.query("include_possible_match") === "true";
 
   const recs = listRecommendations({
     type: type && ["artist", "release_group"].includes(type) ? type : undefined,
     reason,
     minScore,
-    includeOwned,
-    includeUncertain,
+    includeMatched,
+    includePossibleMatch,
     limit,
   });
 
@@ -83,8 +83,8 @@ recommendationRoutes.get("/recommendations", (c) => {
       score: rec.score,
       score_breakdown: breakdown,
       primary_reason: rec.primary_reason,
-      ownership: {
-        state: rec.ownership_state,
+      navidrome_match: {
+        status: rec.navidrome_match_status,
       },
       first_release_date: rec.first_release_date,
       first_seen_at: rec.first_seen_at,
@@ -166,8 +166,8 @@ recommendationRoutes.get("/recommendations/:id", (c) => {
     score: rec.score,
     score_breakdown: breakdown,
     primary_reason: rec.primary_reason,
-    ownership: {
-      state: rec.ownership_state,
+    navidrome_match: {
+      status: rec.navidrome_match_status,
     },
     first_release_date: rec.first_release_date,
     first_seen_at: rec.first_seen_at,

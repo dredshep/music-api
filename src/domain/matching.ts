@@ -10,7 +10,7 @@ function safeGetAliases(artist: string): { canonical_artist: string }[] {
   }
 }
 
-export interface OwnershipMatch {
+export interface AlbumMatch {
   artist: string;
   title: string;
   year?: number;
@@ -20,10 +20,10 @@ export interface OwnershipMatch {
   matchReasons: string[];
 }
 
-export interface OwnershipResult {
-  owned: boolean;
+export interface AlbumMatchResult {
+  matched: boolean;
   confidence: number;
-  matches: OwnershipMatch[];
+  matches: AlbumMatch[];
 }
 
 export function matchLibraryAlbums(
@@ -31,8 +31,8 @@ export function matchLibraryAlbums(
   queryTitle: string,
   libraryAlbums: LibraryAlbum[],
   options?: { year?: number; releaseType?: string }
-): OwnershipResult {
-  const matches: OwnershipMatch[] = [];
+): AlbumMatchResult {
+  const matches: AlbumMatch[] = [];
 
   for (const album of libraryAlbums) {
     const result = scoreAlbumMatch(queryArtist, queryTitle, album, options);
@@ -45,10 +45,10 @@ export function matchLibraryAlbums(
   matches.sort((a, b) => b.confidence - a.confidence);
 
   const topMatch = matches[0];
-  const owned = topMatch ? topMatch.confidence >= 0.9 : false;
+  const matched = topMatch ? topMatch.confidence >= 0.9 : false;
   const confidence = topMatch?.confidence ?? 0;
 
-  return { owned, confidence, matches: matches.slice(0, 5) };
+  return { matched, confidence, matches: matches.slice(0, 5) };
 }
 
 function scoreAlbumMatch(
@@ -56,7 +56,7 @@ function scoreAlbumMatch(
   queryTitle: string,
   album: LibraryAlbum,
   options?: { year?: number; releaseType?: string }
-): OwnershipMatch {
+): AlbumMatch {
   const reasons: string[] = [];
   let score = 0;
 
@@ -115,8 +115,8 @@ function scoreAlbumMatch(
   };
 }
 
-export function classifyConfidence(confidence: number): "owned" | "uncertain" | "missing" {
-  if (confidence >= 0.9) return "owned";
-  if (confidence >= 0.65) return "uncertain";
-  return "missing";
+export function classifyConfidence(confidence: number): "matched" | "possible_match" | "not_found" {
+  if (confidence >= 0.9) return "matched";
+  if (confidence >= 0.65) return "possible_match";
+  return "not_found";
 }

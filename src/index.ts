@@ -7,7 +7,7 @@ import { loggingMiddleware, type AppVariables } from "./middleware/logging";
 import { failBanMiddleware, publicRateLimit, authenticatedRateLimit } from "./middleware/rate-limit";
 import { statusRoutes } from "./routes/status";
 import { libraryRoutes } from "./routes/library";
-import { libraryOwnershipRoutes } from "./routes/library-ownership";
+import { navidromeMatchRoutes } from "./routes/navidrome-matches";
 import { catalogRoutes } from "./routes/catalog";
 import { catalogIndexRoutes } from "./routes/catalog-index";
 import { searchRoutes } from "./routes/search";
@@ -48,7 +48,7 @@ app.onError((err, c) => {
 
 app.use("*", failBanMiddleware());
 app.use("*", bodyLimit({
-  // Ownership refresh batches contain up to 500 track descriptors. Keep the
+  // Navidrome match refresh batches contain up to 500 track descriptors. Keep the
   // limit bounded while allowing even long-but-valid metadata fields.
   maxSize: 1024 * 1024,
   onError: (c) => c.json({ error: { code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 1MB limit", retryable: false } }, 413),
@@ -69,7 +69,7 @@ app.use("/v1/*", loggingMiddleware());
 
 app.route("/v1", statusRoutes);
 app.route("/v1", libraryRoutes);
-app.route("/v1", libraryOwnershipRoutes);
+app.route("/v1", navidromeMatchRoutes);
 app.route("/v1", catalogRoutes);
 app.route("/v1", catalogIndexRoutes);
 app.route("/v1", searchRoutes);

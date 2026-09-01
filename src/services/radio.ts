@@ -494,10 +494,10 @@ function scoreCandidates(
     const knownScore = settings.knownBias >= 0
       ? familiar * settings.knownBias
       : (1 - familiar) * -settings.knownBias;
-    const owned = candidate.availability === "local" ? 1 : 0;
-    const ownedScore = settings.ownedBias >= 0
-      ? owned * settings.ownedBias
-      : (1 - owned) * -settings.ownedBias;
+    const inNavidrome = candidate.availability === "local" ? 1 : 0;
+    const navidromeScore = settings.navidromeBias >= 0
+      ? inNavidrome * settings.navidromeBias
+      : (1 - inNavidrome) * -settings.navidromeBias;
     const sameArtist = seedArtists.has(radioArtistCooldownKey(candidate.artist)) ? settings.sameArtistBias : 0;
     const tasteScore =
       taste.spotify * (settings.providerWeights.spotify_taste ?? 1) +
@@ -517,7 +517,7 @@ function scoreCandidates(
     const surprise = seededUnit(randomSeed, candidate.key) * settings.surprise;
 
     candidate.selectionScore =
-      provider + seedAffinity * 1.4 + tasteScore + familiarityScore + knownScore + ownedScore +
+      provider + seedAffinity * 1.4 + tasteScore + familiarityScore + knownScore + navidromeScore +
       sameArtist + popularityScore + releaseAgeScore + genreScore + f.score + surprise -
       historyTrackPenalty - historyArtistPenalty - negativeFeedbackPenalty;
   }

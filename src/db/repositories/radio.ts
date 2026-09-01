@@ -10,7 +10,7 @@ export interface RadioSettings {
   length: number;
   familiarity: number;
   knownBias: number;
-  ownedBias: number;
+  navidromeBias: number;
   sameArtistBias: number;
   popularityBias: number;
   releaseAgeBias: number;
@@ -32,7 +32,7 @@ export const DEFAULT_RADIO_SETTINGS: RadioSettings = {
   length: 30,
   familiarity: 0.55,
   knownBias: 0.15,
-  ownedBias: 0,
+  navidromeBias: 0,
   sameArtistBias: 0.35,
   popularityBias: -0.1,
   releaseAgeBias: 0,
@@ -160,8 +160,11 @@ export interface RadioFeedbackRow {
 }
 
 export function parseRadioSettings(value?: string | null): RadioSettings {
-  let patch: Partial<RadioSettings> = {};
-  try { if (value) patch = JSON.parse(value) as Partial<RadioSettings>; } catch { /* use defaults */ }
+  let patch: Partial<RadioSettings> & { ownedBias?: number } = {};
+  try { if (value) patch = JSON.parse(value) as Partial<RadioSettings> & { ownedBias?: number }; } catch { /* use defaults */ }
+  if (patch.navidromeBias == null && patch.ownedBias != null) {
+    patch.navidromeBias = patch.ownedBias;
+  }
   return {
     ...DEFAULT_RADIO_SETTINGS,
     ...patch,

@@ -1,16 +1,16 @@
 import { artistMatch, titleMatch } from "./normalization";
 import type { LibrarySong } from "../services/navidrome";
 
-export type TrackOwnershipStatus = "owned" | "uncertain" | "missing";
+export type NavidromeMatchStatus = "matched" | "possible_match" | "not_found";
 
-export type TrackOwnershipQuery = {
+export type NavidromeMatchQuery = {
   artist: string;
   title: string;
   album?: string;
   durationMs?: number;
 };
 
-export type TrackOwnershipMatch = {
+export type NavidromeMatch = {
   navidromeId: string;
   artistId: string;
   albumId: string;
@@ -22,13 +22,13 @@ export type TrackOwnershipMatch = {
   reasons: string[];
 };
 
-export type TrackOwnershipResult = {
-  status: TrackOwnershipStatus;
+export type NavidromeMatchResult = {
+  status: NavidromeMatchStatus;
   confidence: number;
-  match: TrackOwnershipMatch | null;
+  match: NavidromeMatch | null;
 };
 
-function scoreSong(query: TrackOwnershipQuery, song: LibrarySong): TrackOwnershipMatch {
+function scoreSong(query: NavidromeMatchQuery, song: LibrarySong): NavidromeMatch {
   const artist = artistMatch(query.artist, song.artist);
   const title = titleMatch(query.title, song.title);
   const reasons: string[] = [];
@@ -63,7 +63,7 @@ function scoreSong(query: TrackOwnershipQuery, song: LibrarySong): TrackOwnershi
   }
 
   // A strong title match with a weak artist (or vice versa) should never become
-  // an owned result just because duration/album happen to line up.
+  // a matched result just because duration/album happen to line up.
   if (!title.match) score = Math.min(score, 0.79);
   if (!artist.match) score = Math.min(score, 0.84);
 
@@ -82,9 +82,9 @@ function scoreSong(query: TrackOwnershipQuery, song: LibrarySong): TrackOwnershi
 }
 
 export function matchLibraryTrack(
-  query: TrackOwnershipQuery,
+  query: NavidromeMatchQuery,
   songs: LibrarySong[]
-): TrackOwnershipResult {
+): NavidromeMatchResult {
   const matches = songs
     .map((song) => scoreSong(query, song))
     .sort((a, b) => b.confidence - a.confidence);
@@ -92,7 +92,7 @@ export function matchLibraryTrack(
   const best = matches[0] ?? null;
   const confidence = best?.confidence ?? 0;
 
-  if (confidence >= 0.9) return { status: "owned", confidence, match: best };
-  if (confidence >= 0.72) return { status: "uncertain", confidence, match: best };
-  return { status: "missing", confidence, match: best };
+  if (confidence >= 0.9) return { status: "matched", confidence, match: best };
+  if (confidence >= 0.72) return { status: "possible_match", confidence, match: best };
+  return { status: "not_found", confidence, match: best };
 }

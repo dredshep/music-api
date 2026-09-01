@@ -251,7 +251,7 @@ catalogRoutes.post("/catalog/missing", async (c) => {
   const summary = summarizeCatalogResults(matchResults);
 
   const missing = matchResults
-    .filter((r) => r.classification === "missing")
+    .filter((r) => r.classification === "not_found")
     .map((r) => ({
       title: r.catalogTitle,
       type: r.type,
@@ -261,7 +261,7 @@ catalogRoutes.post("/catalog/missing", async (c) => {
     }));
 
   const uncertain = matchResults
-    .filter((r) => r.classification === "uncertain")
+    .filter((r) => r.classification === "possible_match")
     .map((r) => ({
       catalog_title: r.catalogTitle,
       possible_library_match: r.possibleLibraryMatch,
@@ -273,9 +273,9 @@ catalogRoutes.post("/catalog/missing", async (c) => {
     artist: artistName,
     source: catalogSource,
     catalog_releases: summary.catalogReleases,
-    owned: summary.owned,
-    missing: summary.missing,
-    uncertain: summary.uncertain,
+    matched: summary.matched,
+    not_found: summary.not_found,
+    possible_match: summary.possible_match,
     degraded: catalogDegraded,
   });
 
@@ -290,9 +290,9 @@ catalogRoutes.post("/catalog/missing", async (c) => {
     warnings,
     summary: {
       catalog_releases: summary.catalogReleases,
-      owned: summary.owned,
-      missing: summary.missing,
-      uncertain: summary.uncertain,
+      matched: summary.matched,
+      not_found: summary.not_found,
+      possible_match: summary.possible_match,
     },
     missing,
     uncertain,
@@ -342,9 +342,9 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
       summary: {
         artists_with_missing: 0,
         total_catalog_releases: 0,
-        total_owned: 0,
-        total_missing: 0,
-        total_uncertain: 0,
+        total_matched: 0,
+        total_not_found: 0,
+        total_possible_match: 0,
       },
       artists: [],
       note: "No cached artists yet. Call getMissingCatalog for individual artists first to populate the local catalog.",
@@ -366,9 +366,9 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
     catalog_checked_at: string | null;
     summary: {
       catalog_releases: number;
-      owned: number;
-      missing: number;
-      uncertain: number;
+      matched: number;
+      not_found: number;
+      possible_match: number;
     };
     missing?: Array<{
       title: string;
@@ -387,9 +387,9 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
 
   const artistResults: ArtistResult[] = [];
   let totalCatalog = 0;
-  let totalOwned = 0;
-  let totalMissing = 0;
-  let totalUncertain = 0;
+  let totalMatched = 0;
+  let totalNotFound = 0;
+  let totalPossibleMatch = 0;
 
   for (const artist of cachedArtists) {
     const localGroups = getReleaseGroupsForArtist(artist.mbid);
@@ -410,11 +410,11 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
     const summary = summarizeCatalogResults(matchResults);
 
     totalCatalog += summary.catalogReleases;
-    totalOwned += summary.owned;
-    totalMissing += summary.missing;
-    totalUncertain += summary.uncertain;
+    totalMatched += summary.matched;
+    totalNotFound += summary.not_found;
+    totalPossibleMatch += summary.possible_match;
 
-    if (summary.missing < min_missing) continue;
+    if (summary.not_found < min_missing) continue;
 
     const result: ArtistResult = {
       name: artist.name,
@@ -422,15 +422,15 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
       catalog_checked_at: artist.catalog_checked_at,
       summary: {
         catalog_releases: summary.catalogReleases,
-        owned: summary.owned,
-        missing: summary.missing,
-        uncertain: summary.uncertain,
+        matched: summary.matched,
+        not_found: summary.not_found,
+        possible_match: summary.possible_match,
       },
     };
 
     if (include_releases) {
       result.missing = matchResults
-        .filter((r) => r.classification === "missing")
+        .filter((r) => r.classification === "not_found")
         .map((r) => ({
           title: r.catalogTitle,
           type: r.type,
@@ -439,7 +439,7 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
           confidence: Math.round(r.confidence * 100) / 100,
         }));
       result.uncertain = matchResults
-        .filter((r) => r.classification === "uncertain")
+        .filter((r) => r.classification === "possible_match")
         .map((r) => ({
           catalog_title: r.catalogTitle,
           possible_library_match: r.possibleLibraryMatch,
@@ -453,7 +453,7 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
 
   artistResults.sort(
     (a, b) =>
-      b.summary.missing - a.summary.missing ||
+      b.summary.not_found - a.summary.not_found ||
       a.name.localeCompare(b.name)
   );
 
@@ -463,7 +463,7 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
     artists_compared: cachedArtists.length,
     artists_with_missing: artistResults.length,
     returned: limited.length,
-    total_missing: totalMissing,
+    total_not_found: totalNotFound,
     library_albums: allAlbums.length,
   });
 
@@ -480,9 +480,9 @@ catalogRoutes.post("/catalog/library-missing", async (c) => {
     summary: {
       artists_with_missing: artistResults.length,
       total_catalog_releases: totalCatalog,
-      total_owned: totalOwned,
-      total_missing: totalMissing,
-      total_uncertain: totalUncertain,
+      total_matched: totalMatched,
+      total_not_found: totalNotFound,
+      total_possible_match: totalPossibleMatch,
     },
     artists: limited,
   });

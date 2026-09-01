@@ -28,7 +28,7 @@ export interface CatalogMatchResult {
   musicbrainzReleaseGroupId: string;
   type?: string;
   date?: string;
-  classification: "owned" | "uncertain" | "missing";
+  classification: "matched" | "possible_match" | "not_found";
   confidence: number;
   possibleLibraryMatch?: string;
   reason?: string;
@@ -125,7 +125,7 @@ function findBestLibraryMatch(
     confidence: bestConfidence,
   };
 
-  if (classification === "uncertain" && bestAlbum) {
+  if (classification === "possible_match" && bestAlbum) {
     result.possibleLibraryMatch = bestAlbum.title;
     result.reason = `Possible edition mismatch: ${bestReason}`;
   }
@@ -135,14 +135,14 @@ function findBestLibraryMatch(
 
 export function summarizeCatalogResults(results: CatalogMatchResult[]): {
   catalogReleases: number;
-  owned: number;
-  missing: number;
-  uncertain: number;
+  matched: number;
+  not_found: number;
+  possible_match: number;
 } {
   return {
     catalogReleases: results.length,
-    owned: results.filter((r) => r.classification === "owned").length,
-    missing: results.filter((r) => r.classification === "missing").length,
-    uncertain: results.filter((r) => r.classification === "uncertain").length,
+    matched: results.filter((r) => r.classification === "matched").length,
+    not_found: results.filter((r) => r.classification === "not_found").length,
+    possible_match: results.filter((r) => r.classification === "possible_match").length,
   };
 }

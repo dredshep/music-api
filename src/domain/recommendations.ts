@@ -18,7 +18,7 @@ import {
   type RecommendationType,
   type RecommendationSource,
   type RecommendationReason,
-  type OwnershipState,
+  type NavidromeMatchStatus,
 } from "../db/repositories/recommendations";
 import { normalizeForComparison } from "./normalization";
 import type { LastFmPeriod } from "../services/lastfm";
@@ -59,8 +59,8 @@ export interface CanonicalCandidate {
   artistName: string;
   releaseTitle: string | null;
   firstReleaseDate: string | null;
-  ownershipState: OwnershipState;
-  ownershipConfidence: number;
+  navidromeMatchStatus: NavidromeMatchStatus | "unchecked";
+  navidromeMatchConfidence: number;
   evidence: SourceObservation[];
   score: number;
   scoreBreakdown: Record<string, number>;
@@ -72,7 +72,7 @@ export interface CanonicalCandidate {
 export interface GenerateOptions {
   limit?: number;
   sources?: RecommendationSource[];
-  includeUncertain?: boolean;
+  includePossibleMatch?: boolean;
 }
 
 export interface GenerationResult {
@@ -86,7 +86,7 @@ export interface GenerationStats {
   seedCount: number;
   observationCount: number;
   canonicalCount: number;
-  ownedCount: number;
+  navidromeMatchedCount: number;
   eligibleCount: number;
   selectedCount: number;
   errorCount: number;
@@ -161,14 +161,14 @@ export async function runGeneration(options: GenerateOptions = {}): Promise<Gene
     const canonical = mergeObservations(observations);
     updateGeneration(generation.id, { canonical_candidate_count: canonical.length });
 
-    // 4. Ownership reconciliation
-    const withOwnership = await reconcileOwnership(canonical);
-    const ownedCount = withOwnership.filter((c) => c.ownershipState === "owned").length;
+    // 4. Navidrome match resolution
+    const withNavidromeMatches = await resolveNavidromeMatches(canonical);
+    const navidromeMatchedCount = withNavidromeMatches.filter((c) => c.navidromeMatchStatus === "matched").length;
 
     // 5. Filter eligible
-    const eligible = withOwnership.filter((c) => {
-      if (c.ownershipState === "owned") return false;
-      if (c.ownershipState === "uncertain" && !options.includeUncertain) return false;
+    const eligible = withNavidromeMatches.filter((c) => {
+      if (c.navidromeMatchStatus === "matched") return false;
+      if (c.navidromeMatchStatus === "possible_match" && !options.includePossibleMatch) return false;
       return true;
     });
 
@@ -193,8 +193,8 @@ export async function runGeneration(options: GenerateOptions = {}): Promise<Gene
         artistName: candidate.artistName,
         releaseTitle: candidate.releaseTitle,
         firstReleaseDate: candidate.firstReleaseDate,
-        ownershipState: candidate.ownershipState,
-        ownershipConfidence: candidate.ownershipConfidence,
+        navidromeMatchStatus: candidate.navidromeMatchStatus,
+        navidromeMatchConfidence: candidate.navidromeMatchConfidence,
         score: candidate.score,
         scoreBreakdown: candidate.scoreBreakdown,
         primaryReason: candidate.primaryReason,
@@ -226,7 +226,7 @@ export async function runGeneration(options: GenerateOptions = {}): Promise<Gene
           score: candidate.score,
           scoreBreakdown: candidate.scoreBreakdown,
           primaryReason: candidate.primaryReason,
-          ownershipState: candidate.ownershipState,
+          navidromeMatchStatus: candidate.navidromeMatchStatus,
         });
       }
     }
@@ -238,7 +238,7 @@ export async function runGeneration(options: GenerateOptions = {}): Promise<Gene
       seedCount: seeds.length,
       observationCount: observations.length,
       canonicalCount: canonical.length,
-      ownedCount,
+      navidromeMatchedCount,
       eligibleCount: eligible.length,
       selectedCount: selected.length,
       errorCount: errors.length,
@@ -281,7 +281,7 @@ export async function runGeneration(options: GenerateOptions = {}): Promise<Gene
         seedCount: 0,
         observationCount: 0,
         canonicalCount: 0,
-        ownedCount: 0,
+        navidromeMatchedCount: 0,
         eligibleCount: 0,
         selectedCount: 0,
         errorCount: 1,
@@ -484,8 +484,8 @@ function mergeObservations(observations: SourceObservation[]): CanonicalCandidat
         artistName: obs.artistName,
         releaseTitle: obs.releaseTitle ?? null,
         firstReleaseDate: obs.firstReleaseDate ?? null,
-        ownershipState: "unknown",
-        ownershipConfidence: 0,
+        navidromeMatchStatus: "unchecked",
+        navidromeMatchConfidence: 0,
         evidence: [obs],
         score: 0,
         scoreBreakdown: {},
@@ -497,16 +497,16 @@ function mergeObservations(observations: SourceObservation[]): CanonicalCandidat
   return Array.from(byKey.values());
 }
 
-// --- Step 4: Ownership reconciliation ---
+// --- Step 4: Navidrome match resolution ---
 
-async function reconcileOwnership(
+async function resolveNavidromeMatches(
   candidates: CanonicalCandidate[]
 ): Promise<CanonicalCandidate[]> {
   let libraryAlbums: navidrome.LibraryAlbum[];
   try {
     libraryAlbums = await navidrome.getAllAlbums();
   } catch {
-    log("warn", "rec_ownership_skip", { reason: "navidrome unavailable" });
+    log("warn", "rec_navidrome_match_skip", { reason: "navidrome unavailable" });
     return candidates;
   }
 
@@ -518,11 +518,11 @@ async function reconcileOwnership(
     if (candidate.type === "artist") {
       const normalizedName = normalizeForComparison(candidate.artistName);
       if (libraryArtistNames.has(normalizedName)) {
-        candidate.ownershipState = "owned";
-        candidate.ownershipConfidence = 0.95;
+        candidate.navidromeMatchStatus = "matched";
+        candidate.navidromeMatchConfidence = 0.95;
       } else {
-        candidate.ownershipState = "missing";
-        candidate.ownershipConfidence = 0.8;
+        candidate.navidromeMatchStatus = "not_found";
+        candidate.navidromeMatchConfidence = 0.8;
       }
     } else if (candidate.type === "release_group" && candidate.releaseTitle) {
       const artistAlbums = libraryAlbums.filter(
@@ -530,8 +530,8 @@ async function reconcileOwnership(
       );
 
       if (artistAlbums.length === 0) {
-        candidate.ownershipState = "missing";
-        candidate.ownershipConfidence = 0.9;
+        candidate.navidromeMatchStatus = "not_found";
+        candidate.navidromeMatchConfidence = 0.9;
         continue;
       }
 
@@ -550,8 +550,8 @@ async function reconcileOwnership(
 
       const result = results[0];
       if (result) {
-        candidate.ownershipState = result.classification === "owned" ? "owned" : result.classification;
-        candidate.ownershipConfidence = result.confidence;
+        candidate.navidromeMatchStatus = result.classification;
+        candidate.navidromeMatchConfidence = result.confidence;
       }
     }
   }
@@ -647,10 +647,10 @@ function computeRecency(firstReleaseDate: string | null): number {
 }
 
 function computeNovelty(candidate: CanonicalCandidate): number {
-  if (candidate.ownershipState === "missing" && candidate.type === "artist") {
+  if (candidate.navidromeMatchStatus === "not_found" && candidate.type === "artist") {
     return 1.0;
   }
-  if (candidate.ownershipState === "missing") {
+  if (candidate.navidromeMatchStatus === "not_found") {
     return 0.9;
   }
   return 0.5;

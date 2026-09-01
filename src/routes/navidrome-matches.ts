@@ -4,13 +4,13 @@ import { getConfig } from "../config";
 import { getCache, setCache } from "../db/repositories/cache";
 import { normalizeForComparison } from "../domain/normalization";
 import {
-  getLibraryOwnershipIndex,
+  getNavidromeMatchIndex,
   getLibrarySnapshot,
   getOrBuildLibrarySnapshot,
   type LibrarySnapshot,
 } from "../services/library-snapshot";
 
-export const libraryOwnershipRoutes = new Hono();
+export const navidromeMatchRoutes = new Hono();
 
 const trackSchema = z.object({
   id: z.string().min(1).max(128),
@@ -27,9 +27,9 @@ const bodySchema = z.object({
 
 type InputTrack = z.infer<typeof trackSchema>;
 
-type OwnershipResponse = {
+type NavidromeMatchResponse = {
   id: string;
-  status: "owned" | "uncertain" | "missing" | "unknown";
+  status: "matched" | "possible_match" | "not_found" | "unchecked";
   confidence: number;
   match: {
     navidrome_id: string;
@@ -46,7 +46,7 @@ type OwnershipResponse = {
 function cacheKey(track: InputTrack, snapshotVersion: string) {
   const durationBucket = track.duration_ms ? Math.round(track.duration_ms / 5000) : 0;
   return [
-    "lib:track-ownership:v3",
+    "lib:navidrome-match:v4",
     snapshotVersion,
     normalizeForComparison(track.artist),
     normalizeForComparison(track.title),
@@ -55,13 +55,13 @@ function cacheKey(track: InputTrack, snapshotVersion: string) {
   ].join(":");
 }
 
-function lookupTrack(track: InputTrack, snapshot: LibrarySnapshot): OwnershipResponse {
+function lookupTrack(track: InputTrack, snapshot: LibrarySnapshot): NavidromeMatchResponse {
   const key = cacheKey(track, snapshot.version);
-  const cached = getCache<OwnershipResponse>(key);
+  const cached = getCache<NavidromeMatchResponse>(key);
   if (cached) return { ...cached, id: track.id };
 
   try {
-    const result = getLibraryOwnershipIndex(snapshot).lookup(
+    const result = getNavidromeMatchIndex(snapshot).lookup(
       {
         artist: track.artist,
         title: track.title,
@@ -70,7 +70,7 @@ function lookupTrack(track: InputTrack, snapshot: LibrarySnapshot): OwnershipRes
       }
     );
 
-    const response: OwnershipResponse = {
+    const response: NavidromeMatchResponse = {
       id: track.id,
       status: result.status,
       confidence: Math.round(result.confidence * 1000) / 1000,
@@ -95,11 +95,11 @@ function lookupTrack(track: InputTrack, snapshot: LibrarySnapshot): OwnershipRes
     );
     return response;
   } catch {
-    return { id: track.id, status: "unknown", confidence: 0, match: null };
+    return { id: track.id, status: "unchecked", confidence: 0, match: null };
   }
 }
 
-libraryOwnershipRoutes.post("/library/ownership/tracks", async (c) => {
+async function handleTrackMatchRequest(c: { req: { json: () => Promise<unknown> }; json: (body: unknown, status?: number) => Response }) {
   const parsed = bodySchema.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) {
     return c.json(
@@ -125,14 +125,14 @@ libraryOwnershipRoutes.post("/library/ownership/tracks", async (c) => {
     snapshot = previous;
   }
 
-  const results: OwnershipResponse[] = snapshot
+  const results: NavidromeMatchResponse[] = snapshot
     ? parsed.data.tracks.map((track) => lookupTrack(track, snapshot!))
-    : parsed.data.tracks.map((track) => ({ id: track.id, status: "unknown" as const, confidence: 0, match: null }));
+    : parsed.data.tracks.map((track) => ({ id: track.id, status: "unchecked" as const, confidence: 0, match: null }));
   const summary = {
-    owned: results.filter((r) => r.status === "owned").length,
-    uncertain: results.filter((r) => r.status === "uncertain").length,
-    missing: results.filter((r) => r.status === "missing").length,
-    unknown: results.filter((r) => r.status === "unknown").length,
+    matched: results.filter((r) => r.status === "matched").length,
+    possible_match: results.filter((r) => r.status === "possible_match").length,
+    not_found: results.filter((r) => r.status === "not_found").length,
+    unchecked: results.filter((r) => r.status === "unchecked").length,
   };
 
   return c.json({
@@ -153,4 +153,7 @@ libraryOwnershipRoutes.post("/library/ownership/tracks", async (c) => {
         }
       : null,
   });
-});
+}
+
+navidromeMatchRoutes.post("/navidrome/matches/tracks", handleTrackMatchRequest);
+navidromeMatchRoutes.post("/library/ownership/tracks", handleTrackMatchRequest);

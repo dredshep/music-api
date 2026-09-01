@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { getConfig } from "../config";
 import { getDb } from "../db/database";
 import { extractEditionInfo, normalizeForComparison } from "../domain/normalization";
-import { matchLibraryTrack } from "../domain/track-ownership";
+import { matchLibraryTrack } from "../domain/navidrome-matching";
 import * as navidromePlayer from "./navidrome-player";
 import type { LibrarySong } from "./navidrome";
 
@@ -142,7 +142,7 @@ export async function getOrBuildLibrarySnapshot(refresh = false): Promise<Librar
 
 type IndexedSong = LibrarySong & { titleKey: string; baseTitleKey: string; fuzzyKeys: string[] };
 
-export class LibraryOwnershipIndex {
+export class NavidromeMatchIndex {
   private readonly exact = new Map<string, IndexedSong[]>();
   private readonly base = new Map<string, IndexedSong[]>();
   private readonly fuzzy = new Map<string, IndexedSong[]>();
@@ -186,11 +186,11 @@ export class LibraryOwnershipIndex {
   }
 }
 
-let cachedIndex: LibraryOwnershipIndex | null = null;
+let cachedIndex: NavidromeMatchIndex | null = null;
 
-export function getLibraryOwnershipIndex(snapshot: LibrarySnapshot) {
+export function getNavidromeMatchIndex(snapshot: LibrarySnapshot) {
   if (!cachedIndex || cachedIndex.version !== snapshot.version) {
-    cachedIndex = new LibraryOwnershipIndex(snapshot.version, snapshot.songs);
+    cachedIndex = new NavidromeMatchIndex(snapshot.version, snapshot.songs);
   }
   return cachedIndex;
 }

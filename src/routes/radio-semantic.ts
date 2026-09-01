@@ -34,7 +34,7 @@ const partialSettingsSchema = z.object({
   length: z.number().int().min(1).max(200).optional(),
   familiarity: z.number().min(0).max(1).optional(),
   knownBias: z.number().min(-1).max(1).optional(),
-  ownedBias: z.number().min(-1).max(1).optional(),
+  navidromeBias: z.number().min(-1).max(1).optional(),
   sameArtistBias: z.number().min(-1).max(1).optional(),
   popularityBias: z.number().min(-1).max(1).optional(),
   releaseAgeBias: z.number().min(-1).max(1).optional(),

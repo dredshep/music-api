@@ -328,12 +328,12 @@ searchRoutes.post("/acquire/preview", async (c) => {
   // Check library first
   const query = `${artist} ${title}`;
   const results = await navidrome.search3(query, { albumCount: 20, songCount: 0 });
-  const ownership = matchLibraryAlbums(artist, title, results.albums);
+  const matchResult = matchLibraryAlbums(artist, title, results.albums);
 
-  if (ownership.owned && ownership.confidence >= 0.9) {
-    const topMatch = ownership.matches[0];
+  if (matchResult.matched && matchResult.confidence >= 0.9) {
+    const topMatch = matchResult.matches[0];
     return c.json({
-      status: "owned",
+      status: "matched",
       library_match: topMatch
         ? {
             artist: topMatch.artist,
@@ -368,7 +368,7 @@ searchRoutes.post("/acquire/preview", async (c) => {
       const finalCandidates = existingCandidates.slice(0, config.DEFAULT_MAX_CANDIDATES);
 
       return c.json({
-        status: "not_owned",
+        status: "not_found",
         library_match: null,
         search_id: searchRecord.id,
         lifecycle: buildFallbackLifecycle(searchRecord),
@@ -411,7 +411,7 @@ searchRoutes.post("/acquire/preview", async (c) => {
   const finalCandidates = result.candidates.slice(0, config.DEFAULT_MAX_CANDIDATES);
 
   return c.json({
-    status: "not_owned",
+    status: "not_found",
     library_match: null,
     search_id: searchRecord.id,
     lifecycle,

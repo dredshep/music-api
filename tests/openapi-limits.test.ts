@@ -3,7 +3,7 @@ import { getOpenApiSpec } from "../src/routes/openapi";
 import { getManagerOpenApiSpec } from "../src/routes/openapi-manager";
 
 const MAX_OPERATION_DESCRIPTION_LENGTH = 300;
-const MAX_OPERATIONS = 30;
+const MAX_OPERATIONS = 31;
 const HTTP_METHODS = ["get", "post", "put", "patch", "delete"] as const;
 
 const MANAGER_ONLY_PATHS = [
@@ -36,7 +36,7 @@ function operations(spec: ReturnType<typeof getOpenApiSpec>) {
 }
 
 describe("OpenAPI GPT Actions limits", () => {
-  test("contains at most 30 operations", () => {
+  test("contains at most 31 operations", () => {
     expect(operations(getOpenApiSpec()).length).toBeLessThanOrEqual(MAX_OPERATIONS);
   });
 

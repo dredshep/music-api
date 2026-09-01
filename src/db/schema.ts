@@ -369,7 +369,7 @@ export const MIGRATIONS = [
   {
     version: 12,
     sql: `
-      -- Durable whole-library ownership source. Expiration marks a snapshot
+      -- Durable whole-library Navidrome match source. Expiration marks a snapshot
       -- stale for background scheduling but never makes it unservable.
       CREATE TABLE IF NOT EXISTS library_snapshots (
         singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -380,6 +380,30 @@ export const MIGRATIONS = [
         expires_at DATETIME NOT NULL,
         last_error TEXT
       );
+    `,
+  },
+  {
+    version: 13,
+    sql: `
+      ALTER TABLE recommendation_candidates RENAME COLUMN ownership_state TO navidrome_match_status;
+      ALTER TABLE recommendation_candidates RENAME COLUMN ownership_confidence TO navidrome_match_confidence;
+      ALTER TABLE recommendations RENAME COLUMN ownership_state TO navidrome_match_status;
+
+      UPDATE recommendation_candidates SET navidrome_match_status = CASE
+        WHEN navidrome_match_status = 'owned' THEN 'matched'
+        WHEN navidrome_match_status = 'uncertain' THEN 'possible_match'
+        WHEN navidrome_match_status = 'missing' THEN 'not_found'
+        WHEN navidrome_match_status = 'unknown' THEN 'unchecked'
+        ELSE navidrome_match_status
+      END;
+
+      UPDATE recommendations SET navidrome_match_status = CASE
+        WHEN navidrome_match_status = 'owned' THEN 'matched'
+        WHEN navidrome_match_status = 'uncertain' THEN 'possible_match'
+        WHEN navidrome_match_status = 'missing' THEN 'not_found'
+        WHEN navidrome_match_status = 'unknown' THEN 'unchecked'
+        ELSE navidrome_match_status
+      END;
     `,
   },
 ];

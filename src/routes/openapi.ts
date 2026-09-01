@@ -8,7 +8,7 @@ const spec = {
     title: "Music Automation API",
     version: "1.0.0",
     description:
-      "A semantic music library management API. Searches Soulseek for release candidates, checks Navidrome for owned music, compares catalogs via MusicBrainz, and manages logical download jobs. Designed for LLM tool use.",
+      "A semantic music library management API. Searches Soulseek for release candidates, checks Navidrome for matching tracks, compares catalogs via MusicBrainz, and manages logical download jobs. Designed for LLM tool use.",
   },
   servers: [{ url: "https://music-api.besto.me" }],
   security: [{ bearerAuth: [] }],
@@ -107,9 +107,9 @@ const spec = {
     "/v1/library/search": {
       post: {
         operationId: "searchLibrary",
-        summary: "Check if music is already owned in the library",
+        summary: "Check if music is already matched in Navidrome",
         description:
-          "Checks Navidrome ownership and returns recent Soulseek download jobs for the same artist/title. Includes handoff_hint for lyrics workflow. Set include_songs=true for per-track navidrome IDs when indexed.",
+          "Checks Navidrome matching and returns recent Soulseek download jobs for the same artist/title. Includes handoff_hint for lyrics workflow. Set include_songs=true for per-track navidrome IDs when indexed.",
         requestBody: {
           required: true,
           content: {
@@ -142,13 +142,13 @@ const spec = {
         },
         responses: {
           "200": {
-            description: "Ownership, download history, and handoff hint",
+            description: "Navidrome matches, download history, and handoff hint",
             content: {
               "application/json": {
                 schema: {
                   type: "object",
                   properties: {
-                    owned: { type: "boolean" },
+                    matched: { type: "boolean", description: "True when a high-confidence Navidrome album match exists" },
                     indexed: { type: "boolean" },
                     scan: {
                       type: "object",
@@ -207,10 +207,90 @@ const spec = {
         },
       },
     },
+    "/v1/navidrome/matches/tracks": {
+      post: {
+        operationId: "matchNavidromeTracks",
+        summary: "Batch-check Navidrome match status for tracks",
+        description:
+          "Batch-check up to 500 tracks against the whole-library Navidrome snapshot. Returns match status, confidence, and Navidrome IDs. Set refresh_library_snapshot=true to rebuild first. Legacy alias: POST /v1/library/ownership/tracks.",
+        requestBody: {
+          required: true,
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                properties: {
+                  tracks: {
+                    type: "array",
+                    minItems: 1,
+                    maxItems: 500,
+                    items: {
+                      type: "object",
+                      properties: {
+                        id: { type: "string" },
+                        artist: { type: "string" },
+                        title: { type: "string" },
+                        album: { type: "string" },
+                        duration_ms: { type: "integer" },
+                      },
+                      required: ["id", "artist", "title"],
+                    },
+                  },
+                  refresh_library_snapshot: { type: "boolean", default: false },
+                },
+                required: ["tracks"],
+              },
+            },
+          },
+        },
+        responses: {
+          "200": {
+            description: "Navidrome match results",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    results: {
+                      type: "array",
+                      items: {
+                        type: "object",
+                        properties: {
+                          id: { type: "string" },
+                          status: {
+                            type: "string",
+                            enum: ["matched", "possible_match", "not_found", "unchecked"],
+                          },
+                          confidence: { type: "number" },
+                          match: { type: "object", nullable: true },
+                        },
+                      },
+                    },
+                    summary: {
+                      type: "object",
+                      properties: {
+                        matched: { type: "integer" },
+                        possible_match: { type: "integer" },
+                        not_found: { type: "integer" },
+                        unchecked: { type: "integer" },
+                      },
+                    },
+                    snapshot_version: { type: "string", nullable: true },
+                    snapshot_built_at: { type: "string", nullable: true },
+                    snapshot_total: { type: "integer" },
+                    snapshot_stale: { type: "boolean" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
     "/v1/library/overview": {
       get: {
         operationId: "getLibraryOverview",
-        summary: "Summarize the owned music library",
+        summary: "Summarize the Navidrome library",
         description:
           "Library totals plus top artists. Includes on-disk library size when LIBRARY_MUSIC_PATH is configured. by=album_count (default) ranks by collection size; by=play_count ranks by summed album listens. Prefer over searchLibrary for broad taste/overview queries.",
         parameters: [
@@ -291,7 +371,7 @@ const spec = {
     "/v1/library/artists": {
       get: {
         operationId: "listLibraryArtists",
-        summary: "List artists in the owned library",
+        summary: "List artists in the Navidrome library",
         description:
           "Paginated list of artists from Navidrome. sort=album_count (default), name, or play_count. play_count ranks by summed album listens. Optional q filters by artist name substring. limit default 100 max 500.",
         parameters: [
@@ -495,9 +575,9 @@ const spec = {
                       type: "object",
                       properties: {
                         catalog_releases: { type: "integer" },
-                        owned: { type: "integer" },
-                        missing: { type: "integer" },
-                        uncertain: { type: "integer" },
+                        matched: { type: "integer" },
+                        not_found: { type: "integer" },
+                        possible_match: { type: "integer" },
                       },
                     },
                     missing: { type: "array", items: { type: "object" } },
@@ -625,9 +705,9 @@ const spec = {
                       properties: {
                         artists_with_missing: { type: "integer" },
                         total_catalog_releases: { type: "integer" },
-                        total_owned: { type: "integer" },
-                        total_missing: { type: "integer" },
-                        total_uncertain: { type: "integer" },
+                        total_matched: { type: "integer" },
+                        total_not_found: { type: "integer" },
+                        total_possible_match: { type: "integer" },
                       },
                     },
                     artists: {
@@ -934,9 +1014,9 @@ const spec = {
     "/v1/acquire/preview": {
       post: {
         operationId: "previewAcquire",
-        summary: "Check ownership then search if not owned",
+        summary: "Check Navidrome match then search if not found",
         description:
-          "Convenience endpoint that first checks Navidrome for ownership. If confidently owned, returns the library match. Otherwise, performs a Soulseek search and returns candidates. No download occurs. This is typically the first call for 'find me this album'.",
+          "Convenience endpoint that first checks Navidrome for a matching album. If confidently matched in Navidrome, returns the library match. Otherwise, performs a Soulseek search and returns candidates. No download occurs. This is typically the first call for 'find me this album'.",
         requestBody: {
           required: true,
           content: {
@@ -959,13 +1039,13 @@ const spec = {
         },
         responses: {
           "200": {
-            description: "Ownership status and candidates if not owned",
+            description: "Navidrome match status and candidates if not found in Navidrome",
             content: {
               "application/json": {
                 schema: {
                   type: "object",
                   properties: {
-                    status: { type: "string", enum: ["owned", "not_owned"] },
+                    status: { type: "string", enum: ["matched", "not_found"] },
                     library_match: { type: "object", nullable: true },
                     search_id: { type: "string" },
                     candidates: { type: "array", items: { type: "object" } },
@@ -1104,7 +1184,7 @@ const spec = {
       post: {
         operationId: "generateRecommendations",
         summary: "Generate fresh recommendations",
-        description: "Runs the full recommendation pipeline: fetches seeds from Last.fm, generates candidates from similar artists / ListenBrainz / new releases, canonicalizes via MusicBrainz, filters owned, scores, and persists. Returns generation summary.",
+        description: "Runs the full recommendation pipeline: fetches seeds from Last.fm, generates candidates from similar artists / ListenBrainz / new releases, canonicalizes via MusicBrainz, filters matched, scores, and persists. Returns generation summary.",
         requestBody: {
           content: {
             "application/json": {
@@ -1117,7 +1197,7 @@ const spec = {
                     items: { type: "string", enum: ["lastfm_similar", "listenbrainz_cf", "musicbrainz_new_release"] },
                     description: "Which candidate sources to use. Defaults to all.",
                   },
-                  include_uncertain: { type: "boolean", description: "Include uncertain ownership candidates" },
+                  include_possible_match: { type: "boolean", description: "Include possible match candidates" },
                 },
               },
             },
@@ -1147,14 +1227,14 @@ const spec = {
       get: {
         operationId: "getRecommendations",
         summary: "Get recommendation feed",
-        description: "Returns scored recommendations with full provenance. Defaults to active, non-owned, non-suppressed items sorted by score descending.",
+        description: "Returns scored recommendations with full provenance. Defaults to active, not found in Navidrome, non-suppressed items sorted by score descending.",
         parameters: [
           { name: "limit", in: "query", schema: { type: "integer", default: 50 } },
           { name: "type", in: "query", schema: { type: "string", enum: ["artist", "release_group", "any"] } },
           { name: "reason", in: "query", schema: { type: "string", enum: ["similar_to_recent", "similar_to_favorite", "collaborative", "new_release", "wildcard"] } },
           { name: "min_score", in: "query", schema: { type: "number" } },
-          { name: "include_owned", in: "query", schema: { type: "boolean", default: false } },
-          { name: "include_uncertain", in: "query", schema: { type: "boolean", default: false } },
+          { name: "include_matched", in: "query", schema: { type: "boolean", default: false } },
+          { name: "include_possible_match", in: "query", schema: { type: "boolean", default: false } },
         ],
         responses: {
           "200": {
@@ -1475,9 +1555,9 @@ const spec = {
       },
     },
     primary_reason: { type: "string", enum: ["similar_to_recent", "similar_to_favorite", "collaborative", "new_release", "wildcard"] },
-    ownership: {
+    navidrome_match: {
       type: "object",
-      properties: { state: { type: "string", enum: ["owned", "missing", "uncertain", "unknown"] } },
+      properties: { status: { type: "string", enum: ["matched", "not_found", "possible_match", "unchecked"] } },
     },
     first_release_date: { type: "string", nullable: true },
     first_seen_at: { type: "string" },
